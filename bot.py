@@ -31,8 +31,8 @@ class QueueState:
 
 def checked_query(query: str) -> str:
     query = query.strip()
-    if not query or len(query) > 200:
-        raise ValueError('Judul lagu harus 1–200 karakter.')
+    if not query or len(query) > 500:
+        raise ValueError('Judul atau URL lagu harus 1–500 karakter.')
     parsed = urlparse(query)
     if parsed.scheme or parsed.netloc:
         if parsed.scheme != 'https' or parsed.hostname not in {'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'}:
@@ -41,23 +41,76 @@ def checked_query(query: str) -> str:
     return f'ytsearch1:{query}'
 
 
-OPTIONS = {'format': 'bestaudio[acodec=opus]/bestaudio', 'noplaylist': True,
-           'quiet': True, 'js_runtimes': {'node': {}}, 'skip_download': True}
+_JS_RUNTIME = {'node': {'path': '/usr/local/bin/node'}} if os.path.exists('/usr/local/bin/node') else {}
+
+METADATA_OPTIONS = {
+    'format': 'bestaudio[acodec=opus]/bestaudio',
+    'quiet': True,
+    'extract_flat': 'in_playlist',
+    'ignoreerrors': True,
+    'skip_download': True,
+    'js_runtimes': _JS_RUNTIME,
+}
+
+STREAM_OPTIONS = {
+    'format': 'bestaudio[acodec=opus]/bestaudio',
+    'noplaylist': True,
+    'quiet': True,
+    'skip_download': True,
+    'js_runtimes': _JS_RUNTIME,
+}
 
 
-def extract(query: str) -> dict:
-    with yt_dlp.YoutubeDL(OPTIONS) as ydl:
-        data = ydl.extract_info(query, download=False)
+def extract_stream(url: str) -> dict:
+    with yt_dlp.YoutubeDL(STREAM_OPTIONS) as ydl:
+        data = ydl.extract_info(url, download=False)
     if data and 'entries' in data:
         data = next((entry for entry in data['entries'] if entry), None)
     if not data or not data.get('url'):
-        raise ValueError('Lagu tidak ditemukan atau stream tidak tersedia.')
+        raise ValueError('Stream audio tidak tersedia.')
     return data
 
 
+extract = extract_stream
+
+
+def _fetch_metadata(target: str) -> dict:
+    with yt_dlp.YoutubeDL(METADATA_OPTIONS) as ydl:
+        return ydl.extract_info(target, download=False)
+
+
+async def extract_tracks(query: str, requester: str) -> list[Track]:
+    target = checked_query(query)
+    data = await asyncio.to_thread(_fetch_metadata, target)
+    if not data:
+        raise ValueError('Lagu atau playlist tidak ditemukan.')
+
+    tracks: list[Track] = []
+    if 'entries' in data:
+        for entry in data.get('entries') or []:
+            if not entry:
+                continue
+            title = entry.get('title') or 'Tanpa judul'
+            url = entry.get('url') or entry.get('webpage_url')
+            if not url or not url.startswith('http'):
+                vid_id = entry.get('id') or url
+                url = f'https://www.youtube.com/watch?v={vid_id}'
+            tracks.append(Track(title, url, requester))
+            if len(tracks) >= 100:
+                break
+    else:
+        title = data.get('title') or 'Tanpa judul'
+        url = data.get('webpage_url') or data.get('url') or target
+        tracks.append(Track(title, url, requester))
+
+    if not tracks:
+        raise ValueError('Lagu tidak ditemukan atau stream tidak tersedia.')
+    return tracks
+
+
 async def extract_track(query: str, requester: str) -> Track:
-    data = await asyncio.to_thread(extract, checked_query(query))
-    return Track(data.get('title') or 'Tanpa judul', data.get('webpage_url') or query, requester)
+    tracks = await extract_tracks(query, requester)
+    return tracks[0]
 
 
 def source_for(data: dict) -> discord.FFmpegOpusAudio:
@@ -74,7 +127,7 @@ def same_voice(interaction: discord.Interaction) -> bool:
 
 
 class SearchModal(discord.ui.Modal, title='Putar lagu'):
-    query = discord.ui.TextInput(label='Judul atau URL YouTube Music', max_length=200)
+    query = discord.ui.TextInput(label='Judul atau URL YouTube Music', max_length=500)
 
     def __init__(self, bot: 'MusicBot'):
         super().__init__()
@@ -85,17 +138,23 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
             return await interaction.response.send_message('Masuk ke voice channel bot dulu.', ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            track = await extract_track(str(self.query), interaction.user.display_name)
+            tracks = await extract_tracks(str(self.query), interaction.user.display_name)
             guild = interaction.guild
+            if not guild or not guild.voice_client:
+                return await interaction.followup.send('Bot tidak ada di voice.', ephemeral=True)
             state = self.bot.states.setdefault(guild.id, QueueState())
             async with state.lock:
-                state.queue.append(track)
+                state.queue.extend(tracks)
                 if not guild.voice_client.is_playing() and not guild.voice_client.is_paused() and not state.current:
                     await self.bot.advance(guild)
-            await interaction.followup.send(f'Ditambahkan: **{discord.utils.escape_markdown(track.title)}**', ephemeral=True)
+            if len(tracks) == 1:
+                msg = f'Ditambahkan: **{discord.utils.escape_markdown(tracks[0].title)}**'
+            else:
+                msg = f'Ditambahkan {len(tracks)} lagu dari playlist. Lagu pertama: **{discord.utils.escape_markdown(tracks[0].title)}**'
+            await interaction.followup.send(msg, ephemeral=True)
         except Exception as exc:
             log.warning('Pencarian gagal: %s', exc)
-            await interaction.followup.send('Gagal mencari atau memutar lagu. Coba judul/URL lain.', ephemeral=True)
+            await interaction.followup.send(f'Gagal memproses lagu: {exc}', ephemeral=True)
 
 
 class MusicPanel(discord.ui.View):
@@ -237,16 +296,20 @@ class MusicBot(discord.Client):
                 log.exception('Gagal masuk voice')
                 return await interaction.followup.send('Gagal masuk voice. Cek izin Connect/Speak.', ephemeral=True)
         try:
-            track = await extract_track(lagu, interaction.user.display_name)
+            tracks = await extract_tracks(lagu, interaction.user.display_name)
             state = self.states.setdefault(interaction.guild.id, QueueState())
             async with state.lock:
-                state.queue.append(track)
+                state.queue.extend(tracks)
                 if not vc.is_playing() and not vc.is_paused() and not state.current:
                     await self.advance(interaction.guild)
-            await interaction.followup.send(f'Ditambahkan ke antrian: **{discord.utils.escape_markdown(track.title)}**')
+            if len(tracks) == 1:
+                msg = f'Ditambahkan ke antrian: **{discord.utils.escape_markdown(tracks[0].title)}**'
+            else:
+                msg = f'Ditambahkan {len(tracks)} lagu dari playlist ke antrian. Lagu pertama: **{discord.utils.escape_markdown(tracks[0].title)}**'
+            await interaction.followup.send(msg)
         except Exception as exc:
             log.warning('Pencarian gagal: %s', exc)
-            await interaction.followup.send('Gagal mencari lagu. Coba judul atau URL YouTube lain.', ephemeral=True)
+            await interaction.followup.send(f'Gagal mencari atau memproses lagu: {exc}', ephemeral=True)
 
     async def cmd_skip(self, interaction: discord.Interaction):
         if not interaction.guild:

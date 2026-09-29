@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import discord
 
-from bot import MusicBot, MusicPanel, Track, QueueState, extract_track, source_for
+from bot import MusicBot, MusicPanel, Track, QueueState, extract_track, extract_tracks, source_for
 
 
 class MusicTests(unittest.TestCase):
@@ -58,6 +58,36 @@ class MusicTests(unittest.TestCase):
         commands = [c.name for c in bot.tree.get_commands()]
         expected = {'musik', 'play', 'skip', 'stop', 'antrian', 'pause'}
         self.assertTrue(expected.issubset(set(commands)), f'Missing commands in {commands}')
+
+    def test_extract_tracks_playlist_skips_none_and_caps(self):
+        mock_entries = [
+            {'title': f'Song {i}', 'url': f'https://youtube.com/watch?v=s{i}'}
+            for i in range(110)
+        ]
+        mock_entries[2] = None  # simulate private video skipped by ignoreerrors
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                '_type': 'playlist',
+                'title': 'Test Playlist',
+                'entries': mock_entries
+            }
+            tracks = asyncio.run(extract_tracks('https://www.youtube.com/playlist?list=PL123', 'vito'))
+            self.assertEqual(len(tracks), 100)
+            self.assertEqual(tracks[0].title, 'Song 0')
+            self.assertEqual(tracks[1].title, 'Song 1')
+            self.assertEqual(tracks[2].title, 'Song 3')  # index 2 was skipped
+
+    def test_extract_tracks_single_video(self):
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                'title': 'Single Track',
+                'webpage_url': 'https://youtube.com/watch?v=abc',
+                'url': 'https://googlevideo.com/audio'
+            }
+            tracks = asyncio.run(extract_tracks('https://www.youtube.com/watch?v=abc', 'vito'))
+            self.assertEqual(len(tracks), 1)
+            self.assertEqual(tracks[0].title, 'Single Track')
+            self.assertEqual(tracks[0].url, 'https://youtube.com/watch?v=abc')
 
 
 if __name__ == '__main__':
