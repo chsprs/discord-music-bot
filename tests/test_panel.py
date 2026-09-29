@@ -148,5 +148,68 @@ class ConfigStoreTests(unittest.TestCase):
                 store.write({'token': 'a\nEVIL=x', 'guild': ''})
 
 
+class PasswordlessTests(unittest.TestCase):
+    """PANEL_PASSWORD kosong = panel terbuka, tapi CSRF tetap berlaku."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = os.path.join(self.tmp.name, '.env')
+        panel.STORE = panel.ConfigStore(self.env)
+        panel.PASSWORD = ''
+        self.server = panel.build_server('127.0.0.1', 0)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.tmp.cleanup)
+
+    def req(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        hdrs = dict(headers or {})
+        if body is not None:
+            hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
+        conn.request(method, path, body=body, headers=hdrs)
+        res = conn.getresponse()
+        payload = res.read().decode('utf-8', 'replace')
+        conn.close()
+        return res.status, payload
+
+    def test_page_opens_without_login(self):
+        status, body = self.req('GET', '/')
+        self.assertEqual(status, 200)
+        self.assertIn('Panel Bot Musik', body)
+
+    def test_api_status_opens_without_login(self):
+        status, body = self.req('GET', '/api/status')
+        self.assertEqual(status, 200)
+        self.assertIn('token_set', body)
+
+    def test_cross_site_post_still_rejected(self):
+        status, _ = self.req('POST', '/save', 'token=a&guild=1',
+                             headers={'Origin': 'http://evil.example'})
+        self.assertEqual(status, 403)
+
+    def test_same_origin_save_works_without_login(self):
+        origin = f'http://127.0.0.1:{self.port}'
+        status, _ = self.req('POST', '/save', 'token=abc&guild=7',
+                             headers={'Origin': origin})
+        self.assertEqual(status, 303)
+        self.assertEqual(panel.ConfigStore(self.env).read()['token'], 'abc')
+
+    def test_start_without_token_is_rejected(self):
+        origin = f'http://127.0.0.1:{self.port}'
+        status, _ = self.req('POST', '/start', '', headers={'Origin': origin})
+        self.assertEqual(status, 400)
+
+    def test_login_page_redirects_home_when_passwordless(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        conn.request('GET', '/login')
+        res = conn.getresponse()
+        res.read()
+        location = res.getheader('Location') or ''
+        conn.close()
+        self.assertEqual(res.status, 303)
+        self.assertEqual(location, '/')
+
+
 if __name__ == '__main__':
     unittest.main()

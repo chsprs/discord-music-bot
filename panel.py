@@ -244,10 +244,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, json.dumps(payload), 'application/json; charset=utf-8')
 
     def _authenticated(self) -> bool:
+        # Tanpa sandi panel bersifat terbuka (LAN), tetapi CSRF tetap ditegakkan.
+        if not PASSWORD:
+            return True
         raw = self.headers.get('Cookie', '')
         for part in raw.split(';'):
             name, _, value = part.strip().partition('=')
-            if name == COOKIE and PASSWORD and hmac.compare_digest(value, session_value()):
+            if name == COOKIE and hmac.compare_digest(value, session_value()):
                 return True
         return False
 
@@ -275,6 +278,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
         if path == '/login':
+            if not PASSWORD:
+                return self._redirect('/')
             return self._login_page()
         if path in ('/api/status', '/api/*'):
             if not self._authenticated():
@@ -407,11 +412,11 @@ def build_server(host: str, port: int) -> Server:
 
 
 def main():
-    global PASSWORD
     host = os.environ.get('PANEL_HOST', '0.0.0.0')
     port = int(os.environ.get('PANEL_PORT', '9130'))
     if not PASSWORD:
-        raise SystemExit('PANEL_PASSWORD belum disetel. Panel tidak dijalankan.')
+        print('PERINGATAN: PANEL_PASSWORD kosong — panel terbuka untuk siapa pun '
+              'di jaringan ini. Hanya pakai di LAN tepercaya.', flush=True)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     server = build_server(host, port)
     print(f'Panel musik di http://{host}:{port}', flush=True)
