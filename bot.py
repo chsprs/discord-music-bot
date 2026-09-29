@@ -299,7 +299,7 @@ class MusicBot(discord.Client):
             return await interaction.followup.send('Bot sedang dipakai di voice channel lain.', ephemeral=True)
         if not vc:
             try:
-                vc = await voice.channel.connect(timeout=20)
+                vc = await voice.channel.connect(timeout=20, self_deaf=True)
             except Exception:
                 log.exception('Gagal masuk voice')
                 return await interaction.followup.send('Gagal masuk voice. Cek izin Connect/Speak.', ephemeral=True)
@@ -383,7 +383,7 @@ class MusicBot(discord.Client):
             return await interaction.followup.send('Bot sedang dipakai di voice channel lain.', ephemeral=True)
         if not vc:
             try:
-                await voice.channel.connect(timeout=20)
+                vc = await voice.channel.connect(timeout=20, self_deaf=True)
             except Exception:
                 log.exception('Gagal masuk voice')
                 return await interaction.followup.send('Gagal masuk voice. Cek izin Connect/Speak.', ephemeral=True)
