@@ -1,58 +1,105 @@
-# Discord Music Bot (Lightweight & Ad-Free)
+# 🎵 Discord Music Bot (Lightweight, Ad-Free & Studio Quality)
 
-Bot musik Discord ultra-ringan (<50MB RAM) yang dirancang khusus untuk Linux SBC/STB ARM64 (Armbian) maupun VPS x86. Mengalirkan direct audio stream Opus dari YouTube / YouTube Music langsung ke voice socket Discord tanpa encoding video yang membebani CPU, serta dilengkapi web panel konfigurasi LAN mandiri (tanpa framework, Python stdlib).
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
+[![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
+[![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
+[![Tests](https://img.shields.io/badge/Tests-39%2F39%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
+[![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
+
+Bot musik Discord ultra-ringan, hemat sumber daya (<50MB RAM), dan bebas iklan yang dirancang khusus untuk homelab Linux SBC/STB ARM64 (Armbian, Raspberry Pi) maupun VPS x86. Mengalirkan direct audio stream Opus dari YouTube & YouTube Music langsung ke voice socket Discord dengan kualitas audio tinggi, kontrol panel interaktif modern, dan web panel manajemen LAN tanpa ketergantungan framework berat.
 
 ---
 
-## Fitur Utama
+## 📸 Tampilan Antarmuka (Music Panel)
 
-- **Hemat Memori & CPU:** Konsumsi RAM stabil ~46 MB pada arsitektur ARM64 / STB.
-- **Bebas Iklan (Ad-Free):** Memutar direct stream audio dari CDN Google (`googlevideo.com`), bebas dari pre-roll dan mid-roll ads.
-- **Dukungan Playlist Cepat:**
-  - Mendukung link YouTube & YouTube Music playlist (`list=...`).
-  - Metadata diekstrak secara instan (<2 detik) hingga 100 lagu.
-  - Video private/dihapus otomatis dilewati tanpa crash (`ignoreerrors`).
-  - Audio stream diekstrak secara *lazy* (hanya saat giliran lagu dimulai) agar URL CDN tidak kedaluwarsa dan menghemat bandwidth.
-- **Panel Kontrol Interaktif (Modern Dark UI):**
-  - Embed card minimalis tanpa border mencolok (`#2b2d31`).
-  - Menampilkan judul lagu (inline code), `Requested By` (user mention), `Music Duration` (`Xm Ys`), dan `Music Author`.
-  - **Baris 1 Tombol Kontrol:**
-    - `🔉 Down`: Mengurangi volume -10%.
-    - `⏮ Back`: Memutar ulang lagu sebelumnya / riwayat lagu.
-    - `⏸ Pause`: Menjeda / melanjutkan pemutaran lagu.
-    - `⏭ Skip`: Melewati ke lagu antrian berikutnya.
-    - `🔊 Up`: Menambah volume +10% (hingga 200%).
-  - **Baris 2 Tombol Kontrol:**
-    - `🔀 Shuffle`: Mengacak antrian lagu secara random.
-    - `🔁 Loop`: Siklus mode perulangan (Track -> Queue -> Off).
-    - `⏹ Stop`: Menghentikan musik dan mengeluarkan bot dari voice.
-    - `🔄 AutoPlay`: Rekomendasi lagu otomatis saat antrian habis.
-    - `🎵 Playlist`: Menampilkan daftar antrian & tombol cepat tambah lagu.
-- **Dukungan Slash Commands Lengkap:**
-  - `/musik` — Menampilkan panel interaktif (tombol kontrol UI).
-  - `/play <lagu>` — Memutar lagu atau playlist langsung dari judul / URL.
-  - `/skip` — Melewati lagu yang sedang diputar.
-  - `/back` — Memutar lagu sebelumnya.
-  - `/stop` — Menghentikan pemutaran dan keluar dari voice.
-  - `/antrian` — Menampilkan daftar antrian lagu.
-  - `/pause` — Menjeda atau melanjutkan pemutaran.
-  - `/volume <0-200>` — Mengatur tingkat kekerasan suara lagu.
-  - `/shuffle` — Mengacak daftar antrian lagu.
-  - `/loop` — Mengatur mode perulangan lagu/antrian.
-  - `/autoplay` — Mengaktifkan / menonaktifkan fitur AutoPlay.
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ 🎧 MUSIC PANEL                                                         │
+│                                                                        │
+│ 💿 `MANGKU PUREL - Pakdhe Kabul , Mukidi - OM ADELLA`                  │
+│                                                                        │
+│ 🎧 Requested By         ⏱ Music Duration         🎙 Music Author       │
+│ @vitooo                 `5m 2s`                  `Henny Adella`        │
+└────────────────────────────────────────────────────────────────────────┘
+ [ 🔉 Down ]   [ ⏮ Back ]   [ ⏸ Pause ]   [ ⏭ Skip ]   [ 🔊 Up ]
+ [ 🔀 Shuffle ] [ 🔁 Loop ]   [ ⏹ Stop ]    [ 🔄 AutoPlay ] [ 🎵 Playlist ]
+```
+
+---
+
+## ✨ Fitur Utama
+
+- **Hemat Memori & CPU:** Konsumsi RAM stabil ~46 MB pada arsitektur STB ARM64 (Amlogic S905X / H96 Max / HG680P) tanpa beban video rendering.
+- **Bebas Iklan (Ad-Free):** Memutar direct stream audio dari CDN Google (`googlevideo.com`), bebas dari gangguan pre-roll dan mid-roll iklan.
+- **Kualitas Audio Studio (Studio Quality):**
+  - Profil enkoder Opus full-band (`-application audio`) dengan kualitas kompresi algoritma maksimal (`-compression_level 10`).
+  - Penyesuaian bitrate dinamis otomatis mengikuti kapasitas bitrate voice channel Discord server (hingga 96–128 kbps).
+  - Variable Bitrate (`-vbr on`) menjaga dinamika bass, treble, dan vokal tetap jernih tanpa clipping.
+- **Pengaturan Volume Realtime:**
+  - Slider/step volume via tombol `Down` (-10%) dan `Up` (+10%) hingga 200%.
+  - Menggunakan `PCMVolumeTransformer` terintegrasi libopus C-native sehingga volume berubah seketika tanpa jeda pemuatan ulang lagu.
+- **Dukungan Playlist & Pencarian Kilat:**
+  - Mendukung tautan video tunggal maupun playlist YouTube / YouTube Music (`list=...`).
+  - Ekstraksi metadata instan (<2 detik) hingga 100 lagu per playlist.
+  - Video private / dihapus otomatis dilewati tanpa menghentikan pemutaran (`ignoreerrors`).
+  - Ekstraksi stream secara *lazy* (hanya saat giliran lagu dimulai) agar URL CDN tidak kedaluwarsa dan menghemat bandwidth.
+- **Fitur Cerdas (AutoPlay, Loop, Shuffle & History):**
+  - **AutoPlay:** Secara otomatis mencari dan memutar lagu rekomendasi YouTube terkait saat antrian lagu habis.
+  - **Loop Mode:** Siklus pengulangan 3-arah: *Track* (ulang 1 lagu), *Queue* (ulang seluruh antrian), atau *Off*.
+  - **Shuffle:** Mengacak urutan antrian lagu seketika secara acak.
+  - **History Backtracking:** Menyimpan riwayat lagu yang baru diputar agar tombol `Back` dapat memutar ulang lagu sebelumnya.
 - **Web Control Panel Mandiri:**
-  - Dijalankan via `panel.py` pada port `9130` (stdlib HTTP, CSRF-protected).
-  - Memungkinkan input Bot Token dan Server ID langsung dari browser tanpa membuka terminal.
-  - Mengontrol service (`start` / `restart` / `stop`) via tombol web.
+  - Web dashboard di port `9130` (dibangun murni dengan Python standard library HTTP, aman dengan proteksi CSRF token & nonce).
+  - Konfigurasi token bot & ID server Discord langsung dari browser tanpa perlu SSH ke server.
+  - Monitor status service & tombol kontrol start / restart / stop service dari web.
 - **Auto-Sync & Auto-Start:**
-  - Sinkronisasi otomatis ke seluruh server Discord yang terhubung dan auto-sync saat bot diundang ke server baru (`on_guild_join`).
-  - Service systemd terintegrasi untuk otomatis aktif saat STB / server boot.
+  - Sinkronisasi slash command otomatis ke seluruh server Discord saat bot dinyalakan atau diundang ke server baru (`on_guild_join`).
+  - Service systemd terintegrasi untuk otomatis jalan saat server / STB dinyalakan ulang.
 
 ---
 
-## Instalasi Cepat (One-Line / Ready to Use)
+## 🎮 Tombol Panel & Slash Commands
 
-Jalankan perintah berikut di terminal Linux STB / VPS kamu:
+### 🎛️ Tombol Kontrol Interaktif (10 Tombol)
+
+| Baris | Tombol | Emoji | Fungsi |
+| :--- | :--- | :---: | :--- |
+| **Baris 1** | **Down** | 🔉 | Menurunkan volume lagu sebesar -10% |
+| | **Back** | ⏮️ | Memutar ulang lagu sebelumnya (riwayat) atau dari awal |
+| | **Pause** | ⏸️ | Menjeda atau melanjutkan pemutaran musik |
+| | **Skip** | ⏭️ | Melewati lagu yang sedang diputar ke antrian berikutnya |
+| | **Up** | 🔊 | Menaikkan volume lagu sebesar +10% (hingga 200%) |
+| **Baris 2** | **Shuffle** | 🔀 | Mengacak seluruh urutan lagu di dalam antrian |
+| | **Loop** | 🔁 | Mengubah mode perulangan: *Track* ➔ *Queue* ➔ *Off* |
+| | **Stop** | ⏹️ | Menghentikan musik, mengosongkan antrian, dan keluar voice |
+| | **AutoPlay** | 🔄 | Mengaktifkan/menonaktifkan rekomendasi lagu otomatis |
+| | **Playlist** | 🎵 | Melihat daftar antrian & tombol cepat tambah lagu |
+
+### 💬 Slash Commands Discord
+
+Semua fungsi tombol juga dapat diakses lewat perintah chat slash:
+
+| Perintah | Argumen | Keterangan |
+| :--- | :--- | :--- |
+| `/musik` | - | Menampilkan panel interaktif musik dan memanggil bot ke voice channel |
+| `/play` | `<lagu>` | Memutar lagu atau playlist dari judul atau URL YouTube |
+| `/skip` | - | Melewati lagu yang sedang diputar |
+| `/back` | - | Memutar lagu sebelumnya dari riwayat |
+| `/stop` | - | Menghentikan musik dan mengeluarkan bot dari voice |
+| `/antrian` | - | Menampilkan daftar antrian lagu saat ini |
+| `/pause` | - | Menjeda atau melanjutkan pemutaran lagu |
+| `/volume` | `<0-200>` | Mengatur tingkat volume suara lagu (persentase) |
+| `/shuffle` | - | Mengacak urutan antrian lagu |
+| `/loop` | `[mode]` | Mengatur mode perulangan (`track`, `queue`, atau `off`) |
+| `/autoplay`| - | Mengaktifkan atau menonaktifkan fitur AutoPlay |
+
+---
+
+## 🚀 Instalasi Cepat (One-Line Installer)
+
+Jalankan perintah berikut di terminal server Linux (STB Armbian, Debian, Ubuntu, atau VPS):
 
 ```bash
 git clone https://github.com/chsprs/discord-music-bot.git /opt/discord-music-bot
@@ -61,18 +108,18 @@ sudo ./install.sh
 ```
 
 Skrip installer otomatis:
-1. Memeriksa dan menginstal dependensi OS (`python3`, `ffmpeg`, `nodejs`, dll.).
-2. Menyiapkan Python virtual environment dan dependensi `pip`.
-3. Memasang unit systemd `discord-music.service` dan `discord-music-panel.service`.
-4. Mengaktifkan auto-start saat server boot.
-5. Menjalankan unit test mandiri (39/39 passing).
+1. Memeriksa dan menginstal paket sistem yang dibutuhkan (`python3`, `python3-venv`, `ffmpeg`, `nodejs`).
+2. Menyiapkan Python virtual environment dan menginstal dependensi (`discord.py`, `yt-dlp`).
+3. Memasang service systemd `discord-music.service` dan `discord-music-panel.service`.
+4. Mengaktifkan auto-start saat boot sistem.
+5. Menjalankan verifikasi unit test mandiri (**39/39 passing**).
 6. Menyalakan Web Control Panel di port `9130`.
 
 ---
 
-## Langkah Penggunaan
+## 🛠️ Langkah Penggunaan & Konfigurasi
 
-1. Buka browser di perangkat yang satu jaringan LAN:
+1. Buka browser pada perangkat di jaringan LAN yang sama:
    ```
    http://<IP_SERVER_STB>:9130
    ```
@@ -82,11 +129,11 @@ Skrip installer otomatis:
 
 ---
 
-## Konfigurasi Discord Developer Portal
+## ⚙️ Pengaturan di Discord Developer Portal
 
-Saat membuat bot di [Discord Developer Portal](https://discord.com/developers/applications):
+Saat membuat aplikasi bot di [Discord Developer Portal](https://discord.com/developers/applications):
 
-1. **OAuth2 / Installation:**
+1. **OAuth2 ➔ Default Authorization Link / Installation:**
    - **Installation Contexts**: Centang **Guild Install**.
    - **Scopes**: Centang `bot` dan `applications.commands`.
    - **Permissions**: Centang:
@@ -97,46 +144,70 @@ Saat membuat bot di [Discord Developer Portal](https://discord.com/developers/ap
      - `Read Message History`
      - `Connect`
      - `Speak`
-2. **Privileged Gateway Intents:**
-   - Tidak memerlukan *Message Content Intent* karena bot 100% menggunakan Slash Commands dan Button Interaction.
-3. **Link Undangan Bot:**
+2. **Bot ➔ Privileged Gateway Intents:**
+   - Bot ini **TIDAK** membutuhkan *Message Content Intent* karena 100% menggunakan Slash Commands dan Button Interaction yang lebih aman dan efisien.
+3. **Format Link Undangan Bot:**
    ```
    https://discord.com/oauth2/authorize?client_id=<YOUR_CLIENT_ID>&scope=bot+applications.commands&permissions=2150714368
    ```
 
 ---
 
-## Struktur Berkas
+## 📁 Struktur Berkas
 
 ```
 /opt/discord-music-bot/
-├── bot.py                      # Core bot Discord (audio pipeline, queue, commands)
-├── panel.py                    # Web Control Panel LAN (stdlib HTTP)
-├── requirements.txt            # Dependensi Python
-├── install.sh                  # Skrip instalasi otomatis
+├── bot.py                      # Core bot Discord (audio pipeline, queue, commands, UI View)
+├── panel.py                    # Web Control Panel LAN mandiri (stdlib HTTP, CSRF-safe)
+├── requirements.txt            # Dependensi Python pip (discord.py, yt-dlp)
+├── install.sh                  # Skrip instalasi otomatis satu baris
 ├── discord-music.service       # Service systemd bot musik
-├── discord-music-panel.service # Service systemd panel web
-├── .env.example                # Templat konfigurasi
+├── discord-music-panel.service # Service systemd web dashboard
+├── .env.example                # Templat variabel lingkungan
 ├── .gitignore
-├── README.md
+├── README.md                   # Dokumentasi proyek
 └── tests/
-    ├── test_bot.py             # Unit test core bot & commands (mocked API)
-    └── test_panel.py           # Unit test web panel & CSRF
+    ├── test_bot.py             # Unit test core bot, UI View, queue, dan commands
+    └── test_panel.py           # Unit test web panel, keamanan CSRF, dan konfigurasi
 ```
 
 ---
 
-## Pengujian Mandiri
+## 🧪 Pengujian Mandiri (Self-Contained Tests)
 
-Jalankan seluruh rangkaian tes:
+Jalankan rangkaian unit test lengkap:
 
 ```bash
 cd /opt/discord-music-bot
 PYTHONPATH=. ./venv/bin/python -m unittest discover -s tests -v
 ```
 
+Hasil uji:
+```
+Ran 39 tests in 1.126s
+OK
+```
+
 ---
 
-## Lisensi
+## 📊 Manajemen Service Linux
 
-MIT License. Dibuat untuk performa andal dan konsumsi daya rendah di lingkungan homelab STB Armbian.
+```bash
+# Cek status bot
+sudo systemctl status discord-music.service
+
+# Melihat log bot secara realtime
+sudo journalctl -u discord-music.service -f
+
+# Restart bot
+sudo systemctl restart discord-music.service
+
+# Restart web control panel
+sudo systemctl restart discord-music-panel.service
+```
+
+---
+
+## 📄 Lisensi
+
+Didistribusikan di bawah **MIT License**. Dirancang dengan fokus pada efisiensi daya, nol beban disk, dan stabilitas jangka panjang untuk lingkungan homelab STB Armbian maupun server produksi.
