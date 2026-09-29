@@ -176,6 +176,91 @@ def run_update() -> tuple[bool, str]:
         return False, err
 
 
+def read_bot_runtime_info() -> dict:
+    default_info = {
+        'status': 'offline' if bot_state() != 'active' else 'online',
+        'total_guilds': 0,
+        'active_voice_count': 0,
+        'total_listeners': 0,
+        'guilds': [],
+    }
+    if bot_state() != 'active':
+        return default_info
+
+    path = os.environ.get('BOT_STATE_FILE')
+    if not path:
+        if os.path.isdir('/run/discord-music'):
+            path = '/run/discord-music/state.json'
+        else:
+            path = '/tmp/discord-music-state.json'
+
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as handle:
+                data = json.load(handle)
+            if time.time() - data.get('updated_at', 0) < 60:
+                data['status'] = 'online'
+                return data
+    except Exception:
+        pass
+    return default_info
+
+
+def format_guilds_html(info: dict) -> str:
+    guilds = info.get('guilds', [])
+    if not guilds:
+        if info.get('status') == 'offline':
+            return '<p class="note" style="margin-top:10px">Bot sedang offline. Nyalakan bot untuk melihat daftar server.</p>'
+        return '<p class="note" style="margin-top:10px">Bot sedang online tetapi belum dimasukkan ke server Discord mana pun.</p>'
+
+    cards = []
+    for g in guilds:
+        name = html.escape(str(g.get('name', 'Server Discord')))
+        members = g.get('member_count', 0)
+        connected = bool(g.get('connected', False))
+        ch_name = html.escape(str(g.get('channel_name') or ''))
+        raw_listeners = g.get('listeners', [])
+        listeners = [html.escape(str(u)) for u in raw_listeners]
+        listener_count = g.get('listener_count', len(listeners))
+        is_playing = bool(g.get('is_playing', False))
+        is_paused = bool(g.get('is_paused', False))
+        track = html.escape(str(g.get('current_track') or ''))
+        queue_len = g.get('queue_len', 0)
+
+        if connected:
+            badge_class = 'on'
+            badge_text = f'🔊 {ch_name}' if ch_name else '🔊 Voice Aktif'
+            play_status = '⏸️ Jeda' if is_paused else ('▶️ Memutar' if is_playing else '⏹️ Standby di voice')
+            if track:
+                track_html = f'<div class="track-row">{play_status}: <span>{track}</span> <small style="color:var(--muted)">({queue_len} di antrean)</small></div>'
+            else:
+                track_html = f'<div class="track-row">{play_status} <small style="color:var(--muted)">(antrean kosong)</small></div>'
+
+            if listener_count > 0:
+                users_list = f' ({", ".join(listeners)})' if listeners else ''
+                listeners_html = f'<div class="listeners-row">👥 <strong>{listener_count} user</strong> mendengarkan{users_list}</div>'
+            else:
+                listeners_html = '<div class="server-meta" style="color:var(--muted);margin-top:4px">Tidak ada user lain di voice channel ini</div>'
+        else:
+            badge_class = 'off'
+            badge_text = 'Standby'
+            track_html = '<div class="server-meta" style="color:var(--muted);margin-top:6px">Bot tidak sedang berada di voice channel.</div>'
+            listeners_html = ''
+
+        cards.append(
+            '<div class="server-card">'
+            '<div style="display:flex;justify-content:space-between;align-items:center">'
+            f'<strong style="font-size:14px">{name}</strong>'
+            f'<span class="badge {badge_class}">{badge_text}</span>'
+            '</div>'
+            f'<div class="server-meta">Total member: {members} orang</div>'
+            f'{track_html}'
+            f'{listeners_html}'
+            '</div>'
+        )
+    return '\n'.join(cards)
+
+
 def masked(token: str) -> str:
     if not token:
         return ''
@@ -239,6 +324,10 @@ padding:10px 12px;font-size:13px;margin-bottom:16px}
 .log-box{background:#18181b;color:#e4e4e7;padding:12px;border-radius:8px;
 font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:250px;
 overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
+.server-card{border:1px solid var(--line);background:#fafafa;border-radius:8px;padding:12px 14px;margin-top:10px}
+.server-meta{font-size:12px;color:var(--muted);margin-top:4px}
+.track-row{font-size:13px;margin-top:6px;color:#111;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.listeners-row{font-size:12px;color:#2e7d32;margin-top:6px;font-weight:500}
 @media(max-width:540px){.kv{flex-direction:column;gap:2px}}
 </style></head><body><main>
 <h1>Panel Bot Musik</h1>
@@ -249,6 +338,18 @@ overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
 <div class="kv"><span>Service bot</span><span class="badge {state_class}">{state}</span></div>
 <div class="kv"><span>Token Discord</span><span>{token_state}</span></div>
 <div class="kv"><span>Guild ID</span><span>{guild}</span></div>
+</section>
+<section>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+<h2 style="margin:0">Server & Pengguna Aktif</h2>
+<span class="badge {runtime_badge_class}">{runtime_badge_text}</span>
+</div>
+<div class="kv"><span>Total server terhubung</span><span><strong>{total_guilds}</strong> server</span></div>
+<div class="kv"><span>Server aktif memutar</span><span><strong>{active_voice_count}</strong> server</span></div>
+<div class="kv"><span>Pengguna mendengarkan</span><span><strong>{total_listeners}</strong> user</span></div>
+<div style="margin-top:14px">
+{guilds_detail_html}
+</div>
 </section>
 <form method="post" action="/save">
 <input type="hidden" name="form_token" value="{form_token}">
@@ -428,6 +529,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authenticated():
                 return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
             data = store().read()
+            runtime = read_bot_runtime_info()
             return self._json(HTTPStatus.OK, {
                 'bot': bot_state(),
                 'token_set': bool(data['token']),
@@ -435,6 +537,10 @@ class Handler(BaseHTTPRequestHandler):
                 'guild': data['guild'],
                 'ytdlp_version': ytdlp_version(),
                 'timer': timer_state(),
+                'total_guilds': runtime.get('total_guilds', 0),
+                'active_voice_count': runtime.get('active_voice_count', 0),
+                'total_listeners': runtime.get('total_listeners', 0),
+                'guilds': runtime.get('guilds', []),
             })
         if path == '/api/logs':
             if not self._authenticated():
@@ -504,6 +610,19 @@ class Handler(BaseHTTPRequestHandler):
         else:
             update_log_section = ''
 
+        runtime = read_bot_runtime_info()
+        total_guilds = runtime.get('total_guilds', 0)
+        active_voice = runtime.get('active_voice_count', 0)
+        total_listeners = runtime.get('total_listeners', 0)
+        if runtime.get('status') == 'online':
+            runtime_badge_class = 'on' if active_voice > 0 else 'badge'
+            runtime_badge_text = f'{active_voice} voice aktif' if active_voice > 0 else 'idle'
+        else:
+            runtime_badge_class = 'off'
+            runtime_badge_text = 'offline'
+
+        guilds_html = format_guilds_html(runtime)
+
         page = (PAGE
                 .replace('{form_token}', form_token)
                 .replace('{message}', banner)
@@ -514,6 +633,12 @@ class Handler(BaseHTTPRequestHandler):
                          if data['token'] else 'tempel token bot di sini')
                 .replace('{guild}', html.escape(data['guild']))
                 .replace('{config}', html.escape(CONFIG_PATH))
+                .replace('{runtime_badge_class}', runtime_badge_class)
+                .replace('{runtime_badge_text}', runtime_badge_text)
+                .replace('{total_guilds}', str(total_guilds))
+                .replace('{active_voice_count}', str(active_voice))
+                .replace('{total_listeners}', str(total_listeners))
+                .replace('{guilds_detail_html}', guilds_html)
                 .replace('{ytdlp_version}', html.escape(ytdlp_version()))
                 .replace('{timer_state}', html.escape(timer_state()))
                 .replace('{update_log_section}', update_log_section)

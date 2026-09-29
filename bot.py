@@ -1,8 +1,10 @@
 """Minimal Discord music player: slash summon, buttons, modal, streaming voice."""
 import asyncio
+import json
 import logging
 import os
 import shutil
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
@@ -93,6 +95,87 @@ STREAM_OPTIONS = {
     'skip_download': True,
     'js_runtimes': _JS_RUNTIME,
 }
+
+
+def dump_runtime_state(bot) -> None:
+    path = os.environ.get('BOT_STATE_FILE')
+    if not path:
+        if os.path.isdir('/run/discord-music'):
+            path = '/run/discord-music/state.json'
+        else:
+            path = '/tmp/discord-music-state.json'
+    try:
+        guilds_data = []
+        total_listeners = 0
+        active_voice_count = 0
+        for g in getattr(bot, 'guilds', []):
+            vc = getattr(g, 'voice_client', None)
+            connected = bool(vc and getattr(vc, 'channel', None))
+            channel_name = None
+            listeners = []
+            is_playing = False
+            is_paused = False
+            track_title = None
+            queue_len = 0
+
+            if connected and vc and vc.channel:
+                active_voice_count += 1
+                channel_name = getattr(vc.channel, 'name', None)
+                channel_members = [m for m in getattr(vc.channel, 'members', []) if not getattr(m, 'bot', False)]
+                listeners = [getattr(m, 'display_name', getattr(m, 'name', 'User')) for m in channel_members]
+                total_listeners += len(listeners)
+                is_playing = getattr(vc, 'is_playing', lambda: False)()
+                is_paused = getattr(vc, 'is_paused', lambda: False)()
+                state = bot.states.get(g.id) if hasattr(bot, 'states') else None
+                if state:
+                    if getattr(state, 'current', None):
+                        track_title = state.current.title
+                    queue_len = len(getattr(state, 'queue', []))
+
+            guilds_data.append({
+                'id': str(g.id),
+                'name': g.name,
+                'member_count': getattr(g, 'member_count', 0),
+                'connected': connected,
+                'channel_name': channel_name,
+                'listeners': listeners,
+                'listener_count': len(listeners),
+                'is_playing': is_playing,
+                'is_paused': is_paused,
+                'current_track': track_title,
+                'queue_len': queue_len,
+            })
+
+        payload = {
+            'updated_at': time.time(),
+            'bot_user': str(getattr(bot, 'user', '')),
+            'total_guilds': len(guilds_data),
+            'active_voice_count': active_voice_count,
+            'total_listeners': total_listeners,
+            'guilds': guilds_data,
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        log.debug('Gagal menulis state runtime bot: %s', exc)
+
+
+def dump_runtime_state_offline() -> None:
+    path = os.environ.get('BOT_STATE_FILE')
+    if not path:
+        if os.path.isdir('/run/discord-music'):
+            path = '/run/discord-music/state.json'
+        else:
+            path = '/tmp/discord-music-state.json'
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
 
 
 def extract_stream(url: str) -> dict:
@@ -389,6 +472,10 @@ class MusicBot(discord.Client):
 
     async def setup_hook(self):
         self.add_view(MusicPanel(self))
+        try:
+            asyncio.get_running_loop().create_task(self._state_exporter_loop())
+        except RuntimeError:
+            pass
         guild_id = os.getenv('DISCORD_GUILD_ID')
         if guild_id:
             guild = discord.Object(id=int(guild_id))
@@ -411,7 +498,20 @@ class MusicBot(discord.Client):
             except Exception:
                 log.exception('Gagal sync slash command global')
 
+    async def _state_exporter_loop(self):
+        try:
+            await self.wait_until_ready()
+            while not self.is_closed():
+                try:
+                    dump_runtime_state(self)
+                except Exception as exc:
+                    log.debug('Gagal menulis state runtime: %s', exc)
+                await asyncio.sleep(5)
+        except (asyncio.CancelledError, RuntimeError):
+            pass
+
     async def on_ready(self):
+        dump_runtime_state(self)
         guild_list = [f'{g.name} ({g.id})' for g in self.guilds]
         log.info('Bot login sebagai %s (ID: %s). Terhubung ke %d server: %s',
                  self.user, getattr(self.user, 'id', None), len(self.guilds),
@@ -425,12 +525,23 @@ class MusicBot(discord.Client):
                 log.error('Gagal sync command ke guild %s: %s', guild.id, e)
 
     async def on_guild_join(self, guild: discord.Guild):
+        dump_runtime_state(self)
         try:
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
             log.info('Auto sync commands ke server baru: %s (%s)', guild.name, guild.id)
         except Exception as e:
             log.error('Gagal sync command ke server baru %s: %s', guild.id, e)
+
+    async def on_guild_remove(self, guild: discord.Guild):
+        dump_runtime_state(self)
+
+    async def close(self):
+        try:
+            dump_runtime_state_offline()
+        except Exception:
+            pass
+        await super().close()
 
     async def cmd_play(self, interaction: discord.Interaction, lagu: str):
         voice = getattr(interaction.user, 'voice', None)
@@ -764,6 +875,7 @@ class MusicBot(discord.Client):
             pass
 
     async def on_voice_state_update(self, member, before, after):
+        dump_runtime_state(self)
         vc = member.guild.voice_client
         if not vc or not vc.channel or any(not m.bot for m in vc.channel.members):
             return
@@ -778,6 +890,7 @@ class MusicBot(discord.Client):
                 vc.stop()
                 await vc.disconnect()
                 await self.refresh(state)
+            dump_runtime_state(self)
 
 
 if __name__ == '__main__':

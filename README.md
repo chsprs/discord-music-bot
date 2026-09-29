@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-44%2F44%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-45%2F45%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -50,10 +50,11 @@ Bot musik Discord ultra-ringan, hemat sumber daya (<50MB RAM), dan bebas iklan y
   - **Loop Mode:** Siklus pengulangan 3-arah: *Track* (ulang 1 lagu), *Queue* (ulang seluruh antrian), atau *Off*.
   - **Shuffle:** Mengacak urutan antrian lagu seketika secara acak.
   - **History Backtracking:** Menyimpan riwayat lagu yang baru diputar agar tombol `Back` dapat memutar ulang lagu sebelumnya.
-- **Web Control Panel Mandiri & Pemantau Log:**
+- **Web Control Panel Mandiri & Pemantau Server/Pengguna:**
   - Web dashboard di port `9130` (dibangun murni dengan Python standard library HTTP, aman dengan proteksi CSRF token & nonce).
   - Konfigurasi token bot & ID server Discord langsung dari browser tanpa perlu SSH ke server.
   - Monitor status service & tombol kontrol start / restart / stop service dari web.
+  - **Pemantau Server & Pengguna Aktif:** Menampilkan daftar server Discord yang dimasuki bot, channel voice yang sedang tersambung, judul lagu & antrean yang sedang berputar, serta jumlah & nama pengguna yang sedang mendengarkan secara realtime.
   - **Tombol Pembaruan Manual:** Perbarui `yt-dlp` seketika lewat tombol web lengkap dengan riwayat log keluaran terminal.
   - **Pemantau Log Realtime:** Kotak log aktivitas bot (`journalctl`) yang dapat disegarkan langsung dari antarmuka web.
 - **Auto-Update Berkala & Zero-Warning JS Runtime:**
@@ -192,7 +193,7 @@ PYTHONPATH=. ./venv/bin/python -m unittest discover -s tests -v
 
 Hasil uji:
 ```
-Ran 44 tests in 2.061s
+Ran 45 tests in 2.839s
 OK
 ```
 

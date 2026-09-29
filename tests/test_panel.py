@@ -117,6 +117,54 @@ class PanelTests(unittest.TestCase):
         self.assertTrue(data['token_set'])
         self.assertEqual(data['guild'], '42')
         self.assertIn(data['bot'], ('unknown', 'active', 'inactive'))
+        self.assertIn('total_guilds', data)
+        self.assertIn('active_voice_count', data)
+        self.assertIn('total_listeners', data)
+        self.assertIsInstance(data['guilds'], list)
+
+    def test_format_guilds_html_connected_and_standby(self):
+        info = {
+            'status': 'online',
+            'total_guilds': 2,
+            'active_voice_count': 1,
+            'total_listeners': 2,
+            'guilds': [
+                {
+                    'id': '101',
+                    'name': 'Komunitas Musik',
+                    'member_count': 50,
+                    'connected': True,
+                    'channel_name': 'Stage 1',
+                    'listeners': ['budi', 'ani'],
+                    'listener_count': 2,
+                    'is_playing': True,
+                    'is_paused': False,
+                    'current_track': 'Lagu Asik',
+                    'queue_len': 3,
+                },
+                {
+                    'id': '102',
+                    'name': 'Tongkrongan Santai',
+                    'member_count': 12,
+                    'connected': False,
+                    'channel_name': None,
+                    'listeners': [],
+                    'listener_count': 0,
+                    'is_playing': False,
+                    'is_paused': False,
+                    'current_track': None,
+                    'queue_len': 0,
+                },
+            ]
+        }
+        html_out = panel.format_guilds_html(info)
+        self.assertIn('Komunitas Musik', html_out)
+        self.assertIn('Stage 1', html_out)
+        self.assertIn('Lagu Asik', html_out)
+        self.assertIn('2 user', html_out)
+        self.assertIn('budi, ani', html_out)
+        self.assertIn('Tongkrongan Santai', html_out)
+        self.assertIn('Standby', html_out)
 
     def test_start_requires_authentication(self):
         status, _, _ = self.req('POST', '/start')
