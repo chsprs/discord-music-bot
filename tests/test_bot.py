@@ -24,7 +24,35 @@ class MusicTests(unittest.TestCase):
         bot = MusicBot()
         view = MusicPanel(bot)
         self.assertTrue(view.is_persistent())
-        self.assertEqual(len(view.children), 9)
+        self.assertEqual(len(view.children), 10)
+        expected_ids = [
+            'music:down', 'music:back', 'music:pause', 'music:skip', 'music:up',
+            'music:shuffle', 'music:loop', 'music:stop', 'music:autoplay', 'music:playlist'
+        ]
+        self.assertEqual([c.custom_id for c in view.children], expected_ids)
+
+    def test_embed_formatting_matches_spec(self):
+        bot = MusicBot()
+        state = QueueState()
+        track = Track(
+            title="MANGKU PUREL - Pakdhe Kabul , Mukidi - OM ADELLA",
+            url="https://youtube.com/watch?v=123",
+            requester="@Han aja",
+            duration=302,
+            duration_str="5m 2s",
+            author="Henny Adella"
+        )
+        state.current = track
+        emb = bot.embed(state)
+        self.assertEqual(emb.author.name, "MUSIC PANEL")
+        self.assertIn("MANGKU PUREL", emb.description)
+        self.assertEqual(len(emb.fields), 3)
+        self.assertEqual(emb.fields[0].name, "🎧 Requested By")
+        self.assertEqual(emb.fields[0].value, "@Han aja")
+        self.assertEqual(emb.fields[1].name, "⏱ Music Duration")
+        self.assertEqual(emb.fields[1].value, "`5m 2s`")
+        self.assertEqual(emb.fields[2].name, "🎙 Music Author")
+        self.assertEqual(emb.fields[2].value, "`Henny Adella`")
 
     def test_source_configures_volume(self):
         class DummyAudio(discord.AudioSource):
@@ -73,7 +101,7 @@ class MusicTests(unittest.TestCase):
     def test_command_tree_has_all_music_commands(self):
         bot = MusicBot()
         commands = [c.name for c in bot.tree.get_commands()]
-        expected = {'musik', 'play', 'skip', 'stop', 'antrian', 'pause', 'volume'}
+        expected = {'musik', 'play', 'skip', 'back', 'stop', 'antrian', 'pause', 'volume', 'shuffle', 'loop', 'autoplay'}
         self.assertTrue(expected.issubset(set(commands)), f'Missing commands in {commands}')
 
     def test_extract_tracks_playlist_skips_none_and_caps(self):

@@ -13,17 +13,33 @@ Bot musik Discord ultra-ringan (<50MB RAM) yang dirancang khusus untuk Linux SBC
   - Metadata diekstrak secara instan (<2 detik) hingga 100 lagu.
   - Video private/dihapus otomatis dilewati tanpa crash (`ignoreerrors`).
   - Audio stream diekstrak secara *lazy* (hanya saat giliran lagu dimulai) agar URL CDN tidak kedaluwarsa dan menghemat bandwidth.
+- **Panel Kontrol Interaktif (Modern Dark UI):**
+  - Embed card minimalis tanpa border mencolok (`#2b2d31`).
+  - Menampilkan judul lagu (inline code), `Requested By` (user mention), `Music Duration` (`Xm Ys`), dan `Music Author`.
+  - **Baris 1 Tombol Kontrol:**
+    - `🔉 Down`: Mengurangi volume -10%.
+    - `⏮ Back`: Memutar ulang lagu sebelumnya / riwayat lagu.
+    - `⏸ Pause`: Menjeda / melanjutkan pemutaran lagu.
+    - `⏭ Skip`: Melewati ke lagu antrian berikutnya.
+    - `🔊 Up`: Menambah volume +10% (hingga 200%).
+  - **Baris 2 Tombol Kontrol:**
+    - `🔀 Shuffle`: Mengacak antrian lagu secara random.
+    - `🔁 Loop`: Siklus mode perulangan (Track -> Queue -> Off).
+    - `⏹ Stop`: Menghentikan musik dan mengeluarkan bot dari voice.
+    - `🔄 AutoPlay`: Rekomendasi lagu otomatis saat antrian habis.
+    - `🎵 Playlist`: Menampilkan daftar antrian & tombol cepat tambah lagu.
 - **Dukungan Slash Commands Lengkap:**
   - `/musik` — Menampilkan panel interaktif (tombol kontrol UI).
   - `/play <lagu>` — Memutar lagu atau playlist langsung dari judul / URL.
   - `/skip` — Melewati lagu yang sedang diputar.
-  - `/stop` — Menghentikan pemutaran dan mengeluarkan bot dari voice channel.
+  - `/back` — Memutar lagu sebelumnya.
+  - `/stop` — Menghentikan pemutaran dan keluar dari voice.
   - `/antrian` — Menampilkan daftar antrian lagu.
   - `/pause` — Menjeda atau melanjutkan pemutaran.
   - `/volume <0-200>` — Mengatur tingkat kekerasan suara lagu.
-- **Pengaturan Volume Realtime:**
-  - Tombol panel interaktif: `🔉 -10%`, `🔊 +10%`, `Atur Vol` (pop-up modal input angka presisi), dan `100%` (reset cepat).
-  - Menggunakan `PCMVolumeTransformer` terintegrasi encoder Opus C-native sehingga volume berubah seketika tanpa stuttering.
+  - `/shuffle` — Mengacak daftar antrian lagu.
+  - `/loop` — Mengatur mode perulangan lagu/antrian.
+  - `/autoplay` — Mengaktifkan / menonaktifkan fitur AutoPlay.
 - **Web Control Panel Mandiri:**
   - Dijalankan via `panel.py` pada port `9130` (stdlib HTTP, CSRF-protected).
   - Memungkinkan input Bot Token dan Server ID langsung dari browser tanpa membuka terminal.
@@ -49,7 +65,7 @@ Skrip installer otomatis:
 2. Menyiapkan Python virtual environment dan dependensi `pip`.
 3. Memasang unit systemd `discord-music.service` dan `discord-music-panel.service`.
 4. Mengaktifkan auto-start saat server boot.
-5. Menjalankan unit test mandiri (38/38 passing).
+5. Menjalankan unit test mandiri (39/39 passing).
 6. Menyalakan Web Control Panel di port `9130`.
 
 ---
