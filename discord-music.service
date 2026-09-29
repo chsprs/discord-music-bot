@@ -1,0 +1,23 @@
+[Unit]
+Description=Discord Music Bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/discord-music-bot
+EnvironmentFile=/opt/discord-music-bot/.env
+ExecStart=/opt/discord-music-bot/venv/bin/python /opt/discord-music-bot/bot.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=XDG_CACHE_HOME=/run/discord-music
+RuntimeDirectory=discord-music
+
+[Install]
+WantedBy=multi-user.target

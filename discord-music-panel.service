@@ -1,0 +1,18 @@
+[Unit]
+Description=Discord Music Bot LAN Panel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/discord-music-bot
+EnvironmentFile=/opt/discord-music-panel.env
+ExecStart=/opt/discord-music-bot/venv/bin/python /opt/discord-music-bot/panel.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
