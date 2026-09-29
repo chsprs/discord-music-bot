@@ -443,6 +443,19 @@ class MusicBot(discord.Client):
             else:
                 msg = f'Ditambahkan {len(tracks)} lagu dari playlist ke antrian. Lagu pertama: **{discord.utils.escape_markdown(tracks[0].title)}**'
             await interaction.followup.send(msg)
+
+            channel = interaction.channel
+            if channel and hasattr(channel, 'send'):
+                if state.message is None or state.message.channel.id != channel.id:
+                    if state.message:
+                        try:
+                            await state.message.delete()
+                        except Exception:
+                            pass
+                    try:
+                        state.message = await channel.send(embed=self.embed(state), view=MusicPanel(self))
+                    except Exception:
+                        log.exception('Gagal memunculkan panel otomatis saat play')
         except Exception as exc:
             log.warning('Pencarian gagal: %s', exc)
             await interaction.followup.send(f'Gagal mencari atau memproses lagu: {exc}', ephemeral=True)
@@ -604,12 +617,24 @@ class MusicBot(discord.Client):
         state = self.states.setdefault(interaction.guild.id, QueueState())
         if state.message:
             try:
-                await state.message.edit(embed=self.embed(state), view=MusicPanel(self))
-                return await interaction.followup.send('Panel musik sudah aktif.', ephemeral=True)
-            except discord.HTTPException:
-                state.message = None
-        state.message = await interaction.channel.send(embed=self.embed(state), view=MusicPanel(self))
-        await interaction.followup.send('Panel musik aktif.', ephemeral=True)
+                await state.message.delete()
+            except Exception:
+                pass
+            state.message = None
+
+        channel = interaction.channel
+        if channel is None and interaction.channel_id and interaction.guild:
+            channel = interaction.guild.get_channel(interaction.channel_id)
+
+        if not channel or not hasattr(channel, 'send'):
+            return await interaction.followup.send('Tidak dapat menemukan text channel untuk menampilkan panel.', ephemeral=True)
+
+        try:
+            state.message = await channel.send(embed=self.embed(state), view=MusicPanel(self))
+            await interaction.followup.send('Panel musik aktif di channel ini.', ephemeral=True)
+        except Exception as exc:
+            log.exception('Gagal mengirim panel musik: %s', exc)
+            await interaction.followup.send(f'Gagal memunculkan panel: {exc}', ephemeral=True)
 
     def embed(self, state: QueueState) -> discord.Embed:
         embed = discord.Embed(color=0x2b2d31)
