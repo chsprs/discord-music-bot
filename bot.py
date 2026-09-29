@@ -281,6 +281,14 @@ class MusicBot(discord.Client):
             except Exception as e:
                 log.error('Gagal sync command ke guild %s: %s', guild.id, e)
 
+    async def on_guild_join(self, guild: discord.Guild):
+        try:
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            log.info('Auto sync commands ke server baru: %s (%s)', guild.name, guild.id)
+        except Exception as e:
+            log.error('Gagal sync command ke server baru %s: %s', guild.id, e)
+
     async def cmd_play(self, interaction: discord.Interaction, lagu: str):
         voice = getattr(interaction.user, 'voice', None)
         if not interaction.guild or not voice or not voice.channel:
