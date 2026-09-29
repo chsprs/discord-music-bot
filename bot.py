@@ -178,7 +178,12 @@ class MusicBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = discord.app_commands.CommandTree(self)
         self.states: dict[int, QueueState] = {}
-        self.tree.command(name='musik', description='Tampilkan panel musik dan panggil bot')(self.summon)
+        self.tree.command(name='musik', description='Tampilkan panel musik interaktif dan panggil bot')(self.summon)
+        self.tree.command(name='play', description='Putar lagu atau cari di YouTube')(self.cmd_play)
+        self.tree.command(name='skip', description='Lewati lagu yang sedang diputar')(self.cmd_skip)
+        self.tree.command(name='stop', description='Hentikan musik dan keluar dari voice')(self.cmd_stop)
+        self.tree.command(name='antrian', description='Tampilkan daftar antrian lagu')(self.cmd_queue)
+        self.tree.command(name='pause', description='Jeda atau lanjutkan pemutaran')(self.cmd_pause)
 
     async def setup_hook(self):
         self.add_view(MusicPanel(self))
@@ -209,6 +214,93 @@ class MusicBot(discord.Client):
         log.info('Bot login sebagai %s (ID: %s). Terhubung ke %d server: %s',
                  self.user, getattr(self.user, 'id', None), len(self.guilds),
                  ', '.join(guild_list) if guild_list else 'Belum ada server')
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                log.info('Command list tersinkron ke guild: %s (%s)', guild.name, guild.id)
+            except Exception as e:
+                log.error('Gagal sync command ke guild %s: %s', guild.id, e)
+
+    async def cmd_play(self, interaction: discord.Interaction, lagu: str):
+        voice = getattr(interaction.user, 'voice', None)
+        if not interaction.guild or not voice or not voice.channel:
+            return await interaction.response.send_message('Masuk voice channel dulu.', ephemeral=True)
+        await interaction.response.defer(thinking=True)
+        vc = interaction.guild.voice_client
+        if vc and vc.channel.id != voice.channel.id:
+            return await interaction.followup.send('Bot sedang dipakai di voice channel lain.', ephemeral=True)
+        if not vc:
+            try:
+                vc = await voice.channel.connect(timeout=20)
+            except Exception:
+                log.exception('Gagal masuk voice')
+                return await interaction.followup.send('Gagal masuk voice. Cek izin Connect/Speak.', ephemeral=True)
+        try:
+            track = await extract_track(lagu, interaction.user.display_name)
+            state = self.states.setdefault(interaction.guild.id, QueueState())
+            async with state.lock:
+                state.queue.append(track)
+                if not vc.is_playing() and not vc.is_paused() and not state.current:
+                    await self.advance(interaction.guild)
+            await interaction.followup.send(f'Ditambahkan ke antrian: **{discord.utils.escape_markdown(track.title)}**')
+        except Exception as exc:
+            log.warning('Pencarian gagal: %s', exc)
+            await interaction.followup.send('Gagal mencari lagu. Coba judul atau URL YouTube lain.', ephemeral=True)
+
+    async def cmd_skip(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        vc = interaction.guild.voice_client
+        if not vc or (not vc.is_playing() and not vc.is_paused()):
+            return await interaction.response.send_message('Tidak ada lagu yang sedang diputar.', ephemeral=True)
+        vc.stop()
+        await interaction.response.send_message('Lagu dilewati.')
+
+    async def cmd_stop(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        state = self.states.get(interaction.guild.id)
+        vc = interaction.guild.voice_client
+        if state:
+            async with state.lock:
+                state.generation += 1
+                state.queue.clear()
+                state.current = None
+                if state.idle_task:
+                    state.idle_task.cancel()
+                    state.idle_task = None
+        if vc:
+            vc.stop()
+            await vc.disconnect()
+        if state:
+            await self.refresh(state)
+        await interaction.response.send_message('Musik dihentikan dan bot keluar voice.')
+
+    async def cmd_queue(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        state = self.states.get(interaction.guild.id)
+        if not state or not state.queue:
+            return await interaction.response.send_message('Antrian lagu kosong.', ephemeral=True)
+        tracks = list(state.queue)[:10]
+        text = '\n'.join(f'{i}. {discord.utils.escape_markdown(t.title)}' for i, t in enumerate(tracks, 1))
+        await interaction.response.send_message(f'**Antrian Lagu:**\n{text}'[:1900], ephemeral=True)
+
+    async def cmd_pause(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        vc = interaction.guild.voice_client
+        if not vc:
+            return await interaction.response.send_message('Bot tidak ada di voice channel.', ephemeral=True)
+        if vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message('Pemutaran dijeda.')
+        elif vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message('Pemutaran dilanjutkan.')
+        else:
+            await interaction.response.send_message('Tidak ada lagu yang aktif.', ephemeral=True)
 
     async def summon(self, interaction: discord.Interaction):
         voice = getattr(interaction.user, 'voice', None)

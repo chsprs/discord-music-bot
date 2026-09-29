@@ -53,6 +53,12 @@ class MusicTests(unittest.TestCase):
                 # Should not raise exception
                 asyncio.run(bot.setup_hook())
 
+    def test_command_tree_has_all_music_commands(self):
+        bot = MusicBot()
+        commands = [c.name for c in bot.tree.get_commands()]
+        expected = {'musik', 'play', 'skip', 'stop', 'antrian', 'pause'}
+        self.assertTrue(expected.issubset(set(commands)), f'Missing commands in {commands}')
+
 
 if __name__ == '__main__':
     unittest.main()
