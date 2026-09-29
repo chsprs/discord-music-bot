@@ -232,7 +232,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(raw)))
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Referrer-Policy', 'same-origin')
         self.send_header('Content-Security-Policy',
                          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
         for key, value in (extra or {}).items():
@@ -259,17 +259,44 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _origin_ok(self, fields: dict) -> bool:
-        if self.headers.get('Sec-Fetch-Site', '') == 'cross-site':
-            return False
-        origin = self.headers.get('Origin')
-        if origin:
-            return urllib.parse.urlsplit(origin).netloc == self.headers.get('Host', '')
-        # Browser/webview without Origin: require a fresh nonce served in our page.
+        origin = (self.headers.get('Origin') or '').strip()
+        host = (self.headers.get('Host') or '').strip()
+        sec_fetch_site = (self.headers.get('Sec-Fetch-Site') or '').strip()
+
         candidate = fields.get('form_token', '')
         now = time.monotonic()
         with _lock:
             expiry = _form_tokens.get(candidate, 0) if candidate else 0
-            return bool(expiry > now)
+            has_valid_nonce = bool(expiry > now)
+
+        # 1. Explicit foreign Origin (e.g. http://evil.example): always reject
+        if origin and origin.lower() != 'null':
+            netloc = urllib.parse.urlsplit(origin).netloc
+            if netloc and netloc != host:
+                self.log_message('origin ditolak (foreign netloc %r != host %r)', netloc, host)
+                return False
+            if netloc and netloc == host:
+                return True
+
+        # 2. Sec-Fetch-Site: if cross-site without valid nonce, reject
+        if sec_fetch_site == 'cross-site' and not has_valid_nonce:
+            self.log_message('origin ditolak (cross-site tanpa nonce)')
+            return False
+
+        # 3. Valid page nonce accepted (covers Origin: null, missing Origin, in-app WebViews)
+        if has_valid_nonce:
+            return True
+
+        # 4. Fallback: Referer matching host
+        referer = (self.headers.get('Referer') or '').strip()
+        if referer:
+            ref_netloc = urllib.parse.urlsplit(referer).netloc
+            if ref_netloc and ref_netloc == host:
+                return True
+
+        self.log_message('origin ditolak (Origin=%r Host=%r Sec-Fetch-Site=%r nonce=%s)',
+                         origin, host, sec_fetch_site, has_valid_nonce)
+        return False
 
     def _body(self) -> dict:
         try:

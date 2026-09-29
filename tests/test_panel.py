@@ -225,6 +225,33 @@ class PasswordlessTests(unittest.TestCase):
         status, _ = self.req('POST', '/save', 'token=abc&guild=7')
         self.assertEqual(status, 403)
 
+    def test_origin_null_with_page_nonce_is_accepted(self):
+        _, page = self.req('GET', '/')
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        token = match.group(1)
+        status, _ = self.req('POST', '/save', f'token=abc&guild=7&form_token={token}',
+                             headers={'Origin': 'null'})
+        self.assertEqual(status, 303)
+        self.assertEqual(panel.ConfigStore(self.env).read()['token'], 'abc')
+
+    def test_origin_null_without_nonce_is_rejected(self):
+        status, _ = self.req('POST', '/save', 'token=abc&guild=7',
+                             headers={'Origin': 'null'})
+        self.assertEqual(status, 403)
+
+    def test_cross_site_fetch_site_with_page_nonce_is_accepted(self):
+        _, page = self.req('GET', '/')
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        token = match.group(1)
+        status, _ = self.req('POST', '/save', f'token=abc&guild=7&form_token={token}',
+                             headers={'Sec-Fetch-Site': 'cross-site'})
+        self.assertEqual(status, 303)
+        self.assertEqual(panel.ConfigStore(self.env).read()['token'], 'abc')
+
     def test_foreign_origin_rejected_even_with_nonce(self):
         _, page = self.req('GET', '/')
         match = re.search(r'name="form_token" value="([^"]+)"', page)
