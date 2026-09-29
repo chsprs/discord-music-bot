@@ -13,19 +13,23 @@ import time
 import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from socketserver import ThreadingMixIn
+from typing import Callable, Optional
 
 SERVICE = 'discord-music.service'
+TIMER = 'discord-music-update.timer'
 CONFIG_PATH = os.environ.get('BOT_CONFIG', '/opt/discord-music-bot/.env')
+UPDATE_LOG_PATH = os.environ.get('UPDATE_LOG', '/opt/discord-music-bot/last_update.log')
 PASSWORD = os.environ.get('PANEL_PASSWORD', '')
 COOKIE = 'music_session'
 LABEL = b'music-panel-v1'
 STORE = None
+UPDATE_RUNNER: Optional[Callable[[], tuple[bool, str]]] = None
 
 _attempts: dict[str, list] = {}
 _lock = threading.Lock()
 # Single-process LAN panel: short-lived nonce for form POST when browser omits Origin.
 _form_tokens: dict[str, float] = {}
+_last_update_output: str = ''
 
 
 class ConfigStore:
@@ -85,6 +89,91 @@ def bot_state() -> str:
         return state if state in {'active', 'inactive', 'failed'} else 'unknown'
     except Exception:
         return 'unknown'
+
+
+def timer_state() -> str:
+    try:
+        result = subprocess.run(['systemctl', 'is-active', TIMER],
+                                capture_output=True, text=True, timeout=2)
+        state = result.stdout.strip()
+        return 'Aktif (Mingguan)' if state == 'active' else 'Nonaktif'
+    except Exception:
+        return 'Tidak terpasang'
+
+
+def ytdlp_version() -> str:
+    try:
+        import yt_dlp.version
+        return getattr(yt_dlp.version, '__version__', 'terpasang')
+    except Exception:
+        return 'tidak diketahui'
+
+
+def read_last_update_log() -> str:
+    global _last_update_output
+    if _last_update_output:
+        return _last_update_output
+    try:
+        if os.path.exists(UPDATE_LOG_PATH):
+            with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
+                return handle.read().strip()
+    except Exception:
+        pass
+    return ''
+
+
+def read_bot_logs(lines: int = 35) -> str:
+    try:
+        res = subprocess.run(
+            ['journalctl', '-u', SERVICE, '-n', str(lines), '--no-pager'],
+            capture_output=True, text=True, timeout=4
+        )
+        out = res.stdout.strip()
+        return out if out else '(Belum ada log tercatat)'
+    except Exception as exc:
+        return f'(Gagal membaca log: {exc})'
+
+
+def run_update() -> tuple[bool, str]:
+    global _last_update_output
+    if UPDATE_RUNNER is not None:
+        ok, out = UPDATE_RUNNER()
+        _last_update_output = out
+        return ok, out
+
+    update_script = '/opt/discord-music-bot/update.sh'
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    if os.path.exists(update_script) and os.access(update_script, os.X_OK):
+        cmd = [update_script]
+    else:
+        pip_bin = '/opt/discord-music-bot/venv/bin/pip'
+        if not os.path.exists(pip_bin):
+            pip_bin = sys.executable.replace('python', 'pip')
+        cmd = [pip_bin, 'install', '-U', 'yt-dlp']
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        out = (proc.stdout + '\n' + proc.stderr).strip()
+        ok = (proc.returncode == 0)
+        if ok and cmd != [update_script] and bot_state() == 'active':
+            subprocess.run(['systemctl', 'restart', SERVICE], timeout=15)
+            out += '\nService discord-music.service berhasil dimulai ulang.'
+        if os.path.exists(UPDATE_LOG_PATH):
+            try:
+                with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
+                    file_content = handle.read().strip()
+                if file_content:
+                    _last_update_output = file_content
+                    return ok, file_content
+            except Exception:
+                pass
+        log_content = f'[{timestamp}] Exit code: {proc.returncode}\n{out}'
+        _last_update_output = log_content
+        return ok, log_content
+    except Exception as exc:
+        err = f'[{timestamp}] Update gagal dijalankan: {exc}'
+        _last_update_output = err
+        return False, err
 
 
 def masked(token: str) -> str:
@@ -147,6 +236,9 @@ letter-spacing:.05em;padding:3px 9px;border-radius:999px}
 .note{font-size:12px;color:var(--muted);margin-top:12px}
 .msg{border:1px solid var(--line);background:#f7f6f3;border-radius:8px;
 padding:10px 12px;font-size:13px;margin-bottom:16px}
+.log-box{background:#18181b;color:#e4e4e7;padding:12px;border-radius:8px;
+font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:250px;
+overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
 @media(max-width:540px){.kv{flex-direction:column;gap:2px}}
 </style></head><body><main>
 <h1>Panel Bot Musik</h1>
@@ -182,6 +274,23 @@ pernah ditampilkan kembali. Menyimpan tidak menyalakan bot.</p>
 </div>
 <p class="note">Setelah bot aktif, buka Discord, masuk voice channel, lalu ketik
 <code>/musik</code> dan pakai tombol panel.</p>
+</section>
+<section>
+<h2>Pembaruan yt-dlp & Komponen</h2>
+<div class="kv"><span>Versi yt-dlp saat ini</span><span><code>{ytdlp_version}</code></span></div>
+<div class="kv"><span>Auto-update berkala</span><span>{timer_state}</span></div>
+<form method="post" action="/update">
+<input type="hidden" name="form_token" value="{form_token}">
+<button type="submit" class="ghost">Perbarui yt-dlp sekarang</button>
+</form>
+{update_log_section}
+</section>
+<section>
+<div style="display:flex;justify-content:space-between;align-items:center">
+<h2 style="margin:0">Log Aktivitas Bot (Journalctl)</h2>
+<form method="get" action="/"><button type="submit" class="ghost" style="margin:0;padding:4px 10px;font-size:12px">Segarkan</button></form>
+</div>
+<pre class="log-box">{bot_logs}</pre>
 </section>
 <section>
 <h2>Cara mengundang bot</h2>
@@ -221,8 +330,8 @@ placeholder="Password panel" autofocus>
 class Handler(BaseHTTPRequestHandler):
     server_version = 'MusicPanel/1.0'
 
-    def log_message(self, fmt, *args):
-        sys.stderr.write('%s - %s\n' % (self.address_string(), fmt % args))
+    def log_message(self, format: str, *args):
+        sys.stderr.write('%s - %s\n' % (self.address_string(), format % args))
 
     # ---- helpers -------------------------------------------------
     def _send(self, status, body: str, ctype='text/html; charset=utf-8', extra=None):
@@ -324,6 +433,16 @@ class Handler(BaseHTTPRequestHandler):
                 'token_set': bool(data['token']),
                 'token_hint': masked(data['token']),
                 'guild': data['guild'],
+                'ytdlp_version': ytdlp_version(),
+                'timer': timer_state(),
+            })
+        if path == '/api/logs':
+            if not self._authenticated():
+                return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
+            return self._json(HTTPStatus.OK, {
+                'bot_logs': read_bot_logs(50),
+                'update_log': read_last_update_log(),
+                'ytdlp_version': ytdlp_version(),
             })
         if path in ('/', '/index.html'):
             if not self._authenticated():
@@ -338,7 +457,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         if path == '/login':
             return self._login()
-        if path not in ('/save', '/start', '/restart', '/stop'):
+        if path not in ('/save', '/start', '/restart', '/stop', '/update'):
             return self._send(HTTPStatus.NOT_FOUND, 'Tidak ditemukan')
         if not self._authenticated():
             return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
@@ -347,6 +466,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(HTTPStatus.FORBIDDEN, {'error': 'origin'})
         if path == '/save':
             return self._save(fields)
+        if path == '/update':
+            return self._update()
         return self._service(path.lstrip('/'))
 
     def do_PUT(self):
@@ -371,6 +492,18 @@ class Handler(BaseHTTPRequestHandler):
                     _form_tokens.pop(key, None)
             form_token = secrets.token_urlsafe(24)
             _form_tokens[form_token] = now + 900
+
+        last_log = read_last_update_log()
+        if last_log:
+            update_log_section = (
+                '<div style="margin-top:14px">'
+                '<label style="font-size:12px;color:var(--muted)">Log Pembaruan Terakhir:</label>'
+                f'<pre class="log-box" style="max-height:160px">{html.escape(last_log)}</pre>'
+                '</div>'
+            )
+        else:
+            update_log_section = ''
+
         page = (PAGE
                 .replace('{form_token}', form_token)
                 .replace('{message}', banner)
@@ -380,7 +513,11 @@ class Handler(BaseHTTPRequestHandler):
                 .replace('{token_placeholder}', 'kosong = pakai token lama'
                          if data['token'] else 'tempel token bot di sini')
                 .replace('{guild}', html.escape(data['guild']))
-                .replace('{config}', html.escape(CONFIG_PATH)))
+                .replace('{config}', html.escape(CONFIG_PATH))
+                .replace('{ytdlp_version}', html.escape(ytdlp_version()))
+                .replace('{timer_state}', html.escape(timer_state()))
+                .replace('{update_log_section}', update_log_section)
+                .replace('{bot_logs}', html.escape(read_bot_logs(35))))
         self._send(status, page)
 
     # ---- actions -------------------------------------------------
@@ -416,6 +553,13 @@ class Handler(BaseHTTPRequestHandler):
         self.log_message('konfigurasi disimpan (token_set=%s guild_set=%s)',
                          bool(token), bool(guild))
         return self._redirect('/')
+
+    def _update(self):
+        ok, _ = run_update()
+        if ok:
+            return self._page('Pembaruan yt-dlp berhasil dijalankan.')
+        return self._page('Pembaruan yt-dlp gagal: periksa log pembaruan di bawah.',
+                          HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _service(self, action):
         data = store().read()

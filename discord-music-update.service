@@ -1,0 +1,9 @@
+[Unit]
+Description=Auto-update yt-dlp for Discord Music Bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/discord-music-bot/update.sh
+WorkingDirectory=/opt/discord-music-bot

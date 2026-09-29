@@ -63,13 +63,17 @@ EOF
     chmod 600 "$PANEL_ENV"
 fi
 
-# 5. Pasang dan Aktifkan systemd service
+# 5. Pasang dan Aktifkan systemd service & timer
 echo "[5/6] Memasang dan mengaktifkan service systemd..."
 cp "$INSTALL_DIR/discord-music.service" /etc/systemd/system/discord-music.service
 cp "$INSTALL_DIR/discord-music-panel.service" /etc/systemd/system/discord-music-panel.service
+cp "$INSTALL_DIR/discord-music-update.service" /etc/systemd/system/discord-music-update.service
+cp "$INSTALL_DIR/discord-music-update.timer" /etc/systemd/system/discord-music-update.timer
+chmod +x "$INSTALL_DIR/update.sh"
 
 systemctl daemon-reload
-systemctl enable discord-music.service discord-music-panel.service
+systemctl enable discord-music.service discord-music-panel.service discord-music-update.timer
+systemctl start discord-music-update.timer
 systemctl restart discord-music-panel.service
 
 # 6. Jalankan unit test

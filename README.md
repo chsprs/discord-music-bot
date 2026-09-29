@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-39%2F39%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-44%2F44%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -50,10 +50,15 @@ Bot musik Discord ultra-ringan, hemat sumber daya (<50MB RAM), dan bebas iklan y
   - **Loop Mode:** Siklus pengulangan 3-arah: *Track* (ulang 1 lagu), *Queue* (ulang seluruh antrian), atau *Off*.
   - **Shuffle:** Mengacak urutan antrian lagu seketika secara acak.
   - **History Backtracking:** Menyimpan riwayat lagu yang baru diputar agar tombol `Back` dapat memutar ulang lagu sebelumnya.
-- **Web Control Panel Mandiri:**
+- **Web Control Panel Mandiri & Pemantau Log:**
   - Web dashboard di port `9130` (dibangun murni dengan Python standard library HTTP, aman dengan proteksi CSRF token & nonce).
   - Konfigurasi token bot & ID server Discord langsung dari browser tanpa perlu SSH ke server.
   - Monitor status service & tombol kontrol start / restart / stop service dari web.
+  - **Tombol Pembaruan Manual:** Perbarui `yt-dlp` seketika lewat tombol web lengkap dengan riwayat log keluaran terminal.
+  - **Pemantau Log Realtime:** Kotak log aktivitas bot (`journalctl`) yang dapat disegarkan langsung dari antarmuka web.
+- **Auto-Update Berkala & Zero-Warning JS Runtime:**
+  - **Systemd Timer Mingguan:** Menjalankan pembaruan otomatis `yt-dlp` setiap Minggu pukul 04:00 WIB agar cipher extractor YouTube selalu mutakhir.
+  - **Integrasi JS Engine:** Terhubung ke Node.js runtime untuk menyelesaikan challenge player API YouTube (EJS) tanpa pesan warning deprecation.
 - **Auto-Sync & Auto-Start:**
   - Sinkronisasi slash command otomatis ke seluruh server Discord saat bot dinyalakan atau diundang ke server baru (`on_guild_join`).
   - Service systemd terintegrasi untuk otomatis jalan saat server / STB dinyalakan ulang.
@@ -157,18 +162,21 @@ Saat membuat aplikasi bot di [Discord Developer Portal](https://discord.com/deve
 
 ```
 /opt/discord-music-bot/
-├── bot.py                      # Core bot Discord (audio pipeline, queue, commands, UI View)
-├── panel.py                    # Web Control Panel LAN mandiri (stdlib HTTP, CSRF-safe)
-├── requirements.txt            # Dependensi Python pip (discord.py, yt-dlp)
-├── install.sh                  # Skrip instalasi otomatis satu baris
-├── discord-music.service       # Service systemd bot musik
-├── discord-music-panel.service # Service systemd web dashboard
-├── .env.example                # Templat variabel lingkungan
+├── bot.py                        # Core bot Discord (audio pipeline, queue, commands, UI View)
+├── panel.py                      # Web Control Panel LAN mandiri (stdlib HTTP, CSRF-safe, log viewer)
+├── update.sh                     # Skrip pembaruan otomatis yt-dlp & restart bot
+├── requirements.txt              # Dependensi Python pip (discord.py, yt-dlp)
+├── install.sh                    # Skrip instalasi otomatis satu baris
+├── discord-music.service         # Service systemd bot musik
+├── discord-music-panel.service   # Service systemd web dashboard
+├── discord-music-update.service  # Service oneshot pembaruan yt-dlp
+├── discord-music-update.timer    # Timer mingguan auto-update
+├── .env.example                  # Templat variabel lingkungan
 ├── .gitignore
-├── README.md                   # Dokumentasi proyek
+├── README.md                     # Dokumentasi proyek
 └── tests/
-    ├── test_bot.py             # Unit test core bot, UI View, queue, dan commands
-    └── test_panel.py           # Unit test web panel, keamanan CSRF, dan konfigurasi
+    ├── test_bot.py               # Unit test core bot, UI View, queue, dan commands
+    └── test_panel.py             # Unit test web panel, update endpoint, keamanan CSRF
 ```
 
 ---
@@ -184,7 +192,7 @@ PYTHONPATH=. ./venv/bin/python -m unittest discover -s tests -v
 
 Hasil uji:
 ```
-Ran 39 tests in 1.126s
+Ran 44 tests in 2.061s
 OK
 ```
 
@@ -193,17 +201,19 @@ OK
 ## 📊 Manajemen Service Linux
 
 ```bash
-# Cek status bot
+# Cek status bot & web panel
 sudo systemctl status discord-music.service
+sudo systemctl status discord-music-panel.service
+
+# Melihat status timer auto-update mingguan
+sudo systemctl status discord-music-update.timer
+sudo systemctl list-timers | grep discord
 
 # Melihat log bot secara realtime
 sudo journalctl -u discord-music.service -f
 
-# Restart bot
-sudo systemctl restart discord-music.service
-
-# Restart web control panel
-sudo systemctl restart discord-music-panel.service
+# Menjalankan pembaruan yt-dlp manual via terminal
+sudo /opt/discord-music-bot/update.sh
 ```
 
 ---

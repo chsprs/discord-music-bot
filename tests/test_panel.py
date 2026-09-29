@@ -129,6 +129,32 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertNotIn('Traceback', body)
 
+    def test_update_requires_authentication(self):
+        status, _, _ = self.req('POST', '/update')
+        self.assertIn(status, (401, 403))
+
+    def test_update_executes_and_displays_log(self):
+        cookie = self.login()
+        panel.UPDATE_RUNNER = lambda: (True, '[Mock] yt-dlp updated successfully v2026.09.01')
+        status, body, _ = self.req('POST', '/update', '', cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertIn('Pembaruan yt-dlp berhasil dijalankan', body)
+        self.assertIn('yt-dlp updated successfully', body)
+        panel.UPDATE_RUNNER = None
+
+    def test_api_logs_requires_authentication(self):
+        status, _, _ = self.req('GET', '/api/logs')
+        self.assertEqual(status, 401)
+
+    def test_api_logs_returns_payload(self):
+        cookie = self.login()
+        status, body, _ = self.req('GET', '/api/logs', cookie=cookie)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIn('bot_logs', data)
+        self.assertIn('update_log', data)
+        self.assertIn('ytdlp_version', data)
+
 
 class ConfigStoreTests(unittest.TestCase):
     def test_read_missing_file_returns_empty(self):
@@ -200,6 +226,15 @@ class PasswordlessTests(unittest.TestCase):
         origin = f'http://127.0.0.1:{self.port}'
         status, _ = self.req('POST', '/start', '', headers={'Origin': origin})
         self.assertEqual(status, 400)
+
+    def test_passwordless_update_executes(self):
+        origin = f'http://127.0.0.1:{self.port}'
+        panel.UPDATE_RUNNER = lambda: (True, '[Mock] Update OK')
+        status, body = self.req('POST', '/update', '', headers={'Origin': origin})
+        self.assertEqual(status, 200)
+        self.assertIn('Pembaruan yt-dlp berhasil dijalankan', body)
+        self.assertIn('[Mock] Update OK', body)
+        panel.UPDATE_RUNNER = None
 
     def test_browser_form_without_origin_uses_page_nonce(self):
         status, page = self.req('GET', '/')

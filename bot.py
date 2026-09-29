@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import shutil
 from collections import deque
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
@@ -60,7 +61,21 @@ def checked_query(query: str) -> str:
     return f'ytsearch1:{query}'
 
 
-_JS_RUNTIME = {'node': {'path': '/usr/local/bin/node'}} if os.path.exists('/usr/local/bin/node') else {}
+def _detect_js_runtime() -> dict:
+    candidates = [
+        ('node', '/usr/local/bin/node'),
+        ('node', shutil.which('node')),
+        ('node', '/usr/bin/node'),
+        ('deno', shutil.which('deno')),
+        ('bun', shutil.which('bun')),
+    ]
+    for name, path in candidates:
+        if path and os.path.exists(path):
+            return {name: {'path': path}}
+    return {}
+
+
+_JS_RUNTIME = _detect_js_runtime()
 
 METADATA_OPTIONS = {
     'format': 'bestaudio/best',
