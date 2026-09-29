@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import re
 import stat
 import tempfile
 import threading
@@ -199,6 +200,40 @@ class PasswordlessTests(unittest.TestCase):
         origin = f'http://127.0.0.1:{self.port}'
         status, _ = self.req('POST', '/start', '', headers={'Origin': origin})
         self.assertEqual(status, 400)
+
+    def test_browser_form_without_origin_uses_page_nonce(self):
+        status, page = self.req('GET', '/')
+        self.assertEqual(status, 200)
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        token = match.group(1)
+        status, _ = self.req('POST', '/save', f'token=abc&guild=7&form_token={token}')
+        self.assertEqual(status, 303)
+        self.assertEqual(panel.ConfigStore(self.env).read()['token'], 'abc')
+
+    def test_no_origin_start_with_page_nonce_reaches_validation(self):
+        _, page = self.req('GET', '/')
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        status, body = self.req('POST', '/start', f'form_token={match.group(1)}')
+        self.assertEqual(status, 400)
+        self.assertIn('Token Discord belum diisi', body)
+
+    def test_no_origin_without_page_nonce_stays_rejected(self):
+        status, _ = self.req('POST', '/save', 'token=abc&guild=7')
+        self.assertEqual(status, 403)
+
+    def test_foreign_origin_rejected_even_with_nonce(self):
+        _, page = self.req('GET', '/')
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        token = match.group(1)
+        status, _ = self.req('POST', '/save', f'token=abc&guild=7&form_token={token}',
+                             headers={'Origin': 'http://evil.example'})
+        self.assertEqual(status, 403)
 
     def test_login_page_redirects_home_when_passwordless(self):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)

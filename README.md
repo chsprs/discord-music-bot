@@ -4,7 +4,7 @@ Bot Discord ringan: `/musik` sekali untuk masuk voice dan mengirim panel. Setela
 
 ## Status
 
-Kode dan uji lokal siap. **Belum login ke Discord; belum ada token, guild ID, atau pengujian voice end-to-end.** Service belum dipasang/diaktifkan. Penggunaan RAM/CPU nyata belum diukur; klaim `<100 MB` dan `<3%` dari percakapan sebelumnya bukan hasil pengukuran.
+Kode dan uji lokal siap. **Belum login ke Discord; token/guild ID dan voice belum terverifikasi.** Service bot belum dipasang/diaktifkan. Panel LAN aktif sebagai service terpisah; pengguna memilih tanpa sandi. Penggunaan RAM/CPU nyata belum diukur.
 
 ## Syarat
 
@@ -17,10 +17,10 @@ Kode dan uji lokal siap. **Belum login ke Discord; belum ada token, guild ID, at
 
 `panel.py` — panel lokal stdlib-only di `http://192.168.1.100:9130`.
 
-- Login wajib (password dari `PANEL_PASSWORD`). Sesi memakai HMAC, bukan password mentah.
+- Login opsional (`PANEL_PASSWORD`). Saat ini panel **tanpa sandi** sesuai pilihan pengguna, terikat ke IP LAN `192.168.1.100` saja. Jangan buka port ke internet/Tailscale.
 - Menampilkan status service bot, menyimpan `DISCORD_TOKEN` dan `DISCORD_GUILD_ID` ke `.env` mode `0600`. Token **tidak pernah** ditampilkan kembali.
 - Tombol **Nyalakan / Mulai ulang / Matikan** memanggil `systemctl` untuk `discord-music.service`.
-- CSRF: POST tanpa `Origin` yang cocok ditolak; metode selain GET/HEAD/POST dibalas `405`.
+- CSRF: tolak `Origin` asing; saat browser tidak mengirim `Origin`, wajib sertakan nonce sementara dari halaman panel. Metode selain GET/HEAD/POST dibalas `405`.
 
 Jalankan manual (uji):
 
@@ -29,9 +29,9 @@ PANEL_PASSWORD='pilih-sandi-kuat' PANEL_PORT=9130 \
   /opt/discord-music-bot/venv/bin/python /opt/discord-music-bot/panel.py
 ```
 
-Sebagai service: simpan sandi di `/opt/discord-music-panel.env` (`PANEL_PASSWORD=...`, mode `600`), lalu pasang `discord-music-panel.service`. **Belum dipasang/diaktifkan.**
+Sebagai service: panel memakai `/opt/discord-music-panel.env` (`PANEL_HOST=192.168.1.100`, `PANEL_PORT=9130`, `PANEL_PASSWORD=`). Unit `discord-music-panel.service` aktif. Unit bot `discord-music.service` masih belum dipasang; butuh izin terpisah untuk pemasangan dan penyalaan.
 
-> Peringatan: HTTP di LAN tidak mengenkripsi sandi/token saat dikirim dari browser. Pakai hanya di jaringan rumah tepercaya; jangan buka port ini ke internet.
+> Peringatan: HTTP di LAN tidak mengenkripsi token saat dikirim dari browser. Pakai hanya di jaringan rumah tepercaya; jangan buka port ini ke internet.
 
 ## Verifikasi sebelum aktivasi
 

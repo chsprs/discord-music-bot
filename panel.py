@@ -4,6 +4,7 @@ import hmac
 import html
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -23,6 +24,8 @@ STORE = None
 
 _attempts: dict[str, list] = {}
 _lock = threading.Lock()
+# Single-process LAN panel: short-lived nonce for form POST when browser omits Origin.
+_form_tokens: dict[str, float] = {}
 
 
 class ConfigStore:
@@ -156,6 +159,7 @@ padding:10px 12px;font-size:13px;margin-bottom:16px}
 <div class="kv"><span>Guild ID</span><span>{guild}</span></div>
 </section>
 <form method="post" action="/save">
+<input type="hidden" name="form_token" value="{form_token}">
 <section>
 <h2>Konfigurasi</h2>
 <label for="token">Token bot Discord</label>
@@ -172,9 +176,9 @@ pernah ditampilkan kembali. Menyimpan tidak menyalakan bot.</p>
 <section>
 <h2>Jalankan</h2>
 <div class="row">
-<form method="post" action="/start"><button type="submit">Nyalakan bot</button></form>
-<form method="post" action="/restart"><button class="ghost" type="submit">Mulai ulang</button></form>
-<form method="post" action="/stop"><button class="ghost" type="submit">Matikan</button></form>
+<form method="post" action="/start"><input type="hidden" name="form_token" value="{form_token}"><button type="submit">Nyalakan bot</button></form>
+<form method="post" action="/restart"><input type="hidden" name="form_token" value="{form_token}"><button class="ghost" type="submit">Mulai ulang</button></form>
+<form method="post" action="/stop"><input type="hidden" name="form_token" value="{form_token}"><button class="ghost" type="submit">Matikan</button></form>
 </div>
 <p class="note">Setelah bot aktif, buka Discord, masuk voice channel, lalu ketik
 <code>/musik</code> dan pakai tombol panel.</p>
@@ -254,15 +258,18 @@ class Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
-    def _origin_ok(self) -> bool:
-        site = self.headers.get('Sec-Fetch-Site', '')
-        if site == 'cross-site':
+    def _origin_ok(self, fields: dict) -> bool:
+        if self.headers.get('Sec-Fetch-Site', '') == 'cross-site':
             return False
         origin = self.headers.get('Origin')
-        if not origin:
-            return False
-        host = self.headers.get('Host', '')
-        return urllib.parse.urlsplit(origin).netloc == host
+        if origin:
+            return urllib.parse.urlsplit(origin).netloc == self.headers.get('Host', '')
+        # Browser/webview without Origin: require a fresh nonce served in our page.
+        candidate = fields.get('form_token', '')
+        now = time.monotonic()
+        with _lock:
+            expiry = _form_tokens.get(candidate, 0) if candidate else 0
+            return bool(expiry > now)
 
     def _body(self) -> dict:
         try:
@@ -308,10 +315,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(HTTPStatus.NOT_FOUND, 'Tidak ditemukan')
         if not self._authenticated():
             return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
-        if not self._origin_ok():
+        fields = self._body()
+        if not self._origin_ok(fields):
             return self._json(HTTPStatus.FORBIDDEN, {'error': 'origin'})
         if path == '/save':
-            return self._save()
+            return self._save(fields)
         return self._service(path.lstrip('/'))
 
     def do_PUT(self):
@@ -329,7 +337,15 @@ class Handler(BaseHTTPRequestHandler):
         data = store().read()
         state = bot_state()
         banner = f'<div class="msg">{html.escape(message)}</div>' if message else ''
+        now = time.monotonic()
+        with _lock:
+            for key, expiry in list(_form_tokens.items()):
+                if expiry <= now:
+                    _form_tokens.pop(key, None)
+            form_token = secrets.token_urlsafe(24)
+            _form_tokens[form_token] = now + 900
         page = (PAGE
+                .replace('{form_token}', form_token)
                 .replace('{message}', banner)
                 .replace('{state_class}', 'on' if state == 'active' else 'off')
                 .replace('{state}', html.escape(state))
@@ -357,8 +373,7 @@ class Handler(BaseHTTPRequestHandler):
         time.sleep(0.4)
         return self._login_page('Password salah.', HTTPStatus.FORBIDDEN)
 
-    def _save(self):
-        fields = self._body()
+    def _save(self, fields):
         current = store().read()
         token = fields.get('token', '').strip() or current['token']
         guild = fields.get('guild', '').strip()
