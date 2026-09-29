@@ -43,6 +43,16 @@ class MusicTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 asyncio.run(extract_track('impossible song', 'vito'))
 
+    def test_setup_hook_handles_sync_forbidden(self):
+        bot = MusicBot()
+        mock_resp = unittest.mock.MagicMock()
+        mock_resp.status = 403
+        mock_resp.reason = 'Forbidden'
+        with patch.object(bot.tree, 'sync', side_effect=discord.Forbidden(mock_resp, 'Missing Access')):
+            with patch('bot.os.getenv', return_value='12345'):
+                # Should not raise exception
+                asyncio.run(bot.setup_hook())
+
 
 if __name__ == '__main__':
     unittest.main()

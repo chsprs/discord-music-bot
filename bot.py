@@ -186,9 +186,29 @@ class MusicBot(discord.Client):
         if guild_id:
             guild = discord.Object(id=int(guild_id))
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+                log.info('Slash command /musik tersinkron ke guild %s', guild_id)
+            except discord.Forbidden as exc:
+                log.error('Gagal sync command ke guild %s: %s (Missing Access). '
+                          'Pastikan bot diundang dengan scope "applications.commands" dan ID adalah Server ID.',
+                          guild_id, exc)
+            except Exception:
+                log.exception('Gagal sync slash command ke guild %s', guild_id)
         else:
-            await self.tree.sync()
+            try:
+                await self.tree.sync()
+                log.info('Slash command /musik tersinkron global')
+            except discord.Forbidden as exc:
+                log.error('Gagal sync command global: %s', exc)
+            except Exception:
+                log.exception('Gagal sync slash command global')
+
+    async def on_ready(self):
+        guild_list = [f'{g.name} ({g.id})' for g in self.guilds]
+        log.info('Bot login sebagai %s (ID: %s). Terhubung ke %d server: %s',
+                 self.user, getattr(self.user, 'id', None), len(self.guilds),
+                 ', '.join(guild_list) if guild_list else 'Belum ada server')
 
     async def summon(self, interaction: discord.Interaction):
         voice = getattr(interaction.user, 'voice', None)
