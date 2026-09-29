@@ -44,7 +44,7 @@ def checked_query(query: str) -> str:
 _JS_RUNTIME = {'node': {'path': '/usr/local/bin/node'}} if os.path.exists('/usr/local/bin/node') else {}
 
 METADATA_OPTIONS = {
-    'format': 'bestaudio[acodec=opus]/bestaudio',
+    'format': 'bestaudio/best',
     'quiet': True,
     'extract_flat': 'in_playlist',
     'ignoreerrors': True,
@@ -53,7 +53,7 @@ METADATA_OPTIONS = {
 }
 
 STREAM_OPTIONS = {
-    'format': 'bestaudio[acodec=opus]/bestaudio',
+    'format': 'bestaudio/best',
     'noplaylist': True,
     'quiet': True,
     'skip_download': True,
@@ -113,11 +113,15 @@ async def extract_track(query: str, requester: str) -> Track:
     return tracks[0]
 
 
-def source_for(data: dict) -> discord.FFmpegOpusAudio:
-    codec = 'copy' if data.get('acodec') == 'opus' else 'libopus'
-    return discord.FFmpegOpusAudio(data['url'], codec=codec,
+def source_for(data: dict, bitrate_kbps: int = 128) -> discord.FFmpegOpusAudio:
+    bitrate = min(max(bitrate_kbps, 64), 160)
+    return discord.FFmpegOpusAudio(
+        data['url'],
+        codec='encode',
+        bitrate=bitrate,
         before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-        options='-vn')
+        options='-vn -application audio -compression_level 10 -vbr on'
+    )
 
 
 def same_voice(interaction: discord.Interaction) -> bool:
@@ -425,7 +429,8 @@ class MusicBot(discord.Client):
             try:
                 # Refresh signed CDN URL only when track actually starts.
                 data = await asyncio.to_thread(extract, track.url)
-                source = source_for(data)
+                bitrate_kbps = getattr(vc.channel, 'bitrate', 96000) // 1000
+                source = source_for(data, bitrate_kbps=bitrate_kbps)
                 generation = state.generation
                 def after(error):
                     if error:

@@ -26,12 +26,13 @@ class MusicTests(unittest.TestCase):
         self.assertTrue(view.is_persistent())
         self.assertEqual(len(view.children), 5)
 
-    def test_source_only_copies_known_opus(self):
+    def test_source_configures_high_quality_audio(self):
         with patch('bot.discord.FFmpegOpusAudio') as audio:
-            source_for({'url': 'https://example.com/audio', 'acodec': 'opus'})
-            self.assertEqual(audio.call_args.kwargs['codec'], 'copy')
-            source_for({'url': 'https://example.com/audio', 'acodec': 'mp4a.40.2'})
-            self.assertEqual(audio.call_args.kwargs['codec'], 'libopus')
+            source_for({'url': 'https://example.com/audio'}, bitrate_kbps=96)
+            self.assertEqual(audio.call_args.kwargs['codec'], 'encode')
+            self.assertEqual(audio.call_args.kwargs['bitrate'], 96)
+            self.assertIn('-application audio', audio.call_args.kwargs['options'])
+            self.assertIn('-compression_level 10', audio.call_args.kwargs['options'])
 
     def test_search_rejects_bad_urls(self):
         with self.assertRaises(ValueError):
