@@ -20,6 +20,10 @@ Bot musik Discord ultra-ringan (<50MB RAM) yang dirancang khusus untuk Linux SBC
   - `/stop` — Menghentikan pemutaran dan mengeluarkan bot dari voice channel.
   - `/antrian` — Menampilkan daftar antrian lagu.
   - `/pause` — Menjeda atau melanjutkan pemutaran.
+  - `/volume <0-200>` — Mengatur tingkat kekerasan suara lagu.
+- **Pengaturan Volume Realtime:**
+  - Tombol panel interaktif: `🔉 -10%`, `🔊 +10%`, `Atur Vol` (pop-up modal input angka presisi), dan `100%` (reset cepat).
+  - Menggunakan `PCMVolumeTransformer` terintegrasi encoder Opus C-native sehingga volume berubah seketika tanpa stuttering.
 - **Web Control Panel Mandiri:**
   - Dijalankan via `panel.py` pada port `9130` (stdlib HTTP, CSRF-protected).
   - Memungkinkan input Bot Token dan Server ID langsung dari browser tanpa membuka terminal.
@@ -45,7 +49,7 @@ Skrip installer otomatis:
 2. Menyiapkan Python virtual environment dan dependensi `pip`.
 3. Memasang unit systemd `discord-music.service` dan `discord-music-panel.service`.
 4. Mengaktifkan auto-start saat server boot.
-5. Menjalankan unit test mandiri (37/37 passing).
+5. Menjalankan unit test mandiri (38/38 passing).
 6. Menyalakan Web Control Panel di port `9130`.
 
 ---

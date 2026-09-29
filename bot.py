@@ -23,6 +23,7 @@ class Track:
 class QueueState:
     queue: deque[Track] = field(default_factory=deque)
     current: Track | None = None
+    volume: float = 1.0
     generation: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     message: discord.Message | None = None
@@ -113,15 +114,13 @@ async def extract_track(query: str, requester: str) -> Track:
     return tracks[0]
 
 
-def source_for(data: dict, bitrate_kbps: int = 128) -> discord.FFmpegOpusAudio:
-    bitrate = min(max(bitrate_kbps, 64), 160)
-    return discord.FFmpegOpusAudio(
+def source_for(data: dict, volume: float = 1.0) -> discord.PCMVolumeTransformer:
+    pcm = discord.FFmpegPCMAudio(
         data['url'],
-        codec='encode',
-        bitrate=bitrate,
         before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-        options='-vn -application audio -compression_level 10 -vbr on'
+        options='-vn'
     )
+    return discord.PCMVolumeTransformer(pcm, volume=volume)
 
 
 def same_voice(interaction: discord.Interaction) -> bool:
@@ -161,6 +160,30 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
             await interaction.followup.send(f'Gagal memproses lagu: {exc}', ephemeral=True)
 
 
+class VolumeModal(discord.ui.Modal, title='Atur Volume'):
+    level = discord.ui.TextInput(
+        label='Tingkat Volume (%)',
+        placeholder='Contoh: 80 (antara 0 sampai 200)',
+        min_length=1,
+        max_length=4
+    )
+
+    def __init__(self, bot: 'MusicBot'):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not same_voice(interaction):
+            return await interaction.response.send_message('Masuk ke voice channel bot dulu.', ephemeral=True)
+        try:
+            val = int(str(self.level).strip().rstrip('%'))
+            if val < 0 or val > 200:
+                return await interaction.response.send_message('Volume harus antara 0% sampai 200%.', ephemeral=True)
+            await self.bot.change_volume(interaction, val / 100.0)
+        except ValueError:
+            await interaction.response.send_message('Masukkan angka valid (contoh: 80).', ephemeral=True)
+
+
 class MusicPanel(discord.ui.View):
     def __init__(self, bot: 'MusicBot'):
         super().__init__(timeout=None)
@@ -174,12 +197,12 @@ class MusicPanel(discord.ui.View):
         state.message = interaction.message
         return True
 
-    @discord.ui.button(label='Cari / Tambah', style=discord.ButtonStyle.success, custom_id='music:add')
+    @discord.ui.button(label='Cari / Tambah', style=discord.ButtonStyle.success, custom_id='music:add', row=0)
     async def add(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await self.guard(interaction):
             await interaction.response.send_modal(SearchModal(self.bot))
 
-    @discord.ui.button(label='Jeda / Lanjut', style=discord.ButtonStyle.secondary, custom_id='music:pause')
+    @discord.ui.button(label='Jeda / Lanjut', style=discord.ButtonStyle.secondary, custom_id='music:pause', row=0)
     async def pause(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.guard(interaction):
             return
@@ -194,7 +217,7 @@ class MusicPanel(discord.ui.View):
             text = 'Tidak ada lagu aktif.'
         await interaction.response.send_message(text, ephemeral=True)
 
-    @discord.ui.button(label='Lewati', style=discord.ButtonStyle.primary, custom_id='music:skip')
+    @discord.ui.button(label='Lewati', style=discord.ButtonStyle.primary, custom_id='music:skip', row=0)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.guard(interaction):
             return
@@ -206,7 +229,7 @@ class MusicPanel(discord.ui.View):
             text = 'Tidak ada lagu aktif.'
         await interaction.response.send_message(text, ephemeral=True)
 
-    @discord.ui.button(label='Antrian', style=discord.ButtonStyle.secondary, custom_id='music:queue')
+    @discord.ui.button(label='Antrian', style=discord.ButtonStyle.secondary, custom_id='music:queue', row=0)
     async def queue(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.guard(interaction):
             return
@@ -214,7 +237,7 @@ class MusicPanel(discord.ui.View):
         text = '\n'.join(f'{i}. {discord.utils.escape_markdown(t.title)}' for i, t in enumerate(tracks, 1)) or 'Antrian kosong.'
         await interaction.response.send_message(text[:1900], ephemeral=True)
 
-    @discord.ui.button(label='Stop', style=discord.ButtonStyle.danger, custom_id='music:stop')
+    @discord.ui.button(label='Stop', style=discord.ButtonStyle.danger, custom_id='music:stop', row=0)
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.guard(interaction):
             return
@@ -233,9 +256,36 @@ class MusicPanel(discord.ui.View):
         await self.bot.refresh(state)
         await interaction.followup.send('Berhenti dan keluar voice.', ephemeral=True)
 
+    @discord.ui.button(label='🔉 -10%', style=discord.ButtonStyle.secondary, custom_id='music:voldown', row=1)
+    async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.guard(interaction):
+            return
+        state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        await self.bot.change_volume(interaction, state.volume - 0.1)
+
+    @discord.ui.button(label='🔊 +10%', style=discord.ButtonStyle.secondary, custom_id='music:volup', row=1)
+    async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.guard(interaction):
+            return
+        state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        await self.bot.change_volume(interaction, state.volume + 0.1)
+
+    @discord.ui.button(label='Atur Vol', style=discord.ButtonStyle.secondary, custom_id='music:volmodal', row=1)
+    async def vol_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self.guard(interaction):
+            await interaction.response.send_modal(VolumeModal(self.bot))
+
+    @discord.ui.button(label='100%', style=discord.ButtonStyle.secondary, custom_id='music:vol100', row=1)
+    async def vol_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.guard(interaction):
+            return
+        await self.bot.change_volume(interaction, 1.0)
+
 
 class MusicBot(discord.Client):
     def __init__(self):
+        if not discord.opus.is_loaded():
+            discord.opus._load_default()
         intents = discord.Intents.default()
         intents.voice_states = True
         super().__init__(intents=intents)
@@ -247,6 +297,7 @@ class MusicBot(discord.Client):
         self.tree.command(name='stop', description='Hentikan musik dan keluar dari voice')(self.cmd_stop)
         self.tree.command(name='antrian', description='Tampilkan daftar antrian lagu')(self.cmd_queue)
         self.tree.command(name='pause', description='Jeda atau lanjutkan pemutaran')(self.cmd_pause)
+        self.tree.command(name='volume', description='Atur tingkat volume lagu (0–200%)')(self.cmd_volume)
 
     async def setup_hook(self):
         self.add_view(MusicPanel(self))
@@ -377,6 +428,32 @@ class MusicBot(discord.Client):
         else:
             await interaction.response.send_message('Tidak ada lagu yang aktif.', ephemeral=True)
 
+    async def cmd_volume(self, interaction: discord.Interaction, tingkat: int):
+        voice = getattr(interaction.user, 'voice', None)
+        if not interaction.guild or not voice or not voice.channel:
+            return await interaction.response.send_message('Masuk voice channel dulu.', ephemeral=True)
+        if tingkat < 0 or tingkat > 200:
+            return await interaction.response.send_message('Volume harus antara 0% sampai 200%.', ephemeral=True)
+        await self.change_volume(interaction, tingkat / 100.0)
+
+    async def change_volume(self, interaction: discord.Interaction, target_vol: float):
+        if not interaction.guild:
+            return
+        state = self.states.setdefault(interaction.guild.id, QueueState())
+        state.volume = round(max(0.0, min(target_vol, 2.0)), 2)
+        vc = interaction.guild.voice_client
+        if vc and getattr(vc, 'source', None):
+            source = vc.source
+            if isinstance(source, discord.PCMVolumeTransformer):
+                source.volume = state.volume
+        pct = int(round(state.volume * 100))
+        msg = f'Volume diatur ke **{pct}%**.'
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        await self.refresh(state)
+
     async def summon(self, interaction: discord.Interaction):
         voice = getattr(interaction.user, 'voice', None)
         if not interaction.guild or not voice or not voice.channel:
@@ -404,7 +481,8 @@ class MusicBot(discord.Client):
     def embed(self, state: QueueState) -> discord.Embed:
         track = state.current
         text = f'**{discord.utils.escape_markdown(track.title)}** · {discord.utils.escape_markdown(track.requester)}' if track else 'Tekan Cari / Tambah untuk memutar lagu.'
-        return discord.Embed(title='Musik', description=f'{text}\nAntrian: {len(state.queue)}', color=0x5865F2)
+        vol_pct = int(round(state.volume * 100))
+        return discord.Embed(title='Musik', description=f'{text}\nVolume: **{vol_pct}%** · Antrian: **{len(state.queue)}**', color=0x5865F2)
 
     async def refresh(self, state: QueueState):
         if state.message:
@@ -430,14 +508,15 @@ class MusicBot(discord.Client):
                 # Refresh signed CDN URL only when track actually starts.
                 data = await asyncio.to_thread(extract, track.url)
                 bitrate_kbps = getattr(vc.channel, 'bitrate', 96000) // 1000
-                source = source_for(data, bitrate_kbps=bitrate_kbps)
+                bitrate_kbps = min(max(bitrate_kbps, 64), 160)
+                source = source_for(data, volume=state.volume)
                 generation = state.generation
                 def after(error):
                     if error:
                         log.error('Audio playback error: %s', error)
                     future = asyncio.run_coroutine_threadsafe(self.finished(guild, generation), self.loop)
                     future.add_done_callback(lambda f: log.error('Queue advance failed: %s', f.exception()) if f.exception() else None)
-                vc.play(source, after=after)
+                vc.play(source, after=after, application='audio', bitrate=bitrate_kbps, signal_type='music')
                 await self.refresh(state)
                 return
             except Exception:

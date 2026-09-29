@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock, AsyncMock
 
 import discord
 
@@ -24,15 +24,31 @@ class MusicTests(unittest.TestCase):
         bot = MusicBot()
         view = MusicPanel(bot)
         self.assertTrue(view.is_persistent())
-        self.assertEqual(len(view.children), 5)
+        self.assertEqual(len(view.children), 9)
 
-    def test_source_configures_high_quality_audio(self):
-        with patch('bot.discord.FFmpegOpusAudio') as audio:
-            source_for({'url': 'https://example.com/audio'}, bitrate_kbps=96)
-            self.assertEqual(audio.call_args.kwargs['codec'], 'encode')
-            self.assertEqual(audio.call_args.kwargs['bitrate'], 96)
-            self.assertIn('-application audio', audio.call_args.kwargs['options'])
-            self.assertIn('-compression_level 10', audio.call_args.kwargs['options'])
+    def test_source_configures_volume(self):
+        class DummyAudio(discord.AudioSource):
+            def read(self): return b''
+        with patch('bot.discord.FFmpegPCMAudio', return_value=DummyAudio()):
+            source = source_for({'url': 'https://example.com/audio'}, volume=0.75)
+            self.assertIsInstance(source, discord.PCMVolumeTransformer)
+            self.assertEqual(source.volume, 0.75)
+
+    def test_volume_clamping_and_change(self):
+        bot = MusicBot()
+        interaction = MagicMock()
+        interaction.guild.id = 12345
+        interaction.response.is_done.return_value = False
+        interaction.response.send_message = AsyncMock()
+        asyncio.run(bot.change_volume(interaction, 0.85))
+        state = bot.states[12345]
+        self.assertEqual(state.volume, 0.85)
+        # test clamp over 2.0
+        asyncio.run(bot.change_volume(interaction, 2.5))
+        self.assertEqual(state.volume, 2.0)
+        # test clamp under 0.0
+        asyncio.run(bot.change_volume(interaction, -0.5))
+        self.assertEqual(state.volume, 0.0)
 
     def test_search_rejects_bad_urls(self):
         with self.assertRaises(ValueError):
@@ -57,7 +73,7 @@ class MusicTests(unittest.TestCase):
     def test_command_tree_has_all_music_commands(self):
         bot = MusicBot()
         commands = [c.name for c in bot.tree.get_commands()]
-        expected = {'musik', 'play', 'skip', 'stop', 'antrian', 'pause'}
+        expected = {'musik', 'play', 'skip', 'stop', 'antrian', 'pause', 'volume'}
         self.assertTrue(expected.issubset(set(commands)), f'Missing commands in {commands}')
 
     def test_extract_tracks_playlist_skips_none_and_caps(self):
