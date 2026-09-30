@@ -741,21 +741,13 @@ class MusicBot(discord.Client):
             self.tree.copy_global_to(guild=guild)
             try:
                 await self.tree.sync(guild=guild)
-                log.info('Slash command /musik tersinkron ke guild %s', guild_id)
+                log.info('Slash command tersinkron ke guild utama %s', guild_id)
             except discord.Forbidden as exc:
                 log.error('Gagal sync command ke guild %s: %s (Missing Access). '
                           'Pastikan bot diundang dengan scope "applications.commands" dan ID adalah Server ID.',
                           guild_id, exc)
             except Exception:
                 log.exception('Gagal sync slash command ke guild %s', guild_id)
-        else:
-            try:
-                await self.tree.sync()
-                log.info('Slash command /musik tersinkron global')
-            except discord.Forbidden as exc:
-                log.error('Gagal sync command global: %s', exc)
-            except Exception:
-                log.exception('Gagal sync slash command global')
 
     async def _state_exporter_loop(self):
         try:
@@ -775,6 +767,26 @@ class MusicBot(discord.Client):
         log.info('Bot login sebagai %s (ID: %s). Terhubung ke %d server: %s',
                  self.user, getattr(self.user, 'id', None), len(self.guilds),
                  ', '.join(guild_list) if guild_list else 'Belum ada server')
+
+        # Bersihkan command global lama agar tidak terjadi duplikasi slash command
+        try:
+            app_id = self.application_id or (getattr(self.user, 'id', None))
+            if app_id:
+                global_cmds = await self.http.get_global_commands(app_id)
+                if global_cmds:
+                    await self.http.bulk_upsert_global_commands(app_id, [])
+                    log.info('Berhasil menghapus %d slash command global duplikat', len(global_cmds))
+        except Exception as exc:
+            log.debug('Pembersihan command global: %s', exc)
+
+        # Sinkronkan command guild ke seluruh server yang terhubung
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                log.info('Slash commands tersinkron ke server: %s (%s)', guild.name, guild.id)
+            except Exception as exc:
+                log.warning('Gagal sinkronisasi command ke server %s: %s', guild.id, exc)
 
     async def on_guild_join(self, guild: discord.Guild):
         dump_runtime_state(self)
