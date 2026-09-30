@@ -30,6 +30,8 @@ _lock = threading.Lock()
 # Single-process LAN panel: short-lived nonce for form POST when browser omits Origin.
 _form_tokens: dict[str, float] = {}
 _last_update_output: str = ''
+_update_lock = threading.Lock()
+_update_running = False
 
 
 class ConfigStore:
@@ -111,12 +113,17 @@ def ytdlp_version() -> str:
 
 def read_last_update_log() -> str:
     global _last_update_output
-    if _last_update_output:
-        return _last_update_output
+    with _lock:
+        if _last_update_output:
+            return _last_update_output
     try:
         if os.path.exists(UPDATE_LOG_PATH):
+            size = os.path.getsize(UPDATE_LOG_PATH)
             with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
-                return handle.read().strip()
+                if size > 65536:
+                    handle.seek(max(0, size - 65536))
+                    handle.readline()
+                return handle.read()[-65536:].strip()
     except Exception:
         pass
     return ''
@@ -135,7 +142,19 @@ def read_bot_logs(lines: int = 35) -> str:
 
 
 def run_update() -> tuple[bool, str]:
-    global _last_update_output
+    global _last_update_output, _update_running
+    with _update_lock:
+        if _update_running:
+            return False, 'Pembaruan sedang berjalan. Tunggu selesai dulu.'
+        _update_running = True
+    try:
+        return _run_update_inner()
+    finally:
+        with _update_lock:
+            _update_running = False
+
+
+def _run_update_inner() -> tuple[bool, str]:
     if UPDATE_RUNNER is not None:
         ok, out = UPDATE_RUNNER()
         _last_update_output = out
@@ -161,18 +180,26 @@ def run_update() -> tuple[bool, str]:
         if os.path.exists(UPDATE_LOG_PATH):
             try:
                 with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
-                    file_content = handle.read().strip()
+                    handle.seek(0, 2)
+                    size = handle.tell()
+                    handle.seek(max(0, size - 65536))
+                    if size > 65536:
+                        handle.readline()
+                    file_content = handle.read()[-65536:].strip()
                 if file_content:
-                    _last_update_output = file_content
+                    with _lock:
+                        _last_update_output = file_content
                     return ok, file_content
             except Exception:
                 pass
         log_content = f'[{timestamp}] Exit code: {proc.returncode}\n{out}'
-        _last_update_output = log_content
+        with _lock:
+            _last_update_output = log_content
         return ok, log_content
     except Exception as exc:
         err = f'[{timestamp}] Update gagal dijalankan: {exc}'
-        _last_update_output = err
+        with _lock:
+            _last_update_output = err
         return False, err
 
 
@@ -196,6 +223,8 @@ def read_bot_runtime_info() -> dict:
 
     try:
         if os.path.exists(path):
+            if os.path.getsize(path) > 1048576:
+                return default_info
             with open(path, 'r', encoding='utf-8') as handle:
                 data = json.load(handle)
             if time.time() - data.get('updated_at', 0) < 60:
@@ -216,16 +245,27 @@ def format_guilds_html(info: dict) -> str:
     cards = []
     for g in guilds:
         name = html.escape(str(g.get('name', 'Server Discord')))
-        members = g.get('member_count', 0)
+        try:
+            members = int(g.get('member_count', 0) or 0)
+        except (TypeError, ValueError):
+            members = 0
         connected = bool(g.get('connected', False))
         ch_name = html.escape(str(g.get('channel_name') or ''))
         raw_listeners = g.get('listeners', [])
-        listeners = [html.escape(str(u)) for u in raw_listeners]
-        listener_count = g.get('listener_count', len(listeners))
+        if not isinstance(raw_listeners, list):
+            raw_listeners = []
+        listeners = [html.escape(str(u)) for u in raw_listeners[:50]]
+        try:
+            listener_count = int(g.get('listener_count', len(listeners)) or 0)
+        except (TypeError, ValueError):
+            listener_count = len(listeners)
         is_playing = bool(g.get('is_playing', False))
         is_paused = bool(g.get('is_paused', False))
         track = html.escape(str(g.get('current_track') or ''))
-        queue_len = g.get('queue_len', 0)
+        try:
+            queue_len = int(g.get('queue_len', 0) or 0)
+        except (TypeError, ValueError):
+            queue_len = 0
 
         if connected:
             badge_class = 'on'
@@ -443,6 +483,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'same-origin')
+        self.send_header('Cache-Control', 'no-store')
         self.send_header('Content-Security-Policy',
                          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
         for key, value in (extra or {}).items():
@@ -525,7 +566,7 @@ class Handler(BaseHTTPRequestHandler):
             if not PASSWORD:
                 return self._redirect('/')
             return self._login_page()
-        if path in ('/api/status', '/api/*'):
+        if path == '/api/status':
             if not self._authenticated():
                 return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
             data = store().read()
@@ -596,6 +637,8 @@ class Handler(BaseHTTPRequestHandler):
             for key, expiry in list(_form_tokens.items()):
                 if expiry <= now:
                     _form_tokens.pop(key, None)
+            while len(_form_tokens) > 512:
+                _form_tokens.pop(next(iter(_form_tokens)))
             form_token = secrets.token_urlsafe(24)
             _form_tokens[form_token] = now + 900
 
@@ -611,9 +654,18 @@ class Handler(BaseHTTPRequestHandler):
             update_log_section = ''
 
         runtime = read_bot_runtime_info()
-        total_guilds = runtime.get('total_guilds', 0)
-        active_voice = runtime.get('active_voice_count', 0)
-        total_listeners = runtime.get('total_listeners', 0)
+        try:
+            total_guilds = int(runtime.get('total_guilds', 0) or 0)
+        except (TypeError, ValueError):
+            total_guilds = 0
+        try:
+            active_voice = int(runtime.get('active_voice_count', 0) or 0)
+        except (TypeError, ValueError):
+            active_voice = 0
+        try:
+            total_listeners = int(runtime.get('total_listeners', 0) or 0)
+        except (TypeError, ValueError):
+            total_listeners = 0
         if runtime.get('status') == 'online':
             runtime_badge_class = 'on' if active_voice > 0 else 'badge'
             runtime_badge_text = f'{active_voice} voice aktif' if active_voice > 0 else 'idle'
@@ -680,10 +732,10 @@ class Handler(BaseHTTPRequestHandler):
         return self._redirect('/')
 
     def _update(self):
-        ok, _ = run_update()
+        ok, out = run_update()
         if ok:
-            return self._page('Pembaruan yt-dlp berhasil dijalankan.')
-        return self._page('Pembaruan yt-dlp gagal: periksa log pembaruan di bawah.',
+            return self._page(f'Pembaruan yt-dlp berhasil dijalankan.\n{out}')
+        return self._page(f'Pembaruan yt-dlp gagal: {out}',
                           HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _service(self, action):
@@ -712,10 +764,7 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
-
-    def server_bind(self):
-        self.socket.setsockopt(1, 2, 1)  # SO_REUSEPORT
-        super().server_bind()
+    timeout = 10
 
 
 def build_server(host: str, port: int) -> Server:

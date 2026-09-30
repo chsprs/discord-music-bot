@@ -144,16 +144,14 @@ class MusicTests(unittest.TestCase):
         state.generation = 1
         bot.states[99999] = state
 
-        with patch('bot.clear_cache') as mock_clear:
-            with patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh:
-                asyncio.run(bot.quit_voice(guild, clear_queue=True))
-                self.assertEqual(len(state.queue), 0)
-                self.assertIsNone(state.current)
-                self.assertEqual(state.generation, 2)
-                vc.stop.assert_called_once()
-                vc.disconnect.assert_called_once_with(force=True)
-                mock_clear.assert_called_once()
-                mock_refresh.assert_called_once_with(state)
+        with patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh:
+            asyncio.run(bot.quit_voice(guild, clear_queue=True))
+            self.assertEqual(len(state.queue), 0)
+            self.assertIsNone(state.current)
+            self.assertEqual(state.generation, 2)
+            vc.stop.assert_called_once()
+            vc.disconnect.assert_called_once_with(force=True)
+            mock_refresh.assert_called_once_with(state)
 
     def test_quit_voice_default_preserves_queue(self):
         bot = MusicBot()
@@ -178,6 +176,10 @@ class MusicTests(unittest.TestCase):
         interaction = MagicMock()
         interaction.guild = MagicMock()
         interaction.guild.id = 88888
+        interaction.guild.voice_client = MagicMock()
+        interaction.guild.voice_client.channel = MagicMock()
+        interaction.guild.voice_client.channel.id = 111
+        interaction.user.voice.channel.id = 111
         interaction.response.defer = AsyncMock()
         interaction.followup.send = AsyncMock()
         with patch.object(bot, 'quit_voice', new=AsyncMock()) as mock_quit:
@@ -213,6 +215,8 @@ class MusicTests(unittest.TestCase):
         guild.name = 'TestGuild'
         vc = MagicMock()
         vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
         guild.voice_client = vc
 
         state = QueueState()
@@ -223,10 +227,112 @@ class MusicTests(unittest.TestCase):
         with patch('bot.extract', side_effect=RuntimeError('Network down')):
             with patch.object(bot, 'refresh', new=AsyncMock()):
                 asyncio.run(bot.advance(guild))
-                # 3 failed consecutively, track2 was restored to head of queue
-                # remaining queue should have 3 tracks (track2, track3, track4)
-                self.assertEqual(len(state.queue), 3)
+                # Gagal 3x beruntun: queue utuh (tidak ada track hilang),
+                # track gagal di-rotate ke ekor agar retry manual masih bisa.
+                self.assertEqual(len(state.queue), 5)
                 self.assertEqual(state.queue[0].title, 'track2')
+                self.assertIsNone(state.current)
+
+    def test_advance_success_commits_queue_and_history(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 77778
+        guild.name = 'TestGuild2'
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.current = Track('now', 'https://example.com/now', 'user')
+        nxt = Track('next', 'https://example.com/next', 'user')
+        state.queue.append(nxt)
+        bot.states[77778] = state
+
+        with patch('bot.extract', return_value={'url': 'https://cdn/audio'}):
+            with patch('bot.source_for', return_value=MagicMock()):
+                with patch.object(bot, 'refresh', new=AsyncMock()):
+                    asyncio.run(bot.advance(guild))
+                    vc.play.assert_called_once()
+                    self.assertEqual(state.current.title, 'next')
+                    self.assertEqual(len(state.queue), 0)
+                    self.assertEqual(len(state.history), 1)
+                    self.assertEqual(state.history[0].title, 'now')
+
+    def test_skip_bumps_generation(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 77779
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+        state = QueueState()
+        bot.states[77779] = state
+        gen0 = state.generation
+        asyncio.run(bot._stop_player(guild))
+        self.assertEqual(state.generation, gen0 + 1)
+        vc.stop.assert_called_once()
+
+    def test_enqueue_rejects_full_queue(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 77780
+        guild.voice_client = None
+        from bot import MAX_QUEUE
+        state = QueueState()
+        for i in range(MAX_QUEUE):
+            state.queue.append(Track(f't{i}', f'https://example.com/{i}', 'u'))
+        bot.states[77780] = state
+        ok = asyncio.run(bot._enqueue_tracks(guild, [Track('x', 'https://example.com/x', 'u')]))
+        self.assertFalse(ok)
+        self.assertEqual(len(state.queue), MAX_QUEUE)
+
+    def test_buffered_source_eof_after_stall(self):
+        from bot import BufferedAudioSource, MAX_ERROR_STREAK
+        import threading as _th
+        block = _th.Event()
+        class StallAudio(discord.AudioSource):
+            def __init__(self):
+                self.calls = 0
+            def read(self):
+                self.calls += 1
+                if self.calls <= 2:
+                    return b'\x02' * 3840
+                block.wait(timeout=60)  # stall: ffmpeg macet
+                return b''
+            def cleanup(self):
+                pass
+        inner = StallAudio()
+        buf = BufferedAudioSource(inner, buffer_size=2)
+        buf.ready_event.set()
+        # Kuras 2 chunk awal, lalu stall: setelah MAX_ERROR_STREAK miss harus EOF (b'').
+        for _ in range(5):
+            buf.read()
+        eof = False
+        for _ in range(MAX_ERROR_STREAK + 5):
+            if buf.read() == b'':
+                eof = True
+                break
+        self.assertTrue(eof)
+        buf.cleanup()
+
+    def test_play_respects_voice_guard(self):
+        bot = MusicBot()
+        interaction = MagicMock()
+        interaction.guild = MagicMock()
+        interaction.guild.id = 99991
+        interaction.guild.voice_client = MagicMock()
+        interaction.guild.voice_client.channel.id = 111
+        interaction.user.voice.channel.id = 222  # beda channel
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        asyncio.run(bot.cmd_skip(interaction))
+        interaction.followup.send.assert_called_once()
+        args = interaction.followup.send.call_args[0][0]
+        self.assertIn('sama dengan bot', args)
 
     def test_extract_tracks_playlist_skips_none_and_caps(self):
         mock_entries = [

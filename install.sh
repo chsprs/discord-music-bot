@@ -18,7 +18,7 @@ echo "=== Memulai Instalasi Discord Music Bot ==="
 # 1. Update paket & dependensi sistem
 echo "[1/6] Memeriksa dependensi sistem..."
 apt-get update -y
-apt-get install -y python3 python3-venv python3-pip ffmpeg curl git
+apt-get install -y --no-install-recommends python3 python3-venv python3-pip ffmpeg curl git openssl
 
 # Pastikan Node.js terpasang (untuk JS runtime yt-dlp)
 if ! command -v node &>/dev/null; then
@@ -55,12 +55,15 @@ fi
 
 PANEL_ENV="/opt/discord-music-panel.env"
 if [[ ! -f "$PANEL_ENV" ]]; then
+    PANEL_PASS="$(openssl rand -base64 24 2>/dev/null || head -c 18 /dev/urandom | base64)"
     cat <<EOF > "$PANEL_ENV"
 PANEL_HOST=$PANEL_HOST
 PANEL_PORT=$PANEL_PORT
-PANEL_PASSWORD=
+PANEL_PASSWORD=$PANEL_PASS
 EOF
     chmod 600 "$PANEL_ENV"
+    echo ""
+    echo ">>> PANEL_PASSWORD awal: $PANEL_PASS (tersimpan di $PANEL_ENV, mode 0600). Ganti bila perlu."
 fi
 
 # 5. Pasang dan Aktifkan systemd service & timer

@@ -10,9 +10,13 @@ EnvironmentFile=/opt/discord-music-panel.env
 ExecStart=/opt/discord-music-bot/venv/bin/python /opt/discord-music-bot/panel.py
 Restart=on-failure
 RestartSec=5
+MemoryMax=120M
+TasksMax=32
 Environment=PYTHONDONTWRITEBYTECODE=1
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
