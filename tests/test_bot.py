@@ -146,7 +146,7 @@ class MusicTests(unittest.TestCase):
 
         with patch('bot.clear_cache') as mock_clear:
             with patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh:
-                asyncio.run(bot.quit_voice(guild))
+                asyncio.run(bot.quit_voice(guild, clear_queue=True))
                 self.assertEqual(len(state.queue), 0)
                 self.assertIsNone(state.current)
                 self.assertEqual(state.generation, 2)
@@ -154,6 +154,24 @@ class MusicTests(unittest.TestCase):
                 vc.disconnect.assert_called_once_with(force=True)
                 mock_clear.assert_called_once()
                 mock_refresh.assert_called_once_with(state)
+
+    def test_quit_voice_default_preserves_queue(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 99998
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.disconnect = AsyncMock()
+        guild.voice_client = vc
+        state = QueueState()
+        state.queue.append(Track('track1', 'https://example.com/1', 'user'))
+        state.current = Track('track0', 'https://example.com/0', 'user')
+        bot.states[99998] = state
+
+        with patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(bot.quit_voice(guild, clear_queue=False))
+            self.assertEqual(len(state.queue), 1)
+            self.assertIsNone(state.current)
 
     def test_cmd_quit_invokes_quit_voice(self):
         bot = MusicBot()
@@ -165,7 +183,7 @@ class MusicTests(unittest.TestCase):
         with patch.object(bot, 'quit_voice', new=AsyncMock()) as mock_quit:
             asyncio.run(bot.cmd_quit(interaction))
             interaction.response.defer.assert_called_once_with(ephemeral=True)
-            mock_quit.assert_called_once_with(interaction.guild)
+            mock_quit.assert_called_once_with(interaction.guild, clear_queue=True)
             interaction.followup.send.assert_called_once()
 
     def test_on_voice_state_update_bot_kicked(self):
@@ -176,6 +194,7 @@ class MusicTests(unittest.TestCase):
         member = MagicMock()
         member.id = 123456
         member.guild = MagicMock()
+        member.guild.voice_client = None
         before = MagicMock()
         before.channel = MagicMock()
         after = MagicMock()
@@ -183,8 +202,31 @@ class MusicTests(unittest.TestCase):
 
         with patch.object(bot, 'quit_voice', new=AsyncMock()) as mock_quit:
             with patch('bot.dump_runtime_state'):
-                asyncio.run(bot.on_voice_state_update(member, before, after))
-                mock_quit.assert_called_once_with(member.guild)
+                with patch('asyncio.sleep', new=AsyncMock()):
+                    asyncio.run(bot.on_voice_state_update(member, before, after))
+                    mock_quit.assert_called_once_with(member.guild, clear_queue=False)
+
+    def test_advance_stops_on_consecutive_errors_preserving_queue(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 77777
+        guild.name = 'TestGuild'
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        guild.voice_client = vc
+
+        state = QueueState()
+        for i in range(5):
+            state.queue.append(Track(f'track{i}', f'https://example.com/{i}', 'user'))
+        bot.states[77777] = state
+
+        with patch('bot.extract', side_effect=RuntimeError('Network down')):
+            with patch.object(bot, 'refresh', new=AsyncMock()):
+                asyncio.run(bot.advance(guild))
+                # 3 failed consecutively, track2 was restored to head of queue
+                # remaining queue should have 3 tracks (track2, track3, track4)
+                self.assertEqual(len(state.queue), 3)
+                self.assertEqual(state.queue[0].title, 'track2')
 
     def test_extract_tracks_playlist_skips_none_and_caps(self):
         mock_entries = [
