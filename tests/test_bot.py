@@ -82,6 +82,11 @@ class MusicTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             asyncio.run(extract_track('https://example.com/notyoutube', 'vito'))
 
+    def test_checked_query_allows_colons_in_search(self):
+        from bot import checked_query
+        self.assertEqual(checked_query('OST: Attack on Titan'), 'ytsearch1:OST: Attack on Titan')
+        self.assertEqual(checked_query('http://youtube.com/watch?v=123'), 'https://youtube.com/watch?v=123')
+
     def test_search_missing_result(self):
         with patch('bot.yt_dlp.YoutubeDL') as downloader:
             downloader.return_value.__enter__.return_value.extract_info.return_value = {'entries': []}
@@ -101,8 +106,64 @@ class MusicTests(unittest.TestCase):
     def test_command_tree_has_all_music_commands(self):
         bot = MusicBot()
         commands = [c.name for c in bot.tree.get_commands()]
-        expected = {'musik', 'play', 'skip', 'back', 'stop', 'antrian', 'pause', 'volume', 'shuffle', 'loop', 'autoplay'}
+        expected = {'musik', 'play', 'skip', 'back', 'stop', 'quit', 'antrian', 'pause', 'volume', 'shuffle', 'loop', 'autoplay'}
         self.assertTrue(expected.issubset(set(commands)), f'Missing commands in {commands}')
+
+    def test_quit_voice_clears_queue_and_resets_state(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 99999
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        vc.disconnect = AsyncMock()
+        guild.voice_client = vc
+        state = QueueState()
+        state.queue.append(Track('track1', 'https://example.com/1', 'user'))
+        state.current = Track('track0', 'https://example.com/0', 'user')
+        state.generation = 1
+        bot.states[99999] = state
+
+        with patch('bot.clear_cache') as mock_clear:
+            with patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh:
+                asyncio.run(bot.quit_voice(guild))
+                self.assertEqual(len(state.queue), 0)
+                self.assertIsNone(state.current)
+                self.assertEqual(state.generation, 2)
+                vc.stop.assert_called_once()
+                vc.disconnect.assert_called_once_with(force=True)
+                mock_clear.assert_called_once()
+                mock_refresh.assert_called_once_with(state)
+
+    def test_cmd_quit_invokes_quit_voice(self):
+        bot = MusicBot()
+        interaction = MagicMock()
+        interaction.guild = MagicMock()
+        interaction.guild.id = 88888
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        with patch.object(bot, 'quit_voice', new=AsyncMock()) as mock_quit:
+            asyncio.run(bot.cmd_quit(interaction))
+            interaction.response.defer.assert_called_once_with(ephemeral=True)
+            mock_quit.assert_called_once_with(interaction.guild)
+            interaction.followup.send.assert_called_once()
+
+    def test_on_voice_state_update_bot_kicked(self):
+        bot = MusicBot()
+        bot_user = MagicMock()
+        bot_user.id = 123456
+        bot._connection.user = bot_user
+        member = MagicMock()
+        member.id = 123456
+        member.guild = MagicMock()
+        before = MagicMock()
+        before.channel = MagicMock()
+        after = MagicMock()
+        after.channel = None
+
+        with patch.object(bot, 'quit_voice', new=AsyncMock()) as mock_quit:
+            with patch('bot.dump_runtime_state'):
+                asyncio.run(bot.on_voice_state_update(member, before, after))
+                mock_quit.assert_called_once_with(member.guild)
 
     def test_extract_tracks_playlist_skips_none_and_caps(self):
         mock_entries = [

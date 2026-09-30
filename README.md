@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-45%2F45%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-49%2F49%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -94,6 +94,7 @@ Semua fungsi tombol juga dapat diakses lewat perintah chat slash:
 | `/skip` | - | Melewati lagu yang sedang diputar |
 | `/back` | - | Memutar lagu sebelumnya dari riwayat |
 | `/stop` | - | Menghentikan musik dan mengeluarkan bot dari voice |
+| `/quit` | - | Mengeluarkan bot dari voice, mereset antrian, dan membersihkan cache |
 | `/antrian` | - | Menampilkan daftar antrian lagu saat ini |
 | `/pause` | - | Menjeda atau melanjutkan pemutaran lagu |
 | `/volume` | `<0-200>` | Mengatur tingkat volume suara lagu (persentase) |
@@ -193,7 +194,7 @@ PYTHONPATH=. ./venv/bin/python -m unittest discover -s tests -v
 
 Hasil uji:
 ```
-Ran 45 tests in 2.839s
+Ran 49 tests in 3.029s
 OK
 ```
 

@@ -55,10 +55,13 @@ def checked_query(query: str) -> str:
     query = query.strip()
     if not query or len(query) > 500:
         raise ValueError('Judul atau URL lagu harus 1–500 karakter.')
-    parsed = urlparse(query)
-    if parsed.scheme or parsed.netloc:
-        if parsed.scheme != 'https' or parsed.hostname not in {'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'}:
+    if query.startswith(('http://', 'https://')):
+        parsed = urlparse(query)
+        hostname = (parsed.hostname or '').lower()
+        if hostname not in {'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'}:
             raise ValueError('Hanya tautan HTTPS YouTube/YouTube Music yang didukung.')
+        if query.startswith('http://'):
+            query = 'https://' + query[7:]
         return query
     return f'ytsearch1:{query}'
 
@@ -175,6 +178,26 @@ def dump_runtime_state_offline() -> None:
             os.remove(path)
     except Exception:
         pass
+
+
+def clear_cache() -> None:
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            ydl.cache.remove()
+    except Exception as exc:
+        log.debug('Gagal menghapus cache yt-dlp: %s', exc)
+
+    cache_dirs = [
+        os.path.join(os.environ.get('XDG_CACHE_HOME', '/run/discord-music'), 'yt-dlp'),
+        os.path.expanduser('~/.cache/yt-dlp'),
+        '/tmp/yt-dlp',
+    ]
+    for c_dir in cache_dirs:
+        if os.path.isdir(c_dir):
+            try:
+                shutil.rmtree(c_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 
@@ -300,17 +323,45 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
             pass
 
 
-class AddSongView(discord.ui.View):
+class PlaylistView(discord.ui.View):
     def __init__(self, bot: 'MusicBot'):
         super().__init__(timeout=120)
         self.bot = bot
 
-    @discord.ui.button(label='Tambah Lagu / Playlist', emoji='➕', style=discord.ButtonStyle.primary)
+    @discord.ui.button(label='Tambah Lagu', emoji='➕', style=discord.ButtonStyle.primary, row=0)
     async def add_song(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SearchModal(self.bot))
 
+    @discord.ui.button(label='Refresh', emoji='🔄', style=discord.ButtonStyle.secondary, row=0)
+    async def refresh_playlist(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if not interaction.guild:
+            return
+        state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        tracks = list(state.queue)[:10]
+        header = f"**Sedang Diputar:** {discord.utils.escape_markdown(state.current.title)}\n\n" if state.current else ""
+        if tracks:
+            list_text = '\n'.join(f'{i}. {discord.utils.escape_markdown(t.title)} ({t.duration_str})' for i, t in enumerate(tracks, 1))
+            more = f"\n*...dan {len(state.queue) - 10} lagu lainnya*" if len(state.queue) > 10 else ""
+            msg = f"{header}**Antrian ({len(state.queue)} lagu):**\n{list_text}{more}"
+        else:
+            msg = f"{header}Antrian berikutnya kosong."
+        await interaction.followup.send(msg[:1900], view=PlaylistView(self.bot), ephemeral=True)
+
+    @discord.ui.button(label='Kosongkan Antrian', emoji='🗑️', style=discord.ButtonStyle.danger, row=0)
+    async def clear_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if not interaction.guild:
+            return
+        state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        async with state.lock:
+            count = len(state.queue)
+            state.queue.clear()
+        await self.bot.refresh(state)
+        await interaction.followup.send(f'Antrian berhasil dikosongkan ({count} lagu dihapus).', ephemeral=True)
+
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
-        log.error('AddSongView error: %s', error, exc_info=error)
+        log.error('PlaylistView error: %s', error, exc_info=error)
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(f'Terjadi kesalahan: {error}', ephemeral=True)
@@ -318,6 +369,9 @@ class AddSongView(discord.ui.View):
                 await interaction.response.send_message(f'Terjadi kesalahan: {error}', ephemeral=True)
         except Exception:
             pass
+
+
+AddSongView = PlaylistView
 
 
 class MusicPanel(discord.ui.View):
@@ -475,21 +529,9 @@ class MusicPanel(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         if not await self.guard(interaction):
             return
-        state = self.bot.states[interaction.guild.id]
-        async with state.lock:
-            state.generation += 1
-            state.queue.clear()
-            state.history.clear()
-            state.current = None
-            if state.idle_task:
-                state.idle_task.cancel()
-                state.idle_task = None
-            vc = interaction.guild.voice_client
-            if vc:
-                vc.stop()
-                await vc.disconnect()
-        await self.bot.refresh(state)
-        await interaction.followup.send('Berhenti dan keluar voice.', ephemeral=True)
+        if interaction.guild:
+            await self.bot.quit_voice(interaction.guild)
+        await interaction.followup.send('Berhenti, antrian direset, dan keluar voice.', ephemeral=True)
 
     @discord.ui.button(label='AutoPlay', emoji='🔄', style=discord.ButtonStyle.secondary, custom_id='music:autoplay', row=1)
     async def autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -519,7 +561,7 @@ class MusicPanel(discord.ui.View):
             msg = f"{header}**Antrian ({len(state.queue)} lagu):**\n{list_text}{more}"
         else:
             msg = f"{header}Antrian berikutnya kosong."
-        view = AddSongView(self.bot)
+        view = PlaylistView(self.bot)
         await interaction.followup.send(msg[:1900], view=view, ephemeral=True)
 
 
@@ -538,6 +580,7 @@ class MusicBot(discord.Client):
         self.tree.command(name='skip', description='Lewati lagu yang sedang diputar')(self.cmd_skip)
         self.tree.command(name='back', description='Putar lagu sebelumnya')(self.cmd_back)
         self.tree.command(name='stop', description='Hentikan musik dan keluar dari voice')(self.cmd_stop)
+        self.tree.command(name='quit', description='Keluarkan bot dari voice channel, reset antrian, dan bersihkan cache')(self.cmd_quit)
         self.tree.command(name='antrian', description='Tampilkan daftar antrian lagu')(self.cmd_queue)
         self.tree.command(name='pause', description='Jeda atau lanjutkan pemutaran')(self.cmd_pause)
         self.tree.command(name='volume', description='Atur tingkat volume lagu (0–200%)')(self.cmd_volume)
@@ -748,12 +791,8 @@ class MusicBot(discord.Client):
         await interaction.followup.send(f'AutoPlay sekarang: **{status}**', ephemeral=True)
         await self.refresh(state)
 
-    async def cmd_stop(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            return
-        await interaction.response.defer(ephemeral=True)
-        state = self.states.get(interaction.guild.id)
-        vc = interaction.guild.voice_client
+    async def quit_voice(self, guild: discord.Guild) -> None:
+        state = self.states.get(guild.id)
         if state:
             async with state.lock:
                 state.generation += 1
@@ -763,23 +802,55 @@ class MusicBot(discord.Client):
                 if state.idle_task:
                     state.idle_task.cancel()
                     state.idle_task = None
+        vc = getattr(guild, 'voice_client', None)
         if vc:
-            vc.stop()
-            await vc.disconnect()
+            try:
+                if getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)():
+                    vc.stop()
+            except Exception:
+                pass
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+        try:
+            await asyncio.to_thread(clear_cache)
+        except Exception as exc:
+            log.warning('Gagal membersihkan cache: %s', exc)
         if state:
             await self.refresh(state)
-        await interaction.followup.send('Musik dihentikan dan bot keluar voice.', ephemeral=True)
+        dump_runtime_state(self)
+
+    async def cmd_stop(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self.quit_voice(interaction.guild)
+        await interaction.followup.send('Musik dihentikan, antrian direset, dan bot keluar voice.', ephemeral=True)
+
+    async def cmd_quit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self.quit_voice(interaction.guild)
+        await interaction.followup.send('Bot keluar dari voice channel, antrian direset, dan cache dibersihkan.', ephemeral=True)
 
     async def cmd_queue(self, interaction: discord.Interaction):
         if not interaction.guild:
             return
         await interaction.response.defer(ephemeral=True)
         state = self.states.get(interaction.guild.id)
-        if not state or not state.queue:
+        if not state or (not state.queue and not state.current):
             return await interaction.followup.send('Antrian lagu kosong.', ephemeral=True)
         tracks = list(state.queue)[:10]
-        text = '\n'.join(f'{i}. {discord.utils.escape_markdown(t.title)} ({t.duration_str})' for i, t in enumerate(tracks, 1))
-        await interaction.followup.send(f'**Antrian Lagu:**\n{text}'[:1900], ephemeral=True)
+        header = f"**Sedang Diputar:** {discord.utils.escape_markdown(state.current.title)}\n\n" if state.current else ""
+        if tracks:
+            text = '\n'.join(f'{i}. {discord.utils.escape_markdown(t.title)} ({t.duration_str})' for i, t in enumerate(tracks, 1))
+            more = f"\n*...dan {len(state.queue) - 10} lagu lainnya*" if len(state.queue) > 10 else ""
+            msg = f"{header}**Antrian Lagu ({len(state.queue)} lagu):**\n{text}{more}"
+        else:
+            msg = f"{header}Antrian berikutnya kosong."
+        await interaction.followup.send(msg[:1900], view=PlaylistView(self), ephemeral=True)
 
     async def cmd_pause(self, interaction: discord.Interaction):
         if not interaction.guild:
@@ -967,31 +1038,37 @@ class MusicBot(discord.Client):
     async def idle_disconnect(self, guild: discord.Guild, generation: int):
         try:
             await asyncio.sleep(180)
-            state = self.states[guild.id]
+            state = self.states.get(guild.id)
+            if not state:
+                return
+            should_quit = False
             async with state.lock:
                 if state.generation == generation and state.current is None and not state.queue and guild.voice_client:
-                    state.generation += 1
-                    await guild.voice_client.disconnect()
+                    should_quit = True
+            if should_quit:
+                log.info('Idle 3 menit tanpa antrian di guild %s, bot keluar.', guild.name)
+                await self.quit_voice(guild)
         except asyncio.CancelledError:
             pass
 
     async def on_voice_state_update(self, member, before, after):
         dump_runtime_state(self)
+        # 1. Jika bot itu sendiri dikeluarkan atau terputus dari voice
+        if member.id == getattr(self.user, 'id', None):
+            if before.channel is not None and after.channel is None:
+                log.info('Bot dikeluarkan atau terputus dari voice di guild %s (%s)', member.guild.name, member.guild.id)
+                await self.quit_voice(member.guild)
+                return
+
+        # 2. Jika seluruh user keluar dari channel (hanya tersisa bot)
         vc = member.guild.voice_client
         if not vc or not vc.channel or any(not m.bot for m in vc.channel.members):
             return
         await asyncio.sleep(15)
         vc = member.guild.voice_client
         if vc and vc.channel and not any(not m.bot for m in vc.channel.members):
-            state = self.states.setdefault(member.guild.id, QueueState())
-            async with state.lock:
-                state.generation += 1
-                state.queue.clear()
-                state.current = None
-                vc.stop()
-                await vc.disconnect()
-                await self.refresh(state)
-            dump_runtime_state(self)
+            log.info('Voice channel kosong di guild %s, bot keluar.', member.guild.name)
+            await self.quit_voice(member.guild)
 
 
 if __name__ == '__main__':
