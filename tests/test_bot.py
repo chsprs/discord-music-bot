@@ -62,6 +62,27 @@ class MusicTests(unittest.TestCase):
             self.assertIsInstance(source, discord.PCMVolumeTransformer)
             self.assertEqual(source.volume, 0.75)
 
+    def test_buffered_audio_source_fallback_and_cleanup(self):
+        from bot import BufferedAudioSource
+        class ChunkAudio(discord.AudioSource):
+            def __init__(self):
+                self.calls = 0
+            def read(self):
+                self.calls += 1
+                if self.calls <= 3:
+                    return b'\x01' * 3840
+                return b''
+            def cleanup(self):
+                pass
+
+        inner = ChunkAudio()
+        buf = BufferedAudioSource(inner, buffer_size=10)
+        chunk1 = buf.read()
+        self.assertEqual(len(chunk1), 3840)
+        self.assertEqual(chunk1, b'\x01' * 3840)
+        buf.cleanup()
+        self.assertTrue(buf.stop_event.is_set())
+
     def test_volume_clamping_and_change(self):
         bot = MusicBot()
         interaction = MagicMock()

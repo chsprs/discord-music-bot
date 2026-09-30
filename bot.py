@@ -3,7 +3,9 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import shutil
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -257,13 +259,119 @@ async def extract_track(query: str, requester: str) -> Track:
     return tracks[0]
 
 
+class BufferedAudioSource(discord.AudioSource):
+    """Menyangga audio PCM ke dalam memori untuk mencegah fluktuasi kecepatan saat terjadi jitter jaringan."""
+    def __init__(self, source: discord.AudioSource, buffer_size: int = 150):
+        self.source = source
+        self.queue: queue.Queue[bytes | None] = queue.Queue(maxsize=buffer_size)
+        self.stop_event = threading.Event()
+        self.ready_event = threading.Event()
+        self.worker = threading.Thread(target=self._reader, daemon=True)
+        self.worker.start()
+
+    def _reader(self):
+        count = 0
+        try:
+            while not self.stop_event.is_set():
+                data = self.source.read()
+                if not data:
+                    self.queue.put(None)
+                    break
+                self.queue.put(data)
+                count += 1
+                if count >= 25 and not self.ready_event.is_set():
+                    self.ready_event.set()
+        except Exception:
+            pass
+        finally:
+            self.ready_event.set()
+
+    def read(self) -> bytes:
+        if not self.ready_event.is_set():
+            self.ready_event.wait(timeout=2.0)
+        if self.stop_event.is_set():
+            return b''
+        try:
+            data = self.queue.get(timeout=0.3)
+            if data is None:
+                return b''
+            return data
+        except queue.Empty:
+            return b'\x00' * 3840
+
+    def cleanup(self):
+        self.stop_event.set()
+        self.source.cleanup()
+
+    def is_opus(self) -> bool:
+        return self.source.is_opus()
+
+
+def patch_audio_player():
+    def _steady_do_run(self):
+        self.loops = 0
+        self._start = time.perf_counter()
+
+        client = self.client
+        play_audio = client.send_audio_packet
+        self._speak(discord.player.SpeakingState.voice)
+
+        while not self._end.is_set():
+            if not self._resumed.is_set():
+                self.send_silence()
+                self._resumed.wait()
+                continue
+
+            data = self.source.read()
+
+            if not data:
+                if self._current_error is None:
+                    source_error = getattr(self.source, '_current_error', None)
+                    if source_error:
+                        self._current_error = source_error
+                self.stop()
+                break
+
+            if not client.is_connected():
+                connected = client.wait_until_connected(client.timeout)
+                if self._end.is_set() or not connected:
+                    return
+                self._speak(discord.player.SpeakingState.voice)
+                self.loops = 0
+                self._start = time.perf_counter()
+
+            play_audio(data, encode=not self.source.is_opus())
+            self.loops += 1
+            now = time.perf_counter()
+            next_time = self._start + self.DELAY * self.loops
+            diff = next_time - now
+            # Jika timing tertinggal > 40ms (2 frame) akibat lag jaringan / read stall:
+            # Reset clock reference agar tidak burst-send paket (kecepatan / chipmunk effect).
+            if diff < -0.04:
+                self.loops = 0
+                self._start = now
+                delay = self.DELAY
+            else:
+                delay = max(0, self.DELAY + diff)
+            time.sleep(delay)
+
+        if client.is_connected():
+            self.send_silence()
+
+    discord.player.AudioPlayer._do_run = _steady_do_run
+
+
+patch_audio_player()
+
+
 def source_for(data: dict, volume: float = 1.0) -> discord.PCMVolumeTransformer:
     pcm = discord.FFmpegPCMAudio(
         data['url'],
-        before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+        before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5',
         options='-vn'
     )
-    return discord.PCMVolumeTransformer(pcm, volume=volume)
+    buffered = BufferedAudioSource(pcm)
+    return discord.PCMVolumeTransformer(buffered, volume=volume)
 
 
 def same_voice(interaction: discord.Interaction) -> bool:

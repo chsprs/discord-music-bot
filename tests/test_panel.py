@@ -175,7 +175,7 @@ class PanelTests(unittest.TestCase):
         cookie = self.login()
         status, body, _ = self.req('POST', '/start', '', cookie=cookie)
         self.assertEqual(status, 400)
-        self.assertNotIn('Traceback', body)
+        self.assertIn('Token Discord belum diisi', body)
 
     def test_update_requires_authentication(self):
         status, _, _ = self.req('POST', '/update')
