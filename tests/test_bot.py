@@ -191,13 +191,100 @@ class MusicTests(unittest.TestCase):
 
     def test_close_without_panels_skips_delete(self):
         bot = MusicBot()
-        state = QueueState()  # message None
+        state = QueueState()  # message None, now_message None
+        self.assertFalse(state._skip_armed)
         bot.states = {555: state}
         bot._exporter_task = None
         with patch('bot.dump_runtime_state_offline'):
             with patch.object(MusicBot.__bases__[0], 'close', new=AsyncMock()):
                 asyncio.run(bot.close())
         self.assertIsNone(state.message)
+        self.assertIsNone(state.now_message)
+
+    def test_announce_now_playing_sends_and_replaces_old(self):
+        bot = MusicBot()
+        state = QueueState()
+        old = MagicMock()
+        old.delete = AsyncMock()
+        state.now_message = old
+        panel_msg = MagicMock()
+        channel = MagicMock()
+        channel.send = AsyncMock(return_value=MagicMock())
+        panel_msg.channel = channel
+        state.message = panel_msg
+        bot.states = {666: state}
+        track = Track('Lagu Baru', 'https://youtube.com/watch?v=x', 'user')
+        asyncio.run(bot._announce_now_playing(MagicMock(id=666), track))
+        old.delete.assert_called_once_with()
+        channel.send.assert_called_once()
+        sent_text = channel.send.call_args[0][0]
+        self.assertIn('Lagu Baru', sent_text)
+        self.assertIsNotNone(state.now_message)
+
+    def test_announce_now_playing_without_panel_sends_nothing(self):
+        bot = MusicBot()
+        state = QueueState()  # message None
+        bot.states = {667: state}
+        track = Track('Lagu X', 'https://youtube.com/watch?v=y', 'user')
+        asyncio.run(bot._announce_now_playing(MagicMock(id=667), track))
+        self.assertIsNone(state.now_message)
+
+    def test_skip_arms_flag_and_advances_next(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 668
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+        state = QueueState()
+        bot.states[668] = state
+        played = []
+
+        async def fake_advance(g):
+            played.append(g.id)
+
+        with patch.object(bot, 'advance', new=AsyncMock(side_effect=fake_advance)):
+            interaction = MagicMock()
+            interaction.guild = guild
+            interaction.response.send_message = AsyncMock()
+            interaction.response.defer = AsyncMock()
+            interaction.followup.send = AsyncMock()
+            with patch('bot._check_guild_only', return_value=True), \
+                 patch('bot._check_same_voice', return_value=(True, '')):
+                asyncio.run(bot.cmd_skip(interaction))
+        self.assertEqual(played, [668])  # advance manual selalu jalan
+        self.assertTrue(state._skip_armed)  # after() basi dibuang
+        vc.stop.assert_called_once()
+
+    def test_back_advances_after_stop(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 669
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+        state = QueueState()
+        state.history.append(Track('prev', 'https://example.com/prev', 'u'))
+        state.current = Track('now', 'https://example.com/now', 'u')
+        bot.states[669] = state
+        played = []
+
+        async def fake_advance(g):
+            played.append(g.id)
+
+        with patch.object(bot, 'advance', new=AsyncMock(side_effect=fake_advance)):
+            interaction = MagicMock()
+            interaction.guild = guild
+            interaction.response.send_message = AsyncMock()
+            interaction.response.defer = AsyncMock()
+            interaction.followup.send = AsyncMock()
+            with patch('bot._check_guild_only', return_value=True), \
+                 patch('bot._check_same_voice', return_value=(True, '')):
+                asyncio.run(bot.cmd_back(interaction))
+        self.assertEqual(played, [669])  # tidak tergantung voice_client hilang
+        self.assertTrue(state.queue)  # current lama balik ke head antrian
 
     def test_quit_voice_default_preserves_queue(self):
         bot = MusicBot()

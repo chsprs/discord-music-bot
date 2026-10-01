@@ -51,6 +51,8 @@ class QueueState:
     generation: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     message: discord.Message | None = None
+    now_message: discord.Message | None = None
+    _skip_armed: bool = False  # skip/back manual: after() basi, advance manual yang jalan
     idle_task: asyncio.Task | None = None
     empty_task: asyncio.Task | None = None
     refresh_task: asyncio.Task | None = None
@@ -689,8 +691,7 @@ class MusicPanel(discord.ui.View):
                 state.queue.appendleft(state.current)
                 state.current = None
         await self.bot._stop_player(interaction.guild)
-        if not interaction.guild.voice_client:
-            await self.bot.advance(interaction.guild)
+        await self.bot.advance(interaction.guild)
         await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
 
     @discord.ui.button(label='Pause', emoji='⏸️', style=discord.ButtonStyle.secondary, custom_id='music:pause', row=0)
@@ -735,6 +736,7 @@ class MusicPanel(discord.ui.View):
         state = self.bot.states.setdefault(interaction.guild.id, QueueState())
         if vc and (vc.is_playing() or vc.is_paused()):
             await self.bot._stop_player(interaction.guild)
+            await self.bot.advance(interaction.guild)
             text = 'Dilewati.'
         elif state.queue:
             await self.bot.advance(interaction.guild)
@@ -859,6 +861,7 @@ class MusicBot(discord.Client):
         if state:
             async with state.lock:
                 state.generation += 1
+                state._skip_armed = True
         vc = guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
             try:
@@ -980,6 +983,8 @@ class MusicBot(discord.Client):
         """
         targets = [(gid, st.message) for gid, st in list(self.states.items())
                    if getattr(st, 'message', None) is not None]
+        targets += [(gid, st.now_message) for gid, st in list(self.states.items())
+                    if getattr(st, 'now_message', None) is not None]
         if not targets:
             return
 
@@ -1002,6 +1007,7 @@ class MusicBot(discord.Client):
             state = self.states.get(gid)
             if state is not None:
                 state.message = None
+                state.now_message = None
 
     async def close(self):
         try:
@@ -1083,6 +1089,7 @@ class MusicBot(discord.Client):
         if not ok:
             return await interaction.followup.send(msg, ephemeral=True)
         await self._stop_player(interaction.guild)
+        await self.advance(interaction.guild)
         await interaction.followup.send('Lagu dilewati.', ephemeral=True)
 
     async def cmd_back(self, interaction: discord.Interaction):
@@ -1106,8 +1113,7 @@ class MusicBot(discord.Client):
                 state.queue.appendleft(state.current)
                 state.current = None
         await self._stop_player(interaction.guild)
-        if not interaction.guild.voice_client:
-            await self.advance(interaction.guild)
+        await self.advance(interaction.guild)
         await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
 
     async def cmd_shuffle(self, interaction: discord.Interaction):
@@ -1443,7 +1449,24 @@ class MusicBot(discord.Client):
                 def after(error, _gen=generation):
                     if error:
                         log.error('Audio playback error: %s', error)
-                    fut = asyncio.run_coroutine_threadsafe(self.finished(guild, _gen), loop)
+                    # Skip/back manual: after() dari vc.stop() diabaikan,
+                    # advance manual di handler yang jalan — anti dobel.
+                    async def _after_dispatch():
+                        st = self.states.get(guild.id)
+                        if st is None:
+                            return
+                        skip = False
+                        async with st.lock:
+                            if getattr(st, '_skip_armed', False):
+                                st._skip_armed = False
+                                skip = True
+                        if skip:
+                            return
+                        await self.finished(guild, _gen)
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(_after_dispatch(), loop)
+                    except RuntimeError:
+                        return
                     def _cb(f):
                         if f.cancelled():
                             return
@@ -1470,7 +1493,13 @@ class MusicBot(discord.Client):
                             if state.loop_mode == 'queue':
                                 state.queue.append(state.current)
                         state.current = next_track
+                        played = next_track
                 await self.refresh(state)
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._announce_now_playing(guild, played))
+                except RuntimeError:
+                    pass
                 return
             except Exception as exc:
                 consecutive_errors += 1
@@ -1492,6 +1521,32 @@ class MusicBot(discord.Client):
             gen = state.generation
         if schedule_idle:
             self._schedule_idle(guild, gen)
+
+    async def _announce_now_playing(self, guild: discord.Guild, track) -> None:
+        """Kirim pesan judul lagu baru; hapus pesan judul lama biar chat bersih."""
+        state = self.states.get(guild.id)
+        if state is None or track is None:
+            return
+        old = getattr(state, 'now_message', None)
+        if old is not None:
+            try:
+                await old.delete()
+            except Exception:
+                pass
+            state.now_message = None
+        panel_msg = getattr(state, 'message', None)
+        if panel_msg is None:
+            return
+        try:
+            channel = getattr(panel_msg, 'channel', None)
+            if channel is None:
+                return
+            state.now_message = await channel.send(
+                f'Now playing: **{discord.utils.escape_markdown(track.title)}**')
+        except discord.HTTPException:
+            state.now_message = None
+        except Exception:
+            log.debug('Gagal kirim now-playing', exc_info=True)
 
     def _schedule_idle(self, guild: discord.Guild, generation: int) -> None:
         state = self.states.get(guild.id)
