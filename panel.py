@@ -32,6 +32,8 @@ _form_tokens: dict[str, float] = {}
 _last_update_output: str = ''
 _update_lock = threading.Lock()
 _update_running = False
+# PRG flash: POST handler set pesan lalu redirect 303 ke GET, refresh aman.
+_flash_msg: str = ''
 
 
 class ConfigStore:
@@ -629,8 +631,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, LOGIN_PAGE.replace('{error}', notice))
 
     def _page(self, message='', status=HTTPStatus.OK):
+        global _flash_msg
         data = store().read()
         state = bot_state()
+        if not message:
+            with _lock:
+                if _flash_msg:
+                    message = _flash_msg
+                    _flash_msg = ''
         banner = f'<div class="msg">{html.escape(message)}</div>' if message else ''
         now = time.monotonic()
         with _lock:
@@ -714,6 +722,11 @@ class Handler(BaseHTTPRequestHandler):
         time.sleep(0.4)
         return self._login_page('Password salah.', HTTPStatus.FORBIDDEN)
 
+    def _set_flash(self, message: str) -> None:
+        global _flash_msg
+        with _lock:
+            _flash_msg = message
+
     def _save(self, fields):
         current = store().read()
         token = fields.get('token', '').strip() or current['token']
@@ -729,14 +742,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._page('Gagal menyimpan konfigurasi.', HTTPStatus.BAD_REQUEST)
         self.log_message('konfigurasi disimpan (token_set=%s guild_set=%s)',
                          bool(token), bool(guild))
+        self._set_flash('Konfigurasi disimpan.')
         return self._redirect('/')
 
     def _update(self):
         ok, out = run_update()
         if ok:
-            return self._page(f'Pembaruan yt-dlp berhasil dijalankan.\n{out}')
-        return self._page(f'Pembaruan yt-dlp gagal: {out}',
-                          HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._set_flash(f'Pembaruan yt-dlp berhasil dijalankan.\n{out}')
+        else:
+            self._set_flash(f'Pembaruan yt-dlp gagal: {out}')
+        return self._redirect('/')
 
     def _service(self, action):
         data = store().read()
@@ -758,7 +773,8 @@ class Handler(BaseHTTPRequestHandler):
         labels = {'start': 'Bot dinyalakan.', 'restart': 'Bot dimulai ulang.',
                   'stop': 'Bot dimatikan.'}
         self.log_message('systemctl %s ok', action)
-        return self._page(labels.get(action, 'Selesai.'))
+        self._set_flash(labels.get(action, 'Selesai.'))
+        return self._redirect('/')
 
 
 class Server(ThreadingHTTPServer):

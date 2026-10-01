@@ -185,6 +185,9 @@ class PanelTests(unittest.TestCase):
         cookie = self.login()
         panel.UPDATE_RUNNER = lambda: (True, '[Mock] yt-dlp updated successfully v2026.09.01')
         status, body, _ = self.req('POST', '/update', '', cookie=cookie)
+        # PRG: POST redirect 303, pesan via flash di GET berikutnya.
+        self.assertEqual(status, 303)
+        status, body, _ = self.req('GET', '/', cookie=cookie)
         self.assertEqual(status, 200)
         self.assertIn('Pembaruan yt-dlp berhasil dijalankan', body)
         self.assertIn('yt-dlp updated successfully', body)
@@ -275,10 +278,26 @@ class PasswordlessTests(unittest.TestCase):
         status, _ = self.req('POST', '/start', '', headers={'Origin': origin})
         self.assertEqual(status, 400)
 
+    def test_post_redirect_get_no_resubmit_on_refresh(self):
+        # Klik tombol lalu GET ulang: tidak ada POST ulang, tidak ada 405/409.
+        # Lalu refresh berkali-kali tetap GET 200 tanpa warning resubmit browser.
+        origin = f'http://127.0.0.1:{self.port}'
+        self.req('POST', '/save', 'token=abc&guild=7', headers={'Origin': origin})
+        status, body = self.req('GET', '/')
+        self.assertEqual(status, 200)
+        self.assertIn('Konfigurasi disimpan.', body)
+        # Flash sekali tampil: refresh berikutnya bersih, tanpa warning POST.
+        status, body = self.req('GET', '/')
+        self.assertEqual(status, 200)
+        self.assertNotIn('Konfigurasi disimpan.', body)
+
     def test_passwordless_update_executes(self):
         origin = f'http://127.0.0.1:{self.port}'
         panel.UPDATE_RUNNER = lambda: (True, '[Mock] Update OK')
         status, body = self.req('POST', '/update', '', headers={'Origin': origin})
+        # PRG: POST redirect 303, pesan via flash di GET berikutnya.
+        self.assertEqual(status, 303)
+        status, body = self.req('GET', '/')
         self.assertEqual(status, 200)
         self.assertIn('Pembaruan yt-dlp berhasil dijalankan', body)
         self.assertIn('[Mock] Update OK', body)
