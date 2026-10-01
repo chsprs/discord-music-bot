@@ -972,6 +972,37 @@ class MusicBot(discord.Client):
     async def on_guild_remove(self, guild: discord.Guild):
         dump_runtime_state(self)
 
+    async def _delete_all_panels(self) -> None:
+        """Hapus semua pesan panel agar chat bersih saat bot mati.
+
+        Dipanggil dari close() selagi koneksi HTTP masih hidup —
+        super().close() menutup http/ws setelahnya.
+        """
+        targets = [(gid, st.message) for gid, st in list(self.states.items())
+                   if getattr(st, 'message', None) is not None]
+        if not targets:
+            return
+
+        async def _del(msg) -> None:
+            try:
+                await msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                log.debug('Gagal hapus panel saat shutdown: %s', exc)
+            except Exception:
+                log.debug('Gagal hapus panel saat shutdown', exc_info=True)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(_del(m) for _, m in targets), return_exceptions=True),
+                timeout=15,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            log.warning('Timeout hapus panel saat shutdown')
+        for gid, _ in targets:
+            state = self.states.get(gid)
+            if state is not None:
+                state.message = None
+
     async def close(self):
         try:
             dump_runtime_state_offline()
@@ -982,6 +1013,10 @@ class MusicBot(discord.Client):
                 if task and not task.done():
                     task.cancel()
             state.idle_task = state.empty_task = state.refresh_task = None
+        try:
+            await self._delete_all_panels()
+        except Exception:
+            pass
         if self._exporter_task and not self._exporter_task.done():
             self._exporter_task.cancel()
         await super().close()

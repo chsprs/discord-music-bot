@@ -153,6 +153,52 @@ class MusicTests(unittest.TestCase):
             vc.disconnect.assert_called_once_with(force=True)
             mock_refresh.assert_called_once_with(state)
 
+    def test_close_deletes_all_panels_and_clears_state(self):
+        bot = MusicBot()
+        states = {}
+        msgs = {}
+        for gid in (111, 222, 333):
+            state = QueueState()
+            if gid != 222:  # 222: tanpa panel
+                msg = MagicMock()
+                msg.delete = AsyncMock()
+                state.message = msg
+                msgs[gid] = msg
+            states[gid] = state
+        bot.states = states
+        bot._exporter_task = None
+        with patch('bot.dump_runtime_state_offline'):
+            with patch.object(MusicBot.__bases__[0], 'close', new=AsyncMock()) as super_close:
+                asyncio.run(bot.close())
+                super_close.assert_called_once_with()
+        msgs[111].delete.assert_called_once_with()
+        msgs[333].delete.assert_called_once_with()
+        self.assertIsNone(states[111].message)
+        self.assertIsNone(states[333].message)
+
+    def test_close_tolerates_panel_delete_failure(self):
+        bot = MusicBot()
+        state = QueueState()
+        bad = MagicMock()
+        bad.delete = AsyncMock(side_effect=discord.NotFound(MagicMock(), 'gone'))
+        state.message = bad
+        bot.states = {444: state}
+        bot._exporter_task = None
+        with patch('bot.dump_runtime_state_offline'):
+            with patch.object(MusicBot.__bases__[0], 'close', new=AsyncMock()):
+                asyncio.run(bot.close())  # tidak boleh raise
+        self.assertIsNone(state.message)
+
+    def test_close_without_panels_skips_delete(self):
+        bot = MusicBot()
+        state = QueueState()  # message None
+        bot.states = {555: state}
+        bot._exporter_task = None
+        with patch('bot.dump_runtime_state_offline'):
+            with patch.object(MusicBot.__bases__[0], 'close', new=AsyncMock()):
+                asyncio.run(bot.close())
+        self.assertIsNone(state.message)
+
     def test_quit_voice_default_preserves_queue(self):
         bot = MusicBot()
         guild = MagicMock()
