@@ -5,7 +5,9 @@ import re
 import stat
 import tempfile
 import threading
+import time
 import unittest
+import unittest.mock
 
 import panel
 
@@ -321,6 +323,120 @@ class ConfigStoreTests(unittest.TestCase):
                 body = handle.read()
             self.assertEqual(body.count('DISCORD_TOKEN='), 1)
             self.assertIn('export BOT_STATE_FILE=/run/x/state.json', body)
+
+
+class RateLimitTests(unittest.TestCase):
+    """Rate limit login harus atomik (bukan check-then-act)."""
+
+    def setUp(self):
+        self._saved = dict(panel._attempts)
+        panel._attempts.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        panel._attempts.clear()
+        panel._attempts.update(self._saved)
+
+    def test_reserve_blocks_after_eight_attempts(self):
+        for i in range(8):
+            allowed, _ = panel.reserve_login_attempt('10.0.0.1')
+            self.assertTrue(allowed, f'percobaan {i + 1} seharusnya boleh')
+        allowed, retry = panel.reserve_login_attempt('10.0.0.1')
+        self.assertFalse(allowed)
+        self.assertEqual(retry, 300)
+
+    def test_reserve_is_atomic_under_concurrency(self):
+        """Tanpa reservasi atomik, N thread bisa lolos bersamaan."""
+        allowed_count = []
+        lock = threading.Lock()
+
+        def worker():
+            ok, _ = panel.reserve_login_attempt('10.0.0.2')
+            with lock:
+                allowed_count.append(ok)
+
+        threads = [threading.Thread(target=worker) for _ in range(40)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(1 for a in allowed_count if a), 8,
+                         'jumlah percobaan yang lolos harus tepat 8')
+
+    def test_separate_peers_have_separate_budgets(self):
+        for _ in range(8):
+            panel.reserve_login_attempt('10.0.0.3')
+        allowed, _ = panel.reserve_login_attempt('10.0.0.4')
+        self.assertTrue(allowed)
+
+
+class SessionTableTests(unittest.TestCase):
+    """Sesi server-side harus kedaluwarsa dan tidak tumbuh tanpa batas."""
+
+    def setUp(self):
+        self._saved = dict(panel._sessions)
+        panel._sessions.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        panel._sessions.clear()
+        panel._sessions.update(self._saved)
+
+    def test_session_valid_then_expires(self):
+        token = panel._mint_session()
+        self.assertTrue(panel._session_valid(token))
+        panel._sessions[token] = time.monotonic() - 1
+        self.assertFalse(panel._session_valid(token))
+        self.assertNotIn(token, panel._sessions)
+
+    def test_session_table_is_bounded(self):
+        saved_max = panel.MAX_SESSIONS
+        panel.MAX_SESSIONS = 16
+        try:
+            for _ in range(64):
+                panel._mint_session()
+            self.assertLessEqual(len(panel._sessions), 16)
+        finally:
+            panel.MAX_SESSIONS = saved_max
+
+    def test_unknown_token_rejected(self):
+        self.assertFalse(panel._session_valid('tidak-ada'))
+        self.assertFalse(panel._session_valid(''))
+
+
+class SystemctlCacheTests(unittest.TestCase):
+    """Cache systemctl tidak boleh menyimpan timestamp sebelum subprocess."""
+
+    def setUp(self):
+        self._saved_cache = dict(panel._state_cache)
+        panel._state_cache.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        panel._state_cache.clear()
+        panel._state_cache.update(self._saved_cache)
+
+    def test_cache_entry_is_fresh_after_slow_subprocess(self):
+        """Subprocess lambat tidak boleh membuat entri langsung kedaluwarsa."""
+        calls = []
+
+        def slow_run(*args, **kwargs):
+            time.sleep(0.3)
+            calls.append(1)
+            return unittest.mock.MagicMock(stdout='active\n')
+
+        with unittest.mock.patch.object(panel.subprocess, 'run', side_effect=slow_run):
+            first = panel._cached_systemctl('bot', panel.SERVICE, 3, 'unknown')
+            second = panel._cached_systemctl('bot', panel.SERVICE, 3, 'unknown')
+        self.assertEqual(first, 'active')
+        self.assertEqual(second, 'active')
+        self.assertEqual(len(calls), 1, 'panggilan kedua harus memakai cache')
+
+    def test_failure_falls_back(self):
+        with unittest.mock.patch.object(panel.subprocess, 'run',
+                                        side_effect=OSError('systemctl hilang')):
+            value = panel._cached_systemctl('bot', panel.SERVICE, 3, 'unknown')
+        self.assertEqual(value, 'unknown')
 
 
 class HostAllowlistTests(unittest.TestCase):

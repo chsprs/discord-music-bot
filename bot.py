@@ -1238,6 +1238,17 @@ class MusicBot(discord.Client):
                     if task and not task.done():
                         task.cancel()
                 state.idle_task = state.empty_task = None
+                announce_task = state.announce_task
+                state.announce_task = None
+                old_now_message = state.now_message
+                state.now_message = None
+            if announce_task and not announce_task.done():
+                announce_task.cancel()
+            if old_now_message is not None:
+                try:
+                    await old_now_message.delete()
+                except Exception:
+                    pass
         vc = getattr(guild, 'voice_client', None)
         if vc:
             try:
@@ -1629,6 +1640,9 @@ class MusicBot(discord.Client):
         state = self.states.get(guild.id)
         if state is None or track is None:
             return
+        previous = state.announce_task
+        if previous is not None and previous is not asyncio.current_task() and not previous.done():
+            previous.cancel()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

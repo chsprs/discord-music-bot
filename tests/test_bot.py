@@ -732,6 +732,58 @@ class MusicTests(unittest.TestCase):
         task = asyncio.run(scenario())
         self.assertIsNotNone(task)
 
+    def test_announce_cancels_previous_task(self):
+        """Announce berturut-turut (loop track) tidak boleh menumpuk task."""
+        bot = MusicBot()
+        state = QueueState()
+        bot.states = {88008: state}
+        guild = MagicMock(id=88008)
+        track = Track('t', 'https://example.com/t', 'u')
+
+        async def slow_announce(g, t):
+            await asyncio.sleep(30)
+
+        async def scenario():
+            with patch.object(bot, '_announce_now_playing', new=slow_announce):
+                bot._announce(guild, track)
+                first = state.announce_task
+                bot._announce(guild, track)
+                second = state.announce_task
+                await asyncio.sleep(0)
+                return first, second
+
+        first, second = asyncio.run(scenario())
+        self.assertIsNot(first, second)
+        self.assertTrue(first.cancelled() or first.done(),
+                        'task announce sebelumnya harus dibatalkan')
+
+    def test_quit_voice_clears_announce_task_and_now_message(self):
+        """Stop/quit harus membatalkan announce & membersihkan pesan now-playing."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88009
+        guild.voice_client = None
+        state = QueueState()
+        old_msg = MagicMock()
+        old_msg.delete = AsyncMock()
+        state.now_message = old_msg
+        bot.states[88009] = state
+
+        async def scenario():
+            with patch.object(bot, 'refresh', new=AsyncMock()), \
+                 patch('bot.dump_runtime_state'):
+                bot._announce(guild, Track('t', 'https://example.com/t', 'u'))
+                pending = state.announce_task
+                await asyncio.sleep(0)
+                await bot.quit_voice(guild, clear_queue=True)
+                return pending
+
+        pending = asyncio.run(scenario())
+        self.assertIsNone(state.announce_task)
+        self.assertIsNone(state.now_message)
+        old_msg.delete.assert_awaited()
+        self.assertTrue(pending.cancelled() or pending.done())
+
 
 if __name__ == '__main__':
     unittest.main()

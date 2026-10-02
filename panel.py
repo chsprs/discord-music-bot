@@ -40,6 +40,7 @@ _form_tokens: dict[str, float] = {}
 # Sesi server-side: token acak per login, bisa dicabut (beda dari cookie deterministic).
 _sessions: dict[str, float] = {}
 SESSION_TTL = 43200
+MAX_SESSIONS = 512
 _last_update_output: str = ''
 _update_lock = threading.Lock()
 _update_running = False
@@ -177,6 +178,9 @@ def _mint_session() -> str:
         for key, expiry in list(_sessions.items()):
             if expiry <= now:
                 _sessions.pop(key, None)
+        if len(_sessions) >= MAX_SESSIONS:
+            oldest = min(_sessions, key=_sessions.get)
+            _sessions.pop(oldest, None)
         _sessions[token] = now + SESSION_TTL
     return token
 
@@ -202,19 +206,29 @@ def store() -> ConfigStore:
 
 def _cached_systemctl(kind: str, unit: str, timeout: int, fallback: str) -> str:
     """Cache hasil systemctl singkat agar satu page render tidak fork 4x (S9)."""
-    now = time.monotonic()
+    started = time.monotonic()
     with _state_cache_lock:
         hit = _state_cache.get(kind)
-        if hit is not None and now - hit[0] < STATE_CACHE_TTL:
+        if hit is not None and started - hit[0] < STATE_CACHE_TTL:
             return hit[1]
-        try:
-            result = subprocess.run(['systemctl', 'is-active', unit],
-                                    capture_output=True, text=True, timeout=timeout)
-            value = result.stdout.strip()
-        except Exception:
-            value = fallback
-        _state_cache[kind] = (now, value)
-        return value
+    # Jangan tahan mutex selama systemctl; timeout 2-3 detik tidak boleh
+    # memblokir semua render panel lain.
+    try:
+        result = subprocess.run(['systemctl', 'is-active', unit],
+                                capture_output=True, text=True, timeout=timeout)
+        value = result.stdout.strip()
+    except Exception:
+        value = fallback
+    # Timestamp diambil SETELAH subprocess: kalau memakai `started`, entri akan
+    # langsung dianggap kedaluwarsa setelah systemctl 2-3 detik.
+    finished = time.monotonic()
+    with _state_cache_lock:
+        current = _state_cache.get(kind)
+        if current is None or current[0] <= finished:
+            _state_cache[kind] = (finished, value)
+            return value
+        # Pemanggil lain sudah mengisi data yang lebih baru saat subprocess ini jalan.
+        return current[1]
 
 
 def bot_state() -> str:
@@ -428,17 +442,16 @@ def format_guilds_html(info: dict) -> str:
     return '\n'.join(cards)
 
 
-def rate_limited(peer: str) -> bool:
+def reserve_login_attempt(peer: str) -> tuple[bool, int]:
+    """Atomically reserve one login attempt for peer."""
     now = time.monotonic()
     with _lock:
         hits = [t for t in _attempts.get(peer, []) if now - t < 300]
+        if len(hits) >= 8:
+            _attempts[peer] = hits
+            return False, 300
+        hits.append(now)
         _attempts[peer] = hits
-        return len(hits) >= 8
-
-
-def record_failure(peer: str) -> None:
-    with _lock:
-        _attempts.setdefault(peer, []).append(time.monotonic())
         if len(_attempts) > 512:
             # Buang entri yang kegagalan terakhirnya paling lama, bukan yang
             # paling awal di-insert, agar serangan rotasi IP tidak mengusir
@@ -446,6 +459,7 @@ def record_failure(peer: str) -> None:
             oldest = sorted(_attempts, key=lambda k: _attempts[k][-1] if _attempts[k] else 0)
             for key in oldest[:128]:
                 _attempts.pop(key, None)
+        return True, 300 if len(hits) >= 8 else 5
 
 
 
@@ -737,6 +751,22 @@ class Handler(BaseHTTPRequestHandler):
                          origin, host, sec_fetch_site, has_valid_nonce)
         return False
 
+    MAX_BODY = 8192
+
+    def _drain_body(self, length: int) -> None:
+        """Buang sisa body yang belum dibaca.
+
+        Menutup socket dengan data masuk yang belum dibaca memicu TCP RST pada
+        banyak stack, sehingga respons 413 tidak sampai ke klien. Batasi jumlah
+        yang dikuras agar klien nakal tidak bisa memaksa kita membaca tanpa henti.
+        """
+        remaining = min(length, self.MAX_BODY * 4)
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 4096))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def _body(self) -> Optional[dict]:
         """Baca body form. Return None bila request sudah ditolak (413)."""
         try:
@@ -745,10 +775,10 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         if length <= 0:
             return {}
-        # Tolak sebelum membaca agar sisa body tidak tertinggal di socket (S8/S11).
-        # Return None menandakan pemanggil HARUS berhenti (respons sudah dikirim),
-        # supaya tidak ada respons ganda dan aksi tidak tetap dijalankan.
-        if length > 8192:
+        if length > self.MAX_BODY:
+            # Kirim 413 lalu kuras sisa body supaya respons benar-benar terkirim
+            # dan koneksi ditutup dengan bersih.
+            self._drain_body(length)
             self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, 'Body terlalu besar')
             return None
         raw = self.rfile.read(length).decode('utf-8', 'replace')
@@ -948,9 +978,11 @@ class Handler(BaseHTTPRequestHandler):
     # ---- actions -------------------------------------------------
     def _login(self, fields):
         peer = self.client_address[0]
-        if rate_limited(peer):
+        allowed, retry_after = reserve_login_attempt(peer)
+        if not allowed:
             return self._login_page('Terlalu banyak percobaan. Tunggu beberapa menit.',
-                                    HTTPStatus.TOO_MANY_REQUESTS)
+                                    HTTPStatus.TOO_MANY_REQUESTS,
+                                    extra={'Retry-After': str(retry_after)})
         password = fields.get('password', '')
         if PASSWORD and hmac.compare_digest(password, PASSWORD):
             with _lock:
@@ -959,8 +991,6 @@ class Handler(BaseHTTPRequestHandler):
             cookie = (f'{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; '
                       f'Max-Age={SESSION_TTL}')
             return self._redirect('/', {'Set-Cookie': cookie})
-        record_failure(peer)
-        retry_after = '300' if rate_limited(peer) else '5'
         # Retry-After menggantikan time.sleep(0.4) yang menahan thread worker.
         return self._login_page(
             'Password salah.',
