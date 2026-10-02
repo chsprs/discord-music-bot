@@ -508,6 +508,97 @@ class HostAllowlistTests(unittest.TestCase):
         self.assertEqual(res.status, 200)
 
 
+class DefaultAllowlistTests(unittest.TestCase):
+    """Fix H2: allowlist default harus memuat alamat LAN yang dipakai installer.
+
+    install.sh mencetak `http://${LAN_IP}:${PANEL_PORT}` dan mengisi
+    PANEL_ALLOWED_HOSTS dari `hostname -I`. Kalau deteksi default melewatkan
+    alamat itu, panel menolak 403 untuk URL yang justru dipromosikan sendiri.
+    """
+
+    def test_default_allowlist_includes_loopback_and_hostname_addresses(self):
+        hosts = panel._default_allowed_hosts('0.0.0.0', 9130)
+        self.assertIn('127.0.0.1:9130', hosts)
+        self.assertIn('localhost:9130', hosts)
+        self.assertIn('[::1]:9130', hosts)
+
+    def test_default_allowlist_includes_every_local_address(self):
+        """Setiap alamat yang dilaporkan _local_addresses harus diterima.
+
+        Di-mock agar deterministik: hasil nyata bergantung NIC/DHCP mesin uji.
+        """
+        port = 9130
+        fake = {'192.168.1.50', '10.0.0.7', 'fe80::1'}
+        with unittest.mock.patch.object(panel, '_local_addresses', return_value=fake):
+            hosts = panel._default_allowed_hosts('0.0.0.0', port)
+        self.assertIn('192.168.1.50:9130', hosts)
+        self.assertIn('10.0.0.7:9130', hosts)
+        self.assertIn('[fe80::1]:9130', hosts)
+
+    def test_lan_address_from_installer_is_accepted(self):
+        """Simulasi alur install.sh: LAN_IP:PORT dari `hostname -I` harus lolos."""
+        port = 9130
+        lan_ip = '192.168.1.50'
+        saved = panel.ALLOWED_HOSTS
+        with unittest.mock.patch.object(panel, '_local_addresses', return_value={lan_ip}):
+            panel.ALLOWED_HOSTS = panel._default_allowed_hosts('0.0.0.0', port)
+        try:
+            handler = panel.Handler.__new__(panel.Handler)
+            self.assertTrue(handler._host_ok(f'{lan_ip}:{port}'),
+                            'Host dari hostname -I ditolak -> panel 403 di URL installer')
+        finally:
+            panel.ALLOWED_HOSTS = saved
+
+    def test_real_local_addresses_are_accepted(self):
+        """Tanpa mock: alamat nyata mesin ini juga harus diterima (bila ada)."""
+        port = 9130
+        local = panel._local_addresses()
+        if not local:
+            self.skipTest('mesin uji tidak melaporkan alamat lokal')
+        saved = panel.ALLOWED_HOSTS
+        panel.ALLOWED_HOSTS = panel._default_allowed_hosts('0.0.0.0', port)
+        try:
+            handler = panel.Handler.__new__(panel.Handler)
+            for addr in local:
+                host_header = f'[{addr}]:{port}' if ':' in addr else f'{addr}:{port}'
+                self.assertTrue(handler._host_ok(host_header),
+                                f'Host {host_header} (dari hostname -I) ditolak')
+        finally:
+            panel.ALLOWED_HOSTS = saved
+
+    def test_explicit_allowed_host_env_is_honoured(self):
+        """PANEL_ALLOWED_HOSTS eksplisit tidak boleh ditimpa oleh autodetect."""
+        saved = panel.ALLOWED_HOSTS
+        panel.ALLOWED_HOSTS = {'panel.local:9130'}
+        try:
+            handler = panel.Handler.__new__(panel.Handler)
+            self.assertTrue(handler._host_ok('panel.local:9130'))
+            self.assertFalse(handler._host_ok('evil.example:9130'))
+        finally:
+            panel.ALLOWED_HOSTS = saved
+
+    def test_ipv6_bracket_host_matching(self):
+        saved = panel.ALLOWED_HOSTS
+        panel.ALLOWED_HOSTS = {'[::1]:9130'}
+        try:
+            handler = panel.Handler.__new__(panel.Handler)
+            self.assertTrue(handler._host_ok('[::1]:9130'))
+        finally:
+            panel.ALLOWED_HOSTS = saved
+
+    def test_default_port_omits_port_in_host(self):
+        """Pada port 80/443 browser mengirim Host tanpa port."""
+        hosts = panel._default_allowed_hosts('0.0.0.0', 80)
+        self.assertIn('127.0.0.1', hosts)
+        handler = panel.Handler.__new__(panel.Handler)
+        saved = panel.ALLOWED_HOSTS
+        panel.ALLOWED_HOSTS = hosts
+        try:
+            self.assertTrue(handler._host_ok('127.0.0.1'))
+        finally:
+            panel.ALLOWED_HOSTS = saved
+
+
 class RobustnessTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
