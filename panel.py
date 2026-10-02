@@ -24,6 +24,10 @@ PASSWORD = os.environ.get('PANEL_PASSWORD', '')
 COOKIE = 'music_session'
 STORE = None
 UPDATE_RUNNER: Optional[Callable[[], tuple[bool, str]]] = None
+# Hook untuk menguji /start, /restart, /stop tanpa menyentuh systemd sungguhan.
+# WAJIB dipasang oleh unit test: menjalankan suite di server produksi tidak
+# boleh mematikan bot yang sedang berjalan.
+SERVICE_RUNNER: Optional[Callable[[str], tuple[bool, str]]] = None
 
 # Nama host/IP yang diizinkan muncul di header Host. Tanpa allowlist, pemeriksaan
 # Origin bisa dilewati dengan DNS rebinding (Host dari klien selalu dipercaya).
@@ -1050,16 +1054,21 @@ class Handler(BaseHTTPRequestHandler):
         if not data['token'] and action != 'stop':
             return self._page('Token Discord belum diisi. Simpan konfigurasi dulu.',
                               HTTPStatus.BAD_REQUEST)
-        try:
-            result = subprocess.run(['systemctl', action, SERVICE],
-                                    capture_output=True, text=True, timeout=15)
-        except Exception as exc:
-            self.log_exception('systemctl %s gagal: %s', action, exc)
-            return self._page(f'Perintah systemctl {action} gagal dijalankan.',
-                              HTTPStatus.INTERNAL_SERVER_ERROR)
-        if result.returncode != 0:
+        if SERVICE_RUNNER is not None:
+            # Jalur unit test: jangan pernah menyentuh systemd sungguhan.
+            ok, detail = SERVICE_RUNNER(action)
+        else:
+            try:
+                result = subprocess.run(['systemctl', action, SERVICE],
+                                        capture_output=True, text=True, timeout=15)
+            except Exception as exc:
+                self.log_exception('systemctl %s gagal: %s', action, exc)
+                return self._page(f'Perintah systemctl {action} gagal dijalankan.',
+                                  HTTPStatus.INTERNAL_SERVER_ERROR)
+            ok = result.returncode == 0
             detail = (result.stderr or result.stdout or '').strip()[:200]
-            self.log_message('systemctl %s rc=%s', action, result.returncode)
+        if not ok:
+            self.log_message('systemctl %s rc!=0', action)
             return self._page(f'systemctl {action} gagal: {detail}',
                               HTTPStatus.INTERNAL_SERVER_ERROR)
         labels = {'start': 'Bot dinyalakan.', 'restart': 'Bot dimulai ulang.',

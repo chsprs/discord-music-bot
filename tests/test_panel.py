@@ -16,6 +16,31 @@ import unittest.mock
 import panel
 
 
+def _no_systemd(action):
+    """Pengganti systemctl untuk unit test.
+
+    Tanpa ini, POST /start|/restart|/stop dari suite benar-benar menjalankan
+    `systemctl <action> discord-music.service` dan MEMATIKAN bot produksi.
+    """
+    return True, ''
+
+
+def _no_update():
+    """Pengganti update.sh untuk unit test.
+
+    Tanpa ini, POST /update dari suite menjalankan update.sh sungguhan:
+    pip install -U yt-dlp lalu `systemctl restart discord-music.service`.
+    """
+    return True, '[uji] pembaruan dilewati'
+
+
+# Pasang sekali di tingkat modul, sebelum test apa pun berjalan. Kedua hook ini
+# adalah jaring pengaman: suite harus bisa dijalankan di server produksi tanpa
+# menyentuh systemd atau memasang paket.
+panel.SERVICE_RUNNER = _no_systemd
+panel.UPDATE_RUNNER = _no_update
+
+
 class PanelTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -195,6 +220,7 @@ class PanelTests(unittest.TestCase):
     def test_update_executes_and_displays_log(self):
         cookie = self.login()
         panel.UPDATE_RUNNER = lambda: (True, '[Mock] yt-dlp updated successfully v2026.09.01')
+        self.addCleanup(setattr, panel, 'UPDATE_RUNNER', _no_update)
         status, body, _ = self.req('POST', '/update', '', cookie=cookie)
         # PRG: POST redirect 303, pesan via flash di GET berikutnya.
         self.assertEqual(status, 303)
@@ -202,7 +228,6 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('Pembaruan yt-dlp berhasil dijalankan', body)
         self.assertIn('yt-dlp updated successfully', body)
-        panel.UPDATE_RUNNER = None
 
     def test_api_logs_requires_authentication(self):
         status, _, _ = self.req('GET', '/api/logs')
@@ -751,6 +776,7 @@ class PasswordlessTests(unittest.TestCase):
     def test_passwordless_update_executes(self):
         origin = f'http://127.0.0.1:{self.port}'
         panel.UPDATE_RUNNER = lambda: (True, '[Mock] Update OK')
+        self.addCleanup(setattr, panel, 'UPDATE_RUNNER', _no_update)
         status, body = self.req('POST', '/update', '', headers={'Origin': origin})
         # PRG: POST redirect 303, pesan via flash di GET berikutnya.
         self.assertEqual(status, 303)
@@ -758,7 +784,6 @@ class PasswordlessTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('Pembaruan yt-dlp berhasil dijalankan', body)
         self.assertIn('[Mock] Update OK', body)
-        panel.UPDATE_RUNNER = None
 
     def test_browser_form_without_origin_uses_page_nonce(self):
         status, page = self.req('GET', '/')
@@ -890,6 +915,67 @@ class ShutdownTests(unittest.TestCase):
                         'akan timeout 90 dtk lalu SIGKILL)')
         self.assertEqual(proc.returncode, 0,
                          f'kode keluar tidak bersih: {proc.returncode}')
+
+
+class NoRealSystemdTests(unittest.TestCase):
+    """Suite tidak boleh menyentuh systemd sungguhan.
+
+    Regresi: POST /start|/restart|/stop dari unit test benar-benar menjalankan
+    `systemctl <action> discord-music.service`. Menjalankan suite di server
+    produksi mematikan bot yang sedang melayani pengguna (terbukti di journal:
+    bot mati dua kali saat suite dijalankan).
+    """
+
+    def test_suite_installs_service_runner_hook(self):
+        self.assertIsNotNone(
+            panel.SERVICE_RUNNER,
+            'panel.SERVICE_RUNNER belum dipasang: suite akan memanggil '
+            'systemctl sungguhan dan mematikan bot produksi')
+        self.assertTrue(callable(panel.SERVICE_RUNNER))
+
+    def test_suite_installs_update_runner_hook(self):
+        """UPDATE_RUNNER juga wajib ada: tanpa itu /update memasang paket
+        sungguhan lewat update.sh dan me-restart bot."""
+        self.assertIsNotNone(
+            panel.UPDATE_RUNNER,
+            'panel.UPDATE_RUNNER belum dipasang: suite akan menjalankan '
+            'update.sh sungguhan (pip install + systemctl restart)')
+        self.assertTrue(callable(panel.UPDATE_RUNNER))
+
+    def test_service_runner_prevents_real_subprocess(self):
+        """_service() harus memakai hook, bukan subprocess.run."""
+        calls = []
+        original = panel.SERVICE_RUNNER
+        panel.SERVICE_RUNNER = lambda action: (calls.append(action), (True, ''))[1]
+        self.addCleanup(setattr, panel, 'SERVICE_RUNNER', original)
+
+        with unittest.mock.patch('panel.subprocess.run') as mock_run:
+            mock_run.side_effect = AssertionError('systemctl sungguhan dipanggil!')
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            env = os.path.join(tmp.name, '.env')
+            panel.STORE = panel.ConfigStore(env)
+            panel.ConfigStore(env).write({'token': 'tok', 'guild': '1'})
+            panel.PASSWORD = ''
+            saved_hosts = set(panel.ALLOWED_HOSTS)
+            self.addCleanup(setattr, panel, 'ALLOWED_HOSTS', saved_hosts)
+
+            server = panel.build_server('127.0.0.1', 0)
+            port = server.server_address[1]
+            panel.ALLOWED_HOSTS = {f'127.0.0.1:{port}'}
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.shutdown)
+            self.addCleanup(server.server_close)
+
+            conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+            conn.request('POST', '/stop', body='',
+                         headers={'Content-Type': 'application/x-www-form-urlencoded',
+                                  'Origin': f'http://127.0.0.1:{port}'})
+            res = conn.getresponse()
+            res.read()
+            conn.close()
+        self.assertEqual(calls, ['stop'], 'hook SERVICE_RUNNER tidak dipakai')
+        self.assertEqual(res.status, 303)
 
 
 if __name__ == '__main__':
