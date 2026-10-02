@@ -2,7 +2,11 @@ import http.client
 import json
 import os
 import re
+import signal
+import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -828,6 +832,64 @@ class PasswordlessTests(unittest.TestCase):
         conn.close()
         self.assertEqual(res.status, 303)
         self.assertEqual(location, '/')
+
+
+class ShutdownTests(unittest.TestCase):
+    """SIGTERM harus menghentikan panel dengan cepat.
+
+    Regresi: handler memanggil server.shutdown() dari thread yang sama dengan
+    serve_forever(). BaseServer.shutdown() menunggu loop berhenti, tetapi loop
+    tidak bisa lanjut karena kita masih di dalam handler -> deadlock. systemd
+    menunggu TimeoutStopSec (90 dtk) lalu SIGKILL, sehingga setiap restart
+    panel lambat dan service tercatat "Failed with result 'timeout'".
+    """
+
+    def _start_panel(self):
+        port_sock = socket.socket()
+        port_sock.bind(('127.0.0.1', 0))
+        port = port_sock.getsockname()[1]
+        port_sock.close()
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = dict(os.environ,
+                   PANEL_HOST='127.0.0.1',
+                   PANEL_PORT=str(port),
+                   PANEL_PASSWORD='uji',
+                   BOT_CONFIG=os.path.join(tmp.name, '.env'))
+        root = os.path.dirname(os.path.abspath(panel.__file__))
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(root, 'panel.py')],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=0.3):
+                    return proc
+            except OSError:
+                if proc.poll() is not None:
+                    out = proc.stdout.read() if proc.stdout else ''
+                    self.fail(f'panel keluar sebelum siap: rc={proc.returncode}\n{out}')
+                time.sleep(0.05)
+        self.fail('panel tidak pernah membuka port')
+
+    def test_sigterm_shuts_down_quickly(self):
+        proc = self._start_panel()
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.fail('SIGTERM tidak menghentikan panel dalam 15 dtk (deadlock)')
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0,
+                        f'panel butuh {elapsed:.1f} dtk untuk berhenti (systemd '
+                        'akan timeout 90 dtk lalu SIGKILL)')
+        self.assertEqual(proc.returncode, 0,
+                         f'kode keluar tidak bersih: {proc.returncode}')
 
 
 if __name__ == '__main__':

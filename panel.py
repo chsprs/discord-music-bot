@@ -1156,16 +1156,28 @@ def main():
         )
 
     server = build_server(host, port)
+    _closing = threading.Event()
 
-    def _shutdown(*_):
-        try:
-            server.shutdown()
-        except Exception:
-            pass
+    def _close_sockets():
         try:
             server.server_close()
         except Exception:
             pass
+
+    def _shutdown(*_):
+        # PENTING: jangan panggil server.shutdown() dari sini.
+        # Signal handler berjalan di thread yang sama dengan serve_forever().
+        # BaseServer.shutdown() menunggu loop berhenti (__is_shut_down), tapi
+        # loop tidak bisa lanjut karena kita masih di dalam handler -> deadlock.
+        # systemd menunggu TimeoutStopSec (90 dtk) lalu SIGKILL: setiap
+        # restart/stop panel jadi lambat dan tercatat "Failed with result
+        # 'timeout'". Cukup tandai berhenti dan tutup socket; SystemExit
+        # membatalkan select() yang sedang menunggu.
+        if _closing.is_set():
+            return
+        _closing.set()
+        threading.Thread(target=_close_sockets, daemon=True).start()
+        raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -1173,7 +1185,13 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _shutdown()
+        # serve_forever() sudah keluar -> __is_shut_down ter-set, jadi
+        # shutdown() di sini tidak memblokir.
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        _close_sockets()
 
 
 
