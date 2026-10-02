@@ -20,6 +20,16 @@ echo "[1/6] Memeriksa dependensi sistem..."
 apt-get update -y
 apt-get install -y --no-install-recommends python3 python3-venv python3-pip ffmpeg curl git openssl
 
+# Bot memakai asyncio.Semaphore/Lock tingkat modul sehingga butuh Python >= 3.10.
+PY_VER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo '0.0')"
+PY_MAJOR="${PY_VER%%.*}"
+PY_MINOR="${PY_VER##*.}"
+if (( PY_MAJOR < 3 || (PY_MAJOR == 3 && PY_MINOR < 10) )); then
+    echo "Error: butuh Python >= 3.10, terdeteksi $PY_VER." >&2
+    echo "Di Debian/Ubuntu lama pasang python3 dari backports, atau pakai distro yang lebih baru." >&2
+    exit 1
+fi
+
 # Pastikan Node.js terpasang (untuk JS runtime yt-dlp)
 if ! command -v node &>/dev/null; then
     echo "Node.js tidak ditemukan, menginstal Node.js LTS..."
@@ -32,8 +42,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "$SCRIPT_DIR" != "$INSTALL_DIR" ]]; then
     echo "[2/6] Menyalin berkas ke $INSTALL_DIR..."
     mkdir -p "$INSTALL_DIR"
-    cp -r "$SCRIPT_DIR"/* "$INSTALL_DIR"/
-    cp -r "$SCRIPT_DIR"/.[!.]* "$INSTALL_DIR"/ 2>/dev/null || true
+    # Salin hanya artefak yang memang bagian aplikasi. Jangan salin .git atau
+    # .env (berisi token) dari direktori sumber ke /opt.
+    for f in bot.py panel.py update.sh install.sh requirements.txt README.md \
+             discord-music.service discord-music-panel.service \
+             discord-music-update.service discord-music-update.timer \
+             .env.example .gitignore; do
+        if [[ -e "$SCRIPT_DIR/$f" ]]; then
+            cp -r "$SCRIPT_DIR/$f" "$INSTALL_DIR"/
+        fi
+    done
+    if [[ -d "$SCRIPT_DIR/tests" ]]; then
+        cp -r "$SCRIPT_DIR/tests" "$INSTALL_DIR"/
+    fi
 fi
 
 cd "$INSTALL_DIR"
@@ -56,14 +77,23 @@ fi
 PANEL_ENV="/opt/discord-music-panel.env"
 if [[ ! -f "$PANEL_ENV" ]]; then
     PANEL_PASS="$(openssl rand -base64 24 2>/dev/null || head -c 18 /dev/urandom | base64)"
+    LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     cat <<EOF > "$PANEL_ENV"
 PANEL_HOST=$PANEL_HOST
 PANEL_PORT=$PANEL_PORT
 PANEL_PASSWORD=$PANEL_PASS
+# Batasi Host header yang diterima (proteksi DNS-rebinding). Pisahkan dengan koma.
+# Kosongkan untuk deteksi otomatis dari alamat lokal mesin.
+PANEL_ALLOWED_HOSTS=${LAN_IP:+$LAN_IP:$PANEL_PORT}
 EOF
     chmod 600 "$PANEL_ENV"
     echo ""
     echo ">>> PANEL_PASSWORD awal: $PANEL_PASS (tersimpan di $PANEL_ENV, mode 0600). Ganti bila perlu."
+    echo ">>> Panel bind ke $PANEL_HOST. Untuk LAN tak-terpercaya, set PANEL_HOST=127.0.0.1"
+    echo "    dan akses lewat SSH tunnel: ssh -L 9130:127.0.0.1:9130 user@host"
+    if [[ -n "$LAN_IP" ]]; then
+        echo ">>> PANEL_ALLOWED_HOSTS=$LAN_IP:$PANEL_PORT (tambahkan IP/host lain bila perlu)."
+    fi
 fi
 
 # 5. Pasang dan Aktifkan systemd service & timer

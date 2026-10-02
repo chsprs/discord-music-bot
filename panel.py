@@ -1,13 +1,14 @@
 """Local LAN control panel for the Discord music bot (stdlib only)."""
-import hashlib
 import hmac
 import html
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -21,24 +22,49 @@ CONFIG_PATH = os.environ.get('BOT_CONFIG', '/opt/discord-music-bot/.env')
 UPDATE_LOG_PATH = os.environ.get('UPDATE_LOG', '/opt/discord-music-bot/last_update.log')
 PASSWORD = os.environ.get('PANEL_PASSWORD', '')
 COOKIE = 'music_session'
-LABEL = b'music-panel-v1'
 STORE = None
 UPDATE_RUNNER: Optional[Callable[[], tuple[bool, str]]] = None
+
+# Nama host/IP yang diizinkan muncul di header Host. Tanpa allowlist, pemeriksaan
+# Origin bisa dilewati dengan DNS rebinding (Host dari klien selalu dipercaya).
+ALLOWED_HOSTS: set[str] = set()
+for _raw in os.environ.get('PANEL_ALLOWED_HOSTS', '').split(','):
+    _raw = _raw.strip().lower()
+    if _raw:
+        ALLOWED_HOSTS.add(_raw)
 
 _attempts: dict[str, list] = {}
 _lock = threading.Lock()
 # Single-process LAN panel: short-lived nonce for form POST when browser omits Origin.
 _form_tokens: dict[str, float] = {}
+# Sesi server-side: token acak per login, bisa dicabut (beda dari cookie deterministic).
+_sessions: dict[str, float] = {}
+SESSION_TTL = 43200
 _last_update_output: str = ''
 _update_lock = threading.Lock()
 _update_running = False
+_state_cache: dict[str, tuple[float, str]] = {}
+_state_cache_lock = threading.Lock()
+STATE_CACHE_TTL = 2.0
+
 
 
 class ConfigStore:
     """Reads/writes the bot dotenv. Never logs or echoes secret values."""
 
+    MANAGED = ('DISCORD_TOKEN', 'DISCORD_GUILD_ID')
+    HEADER = '# Dikelola panel musik. Jangan commit berkas ini.'
+
     def __init__(self, path: str):
         self.path = path
+
+    @staticmethod
+    def _key_of(body: str) -> str:
+        """Ambil nama key dari satu baris dotenv, sadar bentuk 'export KEY=v'."""
+        line = body.strip()
+        if line.startswith('export '):
+            line = line[len('export '):].lstrip()
+        return line.partition('=')[0].strip()
 
     def read(self) -> dict:
         data = {'token': '', 'guild': ''}
@@ -48,59 +74,158 @@ class ConfigStore:
                     line = line.strip()
                     if not line or line.startswith('#') or '=' not in line:
                         continue
-                    key, _, value = line.partition('=')
-                    key = key.strip()
+                    key = self._key_of(line)
+                    value = line.partition('=')[2].strip()
+                    # Assignment terakhir menang, sama seperti EnvironmentFile=.
                     if key == 'DISCORD_TOKEN':
-                        data['token'] = value.strip()
+                        data['token'] = value
                     elif key == 'DISCORD_GUILD_ID':
-                        data['guild'] = value.strip()
+                        data['guild'] = value
         except FileNotFoundError:
             pass
         return data
+
+    def _preserved_lines(self) -> list[str]:
+        """Baris .env yang BUKAN key ter-manage, agar tidak terhapus saat write.
+
+        Sebelumnya write() menulis ulang berkas dari nol sehingga key tambahan
+        seperti BOT_STATE_FILE / XDG_CACHE_HOME hilang tanpa peringatan.
+        """
+        kept: list[str] = []
+        try:
+            with open(self.path, 'r', encoding='utf-8') as handle:
+                for line in handle:
+                    stripped = line.rstrip('\r\n')
+                    body = stripped.strip()
+                    if not body:
+                        continue
+                    if body.startswith('#'):
+                        # Hanya buang header yang kita kelola sendiri.
+                        if body == self.HEADER:
+                            continue
+                        kept.append(stripped)
+                        continue
+                    # Buang baris apa pun yang menetapkan key ter-manage,
+                    # termasuk bentuk 'export KEY=v' dan spasi di sekitar '='.
+                    # Kalau tidak, baris lama bisa menimpa key baru karena
+                    # sistem membaca assignment terakhir.
+                    if self._key_of(body) in self.MANAGED and '=' in body:
+                        continue
+                    kept.append(stripped)
+        except FileNotFoundError:
+            pass
+        return kept
 
     def write(self, values: dict) -> None:
         for value in values.values():
             if '\n' in value or '\r' in value:
                 raise ValueError('Nilai tidak boleh mengandung baris baru.')
-        body = (
-            '# Dikelola panel musik. Jangan commit berkas ini.\n'
-            f"DISCORD_TOKEN={values.get('token', '')}\n"
-            f"DISCORD_GUILD_ID={values.get('guild', '')}\n"
-        )
+
+        preserved = self._preserved_lines()
+        lines = [
+            '# Dikelola panel musik. Jangan commit berkas ini.',
+            f"DISCORD_TOKEN={values.get('token', '')}",
+            f"DISCORD_GUILD_ID={values.get('guild', '')}",
+        ]
+        lines.extend(preserved)
+        body = '\n'.join(lines) + '\n'
+
         directory = os.path.dirname(self.path) or '.'
         os.makedirs(directory, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-            handle.write(body)
-        os.chmod(self.path, 0o600)
+
+        # Nama unik per panggilan: dua /save bersamaan tidak boleh berbagi
+        # berkas sementara (yang bisa membuat salah satunya gagal atau data
+        # saling menimpa). Tulis penuh + fsync lalu rename atomik agar .env
+        # tidak pernah terlihat kosong/terpotong.
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.env.', suffix='.tmp')
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.path)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
 
-def session_value() -> str:
-    return hmac.new(PASSWORD.encode(), LABEL, hashlib.sha256).hexdigest()
+
+def _mint_session() -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    with _lock:
+        for key, expiry in list(_sessions.items()):
+            if expiry <= now:
+                _sessions.pop(key, None)
+        _sessions[token] = now + SESSION_TTL
+    return token
+
+
+def _session_valid(token: str) -> bool:
+    if not token:
+        return False
+    now = time.monotonic()
+    with _lock:
+        expiry = _sessions.get(token)
+        if expiry is None:
+            return False
+        if expiry <= now:
+            _sessions.pop(token, None)
+            return False
+        return True
+
 
 
 def store() -> ConfigStore:
     return STORE if STORE is not None else ConfigStore(CONFIG_PATH)
 
 
+def _cached_systemctl(kind: str, unit: str, timeout: int, fallback: str) -> str:
+    """Cache hasil systemctl singkat agar satu page render tidak fork 4x (S9)."""
+    now = time.monotonic()
+    with _state_cache_lock:
+        hit = _state_cache.get(kind)
+        if hit is not None and now - hit[0] < STATE_CACHE_TTL:
+            return hit[1]
+        try:
+            result = subprocess.run(['systemctl', 'is-active', unit],
+                                    capture_output=True, text=True, timeout=timeout)
+            value = result.stdout.strip()
+        except Exception:
+            value = fallback
+        _state_cache[kind] = (now, value)
+        return value
+
+
 def bot_state() -> str:
-    try:
-        result = subprocess.run(['systemctl', 'is-active', SERVICE],
-                                capture_output=True, text=True, timeout=3)
-        state = result.stdout.strip()
-        return state if state in {'active', 'inactive', 'failed'} else 'unknown'
-    except Exception:
-        return 'unknown'
+    state = _cached_systemctl('bot', SERVICE, 3, 'unknown')
+    return state if state in {'active', 'inactive', 'failed'} else 'unknown'
 
 
 def timer_state() -> str:
-    try:
-        result = subprocess.run(['systemctl', 'is-active', TIMER],
-                                capture_output=True, text=True, timeout=2)
-        state = result.stdout.strip()
-        return 'Aktif (Mingguan)' if state == 'active' else 'Nonaktif'
-    except Exception:
-        return 'Tidak terpasang'
+    state = _cached_systemctl('timer', TIMER, 2, 'inactive')
+    return 'Aktif (Mingguan)' if state == 'active' else 'Nonaktif'
+
 
 
 def ytdlp_version() -> str:
@@ -157,7 +282,8 @@ def run_update() -> tuple[bool, str]:
 def _run_update_inner() -> tuple[bool, str]:
     if UPDATE_RUNNER is not None:
         ok, out = UPDATE_RUNNER()
-        _last_update_output = out
+        with _lock:
+            _last_update_output = out
         return ok, out
 
     update_script = '/opt/discord-music-bot/update.sh'
@@ -165,9 +291,9 @@ def _run_update_inner() -> tuple[bool, str]:
     if os.path.exists(update_script) and os.access(update_script, os.X_OK):
         cmd = [update_script]
     else:
-        pip_bin = '/opt/discord-music-bot/venv/bin/pip'
+        pip_bin = os.path.join(os.path.dirname(sys.executable), 'pip3')
         if not os.path.exists(pip_bin):
-            pip_bin = sys.executable.replace('python', 'pip')
+            pip_bin = shutil.which('pip3') or '/opt/discord-music-bot/venv/bin/pip'
         cmd = [pip_bin, 'install', '-U', 'yt-dlp']
 
     try:
@@ -204,14 +330,15 @@ def _run_update_inner() -> tuple[bool, str]:
 
 
 def read_bot_runtime_info() -> dict:
+    active = bot_state() == 'active'
     default_info = {
-        'status': 'offline' if bot_state() != 'active' else 'online',
+        'status': 'online' if active else 'offline',
         'total_guilds': 0,
         'active_voice_count': 0,
         'total_listeners': 0,
         'guilds': [],
     }
-    if bot_state() != 'active':
+    if not active:
         return default_info
 
     path = os.environ.get('BOT_STATE_FILE')
@@ -301,14 +428,8 @@ def format_guilds_html(info: dict) -> str:
     return '\n'.join(cards)
 
 
-def masked(token: str) -> str:
-    if not token:
-        return ''
-    return f'{token[:4]}…{token[-4:]}' if len(token) > 12 else 'tersimpan'
-
-
 def rate_limited(peer: str) -> bool:
-    now = time.time()
+    now = time.monotonic()
     with _lock:
         hits = [t for t in _attempts.get(peer, []) if now - t < 300]
         _attempts[peer] = hits
@@ -317,10 +438,15 @@ def rate_limited(peer: str) -> bool:
 
 def record_failure(peer: str) -> None:
     with _lock:
-        _attempts.setdefault(peer, []).append(time.time())
+        _attempts.setdefault(peer, []).append(time.monotonic())
         if len(_attempts) > 512:
-            for key in list(_attempts)[:128]:
+            # Buang entri yang kegagalan terakhirnya paling lama, bukan yang
+            # paling awal di-insert, agar serangan rotasi IP tidak mengusir
+            # entri milik penyerang sendiri.
+            oldest = sorted(_attempts, key=lambda k: _attempts[k][-1] if _attempts[k] else 0)
+            for key in oldest[:128]:
                 _attempts.pop(key, None)
+
 
 
 PAGE = """<!doctype html>
@@ -461,6 +587,7 @@ p.err{color:#9f2f2d;font-size:13px;margin:0 0 12px}
 <h1>Panel Bot Musik</h1>
 {error}
 <form method="post" action="/login">
+<input type="hidden" name="form_token" value="{form_token}">
 <input name="password" type="password" autocomplete="current-password"
 placeholder="Password panel" autofocus>
 <button type="submit">Masuk</button>
@@ -470,27 +597,34 @@ placeholder="Password panel" autofocus>
 
 class Handler(BaseHTTPRequestHandler):
     server_version = 'MusicPanel/1.0'
+    # Timeout per-koneksi. Tanpa ini, koneksi yang tidak pernah selesai
+    # mengirim header/body akan menahan satu thread selamanya (S8).
+    timeout = 15
+    protocol_version = 'HTTP/1.0'
 
     def log_message(self, format: str, *args):
         sys.stderr.write('%s - %s\n' % (self.address_string(), format % args))
 
     # ---- helpers -------------------------------------------------
     def _send(self, status, body: str, ctype='text/html; charset=utf-8', extra=None):
-        raw = body.encode('utf-8')
-        self.send_response(status)
-        self.send_header('Content-Type', ctype)
-        self.send_header('Content-Length', str(len(raw)))
-        self.send_header('X-Frame-Options', 'DENY')
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Referrer-Policy', 'same-origin')
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('Content-Security-Policy',
-                         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
-        for key, value in (extra or {}).items():
-            self.send_header(key, value)
-        self.end_headers()
-        if self.command != 'HEAD':
-            self.wfile.write(raw)
+        try:
+            raw = body.encode('utf-8')
+            self.send_response(status)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(raw)))
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Referrer-Policy', 'same-origin')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Security-Policy',
+                             "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def _redirect(self, location, extra=None):
         self._send(HTTPStatus.SEE_OTHER, '', extra={'Location': location, **(extra or {})})
@@ -505,14 +639,67 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.headers.get('Cookie', '')
         for part in raw.split(';'):
             name, _, value = part.strip().partition('=')
-            if name == COOKIE and hmac.compare_digest(value, session_value()):
+            if name != COOKIE or not value:
+                continue
+            # Nilai cookie berasal dari server (token_urlsafe) dan sudah ASCII,
+            # tetapi header bisa berisi byte aneh dari klien; tolak dengan aman
+            # alih-alih melempar TypeError tanpa respons HTTP.
+            if not value.isascii():
+                continue
+            if _session_valid(value):
                 return True
         return False
+
+    def _host_ok(self, host: str) -> bool:
+        """Allowlist Host untuk mencegah DNS-rebinding (S7).
+
+        main() mengisi ALLOWED_HOSTS dari host bind + seluruh alamat lokal, jadi
+        proteksi aktif secara default. Daftar kosong hanya terjadi pada harness
+        unit test yang tidak memanggil main().
+        """
+        if not host:
+            return False
+        if not ALLOWED_HOSTS:
+            return True
+        candidate = host.strip().lower()
+        if candidate in ALLOWED_HOSTS:
+            return True
+        # Bandingkan juga tanpa port (Host pada port default tanpa port eksplisit,
+        # dan IPv6 dalam kurung siku).
+        if candidate.startswith('['):
+            hostname = candidate.partition(']')[0] + ']'
+            bare = hostname.strip('[]')
+        else:
+            hostname = candidate.rsplit(':', 1)[0] if ':' in candidate else candidate
+            bare = hostname
+        if hostname in ALLOWED_HOSTS:
+            return True
+
+        # Terima bila nama/alamat Host memang menunjuk ke mesin ini. Ini membuat
+        # panel tetap bisa diakses lewat IP LAN apa pun tanpa harus mendaftar
+        # manual, sementara nama domain penyerang (DNS-rebinding) tetap ditolak.
+        try:
+            import ipaddress
+            import socket
+            ip = ipaddress.ip_address(bare)
+        except ValueError:
+            # bukan literal IP; hanya terima kalau persis salah satu alamat lokal
+            return bare in _local_addresses()
+        except Exception:
+            return False
+        if ip.is_loopback:
+            return True
+        return str(ip) in _local_addresses()
 
     def _origin_ok(self, fields: dict) -> bool:
         origin = (self.headers.get('Origin') or '').strip()
         host = (self.headers.get('Host') or '').strip()
         sec_fetch_site = (self.headers.get('Sec-Fetch-Site') or '').strip()
+
+        # 0. Host allowlist — cek paling awal, sebelum semua perbandingan origin.
+        if not self._host_ok(host):
+            self.log_message('ditolak (host %r tidak di allowlist)', host)
+            return False
 
         candidate = fields.get('form_token', '')
         now = time.monotonic()
@@ -520,7 +707,13 @@ class Handler(BaseHTTPRequestHandler):
             expiry = _form_tokens.get(candidate, 0) if candidate else 0
             has_valid_nonce = bool(expiry > now)
 
-        # 1. Explicit foreign Origin (e.g. http://evil.example): always reject
+        # 1. Sec-Fetch-Site: cross-site ditolak tanpa syarat (S5). Nonce bukan
+        #    pengganti sinyal eksplisit dari browser.
+        if sec_fetch_site == 'cross-site':
+            self.log_message('origin ditolak (cross-site)')
+            return False
+
+        # 2. Explicit foreign Origin (e.g. http://evil.example): always reject
         if origin and origin.lower() != 'null':
             netloc = urllib.parse.urlsplit(origin).netloc
             if netloc and netloc != host:
@@ -528,11 +721,6 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             if netloc and netloc == host:
                 return True
-
-        # 2. Sec-Fetch-Site: if cross-site without valid nonce, reject
-        if sec_fetch_site == 'cross-site' and not has_valid_nonce:
-            self.log_message('origin ditolak (cross-site tanpa nonce)')
-            return False
 
         # 3. Valid page nonce accepted (covers Origin: null, missing Origin, in-app WebViews)
         if has_valid_nonce:
@@ -549,19 +737,39 @@ class Handler(BaseHTTPRequestHandler):
                          origin, host, sec_fetch_site, has_valid_nonce)
         return False
 
-    def _body(self) -> dict:
+    def _body(self) -> Optional[dict]:
+        """Baca body form. Return None bila request sudah ditolak (413)."""
         try:
             length = int(self.headers.get('Content-Length') or 0)
         except ValueError:
             return {}
         if length <= 0:
             return {}
-        raw = self.rfile.read(min(length, 8192)).decode('utf-8', 'replace')
+        # Tolak sebelum membaca agar sisa body tidak tertinggal di socket (S8/S11).
+        # Return None menandakan pemanggil HARUS berhenti (respons sudah dikirim),
+        # supaya tidak ada respons ganda dan aksi tidak tetap dijalankan.
+        if length > 8192:
+            self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, 'Body terlalu besar')
+            return None
+        raw = self.rfile.read(length).decode('utf-8', 'replace')
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
 
     # ---- routing -------------------------------------------------
     def do_GET(self):
+        try:
+            return self._do_get()
+        except Exception:
+            self.log_exception('GET %s', self.path)
+            return self._server_error()
+
+    def _do_get(self):
         path = urllib.parse.urlsplit(self.path).path
+        # Host allowlist berlaku untuk GET juga: tanpa ini, DNS-rebinding bisa
+        # membaca halaman/status/log meski POST sudah terlindungi (S7).
+        if not self._host_ok((self.headers.get('Host') or '').strip()):
+            self.log_message('ditolak (host tidak di allowlist: %r)',
+                             self.headers.get('Host'))
+            return self._send(HTTPStatus.FORBIDDEN, 'Host tidak diizinkan')
         if path == '/login':
             if not PASSWORD:
                 return self._redirect('/')
@@ -571,17 +779,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
             data = store().read()
             runtime = read_bot_runtime_info()
+            # token_hint dihapus: potongan token Discord tidak diperlukan UI dan
+            # bisa dipanen saat panel tanpa password (S10).
             return self._json(HTTPStatus.OK, {
                 'bot': bot_state(),
                 'token_set': bool(data['token']),
-                'token_hint': masked(data['token']),
                 'guild': data['guild'],
                 'ytdlp_version': ytdlp_version(),
                 'timer': timer_state(),
                 'total_guilds': runtime.get('total_guilds', 0),
                 'active_voice_count': runtime.get('active_voice_count', 0),
                 'total_listeners': runtime.get('total_listeners', 0),
-                'guilds': runtime.get('guilds', []),
+                'guild_count': len(runtime.get('guilds', []) or []),
             })
         if path == '/api/logs':
             if not self._authenticated():
@@ -597,18 +806,47 @@ class Handler(BaseHTTPRequestHandler):
             return self._page()
         return self._send(HTTPStatus.NOT_FOUND, 'Tidak ditemukan')
 
+    def log_exception(self, fmt: str, *args) -> None:
+        sys.stderr.write('[panel] error: %s\n' % (fmt % args))
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+
+    def _server_error(self):
+        try:
+            return self._send(HTTPStatus.INTERNAL_SERVER_ERROR, 'Kesalahan server internal')
+        except Exception:
+            return None
+
     def do_HEAD(self):
         return self.do_GET()
 
     def do_POST(self):
+        try:
+            return self._do_post()
+        except Exception:
+            self.log_exception('POST %s', self.path)
+            return self._server_error()
+
+    def _do_post(self):
         path = urllib.parse.urlsplit(self.path).path
         if path == '/login':
-            return self._login()
+            # CSRF ditegakkan untuk /login juga: tanpa ini, situs mana pun bisa
+            # membakar kuota rate-limit milik IP korban (S4).
+            fields = self._body()
+            if fields is None:
+                return  # 413 sudah dikirim oleh _body()
+            if not fields:
+                return self._login_page('Permintaan tidak valid.', HTTPStatus.BAD_REQUEST)
+            if not self._origin_ok(fields):
+                return self._json(HTTPStatus.FORBIDDEN, {'error': 'origin'})
+            return self._login(fields)
         if path not in ('/save', '/start', '/restart', '/stop', '/update'):
             return self._send(HTTPStatus.NOT_FOUND, 'Tidak ditemukan')
         if not self._authenticated():
             return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
         fields = self._body()
+        if fields is None:
+            return  # 413 sudah dikirim; jangan jalankan aksi
         if not self._origin_ok(fields):
             return self._json(HTTPStatus.FORBIDDEN, {'error': 'origin'})
         if path == '/save':
@@ -624,9 +862,19 @@ class Handler(BaseHTTPRequestHandler):
     do_PATCH = do_DELETE = do_OPTIONS = do_PUT
 
     # ---- pages ---------------------------------------------------
-    def _login_page(self, error='', status=HTTPStatus.OK):
+    def _login_page(self, error='', status=HTTPStatus.OK, extra=None):
         notice = f'<p class="err">{html.escape(error)}</p>' if error else ''
-        self._send(status, LOGIN_PAGE.replace('{error}', notice))
+        now = time.monotonic()
+        with _lock:
+            for key, expiry in list(_form_tokens.items()):
+                if expiry <= now:
+                    _form_tokens.pop(key, None)
+            while len(_form_tokens) > 512:
+                _form_tokens.pop(next(iter(_form_tokens)))
+            form_token = secrets.token_urlsafe(24)
+            _form_tokens[form_token] = now + 900
+        page = LOGIN_PAGE.replace('{error}', notice).replace('{form_token}', form_token)
+        self._send(status, page, extra=extra)
 
     def _page(self, message='', status=HTTPStatus.OK):
         data = store().read()
@@ -698,21 +946,27 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, page)
 
     # ---- actions -------------------------------------------------
-    def _login(self):
+    def _login(self, fields):
         peer = self.client_address[0]
         if rate_limited(peer):
             return self._login_page('Terlalu banyak percobaan. Tunggu beberapa menit.',
                                     HTTPStatus.TOO_MANY_REQUESTS)
-        fields = self._body()
         password = fields.get('password', '')
         if PASSWORD and hmac.compare_digest(password, PASSWORD):
             with _lock:
                 _attempts.pop(peer, None)
-            cookie = (f'{COOKIE}={session_value()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200')
+            token = _mint_session()
+            cookie = (f'{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; '
+                      f'Max-Age={SESSION_TTL}')
             return self._redirect('/', {'Set-Cookie': cookie})
         record_failure(peer)
-        time.sleep(0.4)
-        return self._login_page('Password salah.', HTTPStatus.FORBIDDEN)
+        retry_after = '300' if rate_limited(peer) else '5'
+        # Retry-After menggantikan time.sleep(0.4) yang menahan thread worker.
+        return self._login_page(
+            'Password salah.',
+            HTTPStatus.FORBIDDEN,
+            extra={'Retry-After': retry_after},
+        )
 
     def _save(self, fields):
         current = store().read()
@@ -724,9 +978,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._page('Token terlalu panjang.', HTTPStatus.BAD_REQUEST)
         try:
             store().write({'token': token, 'guild': guild})
-        except (ValueError, OSError) as exc:
-            self.log_message('save gagal: %s', exc)
-            return self._page('Gagal menyimpan konfigurasi.', HTTPStatus.BAD_REQUEST)
+        except ValueError as exc:
+            self.log_message('save gagal (nilai tidak valid): %s', exc)
+            return self._page('Gagal menyimpan konfigurasi (nilai tidak valid).',
+                              HTTPStatus.BAD_REQUEST)
+        except OSError as exc:
+            # EROFS / ENOSPC / EACCES adalah kesalahan server, bukan klien.
+            self.log_exception('save gagal (I/O): %s', exc)
+            return self._page('Gagal menyimpan konfigurasi: berkas tidak bisa ditulis. '
+                              'Periksa izin / ruang disk.',
+                              HTTPStatus.INTERNAL_SERVER_ERROR)
         self.log_message('konfigurasi disimpan (token_set=%s guild_set=%s)',
                          bool(token), bool(guild))
         return self._redirect('/')
@@ -740,20 +1001,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _service(self, action):
         data = store().read()
-        if not data['token']:
+        # 'stop' harus selalu boleh: operator perlu bisa mematikan bot walau
+        # konfigurasi hilang/kosong (S12).
+        if not data['token'] and action != 'stop':
             return self._page('Token Discord belum diisi. Simpan konfigurasi dulu.',
                               HTTPStatus.BAD_REQUEST)
         try:
             result = subprocess.run(['systemctl', action, SERVICE],
                                     capture_output=True, text=True, timeout=15)
         except Exception as exc:
-            self.log_message('systemctl %s gagal: %s', action, exc)
+            self.log_exception('systemctl %s gagal: %s', action, exc)
             return self._page(f'Perintah systemctl {action} gagal dijalankan.',
                               HTTPStatus.INTERNAL_SERVER_ERROR)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or '').strip()[:200]
             self.log_message('systemctl %s rc=%s', action, result.returncode)
-            return self._page(f'systemctl {action} gagal: {html.escape(detail)}',
+            return self._page(f'systemctl {action} gagal: {detail}',
                               HTTPStatus.INTERNAL_SERVER_ERROR)
         labels = {'start': 'Bot dinyalakan.', 'restart': 'Bot dimulai ulang.',
                   'stop': 'Bot dimatikan.'}
@@ -771,16 +1034,102 @@ def build_server(host: str, port: int) -> Server:
     return Server((host, port), Handler)
 
 
+_local_addr_cache: set[str] | None = None
+_local_addr_lock = threading.Lock()
+
+
+def _local_addresses() -> set[str]:
+    """Semua alamat IP lokal yang mungkin dipakai klien untuk menjangkau panel."""
+    global _local_addr_cache
+    with _local_addr_lock:
+        if _local_addr_cache is not None:
+            return _local_addr_cache
+        import socket
+        found: set[str] = set()
+
+        # 1. Alamat keluar default (yang dipakai install.sh via `hostname -I`).
+        for family, probe in ((socket.AF_INET, '8.8.8.8'), (socket.AF_INET6, '2001:4860:4860::8888')):
+            sock = None
+            try:
+                sock = socket.socket(family, socket.SOCK_DGRAM)
+                sock.connect((probe, 53))
+                found.add(sock.getsockname()[0])
+            except Exception:
+                pass
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+        # 2. Hasil resolusi hostname (bisa berisi 127.0.1.1 pada Debian, tetap aman).
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                found.add(info[4][0])
+        except Exception:
+            pass
+
+        _local_addr_cache = {a for a in found if a}
+        return _local_addr_cache
+
+
+def _default_allowed_hosts(host: str, port: int) -> set[str]:
+    hosts = {f'127.0.0.1:{port}', f'localhost:{port}', f'[::1]:{port}'}
+    if host not in ('0.0.0.0', '::', ''):
+        hosts.add(f'{host.lower()}:{port}')
+    for addr in _local_addresses():
+        hosts.add(f'[{addr}]:{port}' if ':' in addr else f'{addr}:{port}')
+    if port in (80, 443):
+        # Browser mengirim Host tanpa port pada port default.
+        hosts |= {h.rsplit(':', 1)[0] for h in list(hosts)}
+    return hosts
+
+
 def main():
     host = os.environ.get('PANEL_HOST', '0.0.0.0')
-    port = int(os.environ.get('PANEL_PORT', '9130'))
+    try:
+        port = int(os.environ.get('PANEL_PORT', '9130'))
+    except ValueError:
+        raise SystemExit('PANEL_PORT harus berupa angka.')
+    if not ALLOWED_HOSTS:
+        ALLOWED_HOSTS.update(_default_allowed_hosts(host, port))
+
     if not PASSWORD:
-        print('PERINGATAN: PANEL_PASSWORD kosong — panel terbuka untuk siapa pun '
-              'di jaringan ini. Hanya pakai di LAN tepercaya.', flush=True)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        print(
+            '=' * 64 + '\n'
+            'PERINGATAN: PANEL_PASSWORD kosong.\n'
+            'Panel ini TERBUKA tanpa autentikasi untuk siapa pun yang bisa\n'
+            f'menjangkau {host}:{port}. Siapa pun di jaringan itu dapat:\n'
+            '  - menimpa token bot di .env\n'
+            '  - menjalankan systemctl start/stop/restart sebagai root\n'
+            '  - memicu instalasi paket (update yt-dlp)\n'
+            'Set PANEL_PASSWORD di /opt/discord-music-panel.env, atau batasi\n'
+            'PANEL_HOST=127.0.0.1 dan akses lewat SSH tunnel.\n'
+            + '=' * 64,
+            flush=True,
+        )
+
     server = build_server(host, port)
+
+    def _shutdown(*_):
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
     print(f'Panel musik di http://{host}:{port}', flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        _shutdown()
+
 
 
 if __name__ == '__main__':
