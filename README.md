@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-52%2F52%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-105%2F105%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -119,7 +119,7 @@ Skrip installer otomatis:
 2. Menyiapkan Python virtual environment dan menginstal dependensi (`discord.py`, `yt-dlp`).
 3. Memasang service systemd `discord-music.service` dan `discord-music-panel.service`.
 4. Mengaktifkan auto-start saat boot sistem.
-5. Menjalankan verifikasi unit test mandiri (**39/39 passing**).
+5. Menjalankan verifikasi unit test mandiri (**105/105 passing**).
 6. Menyalakan Web Control Panel di port `9130`.
 
 ---
@@ -133,6 +133,21 @@ Skrip installer otomatis:
 2. Masukkan **Bot Token** dan **Guild ID** (Server ID Discord).
 3. Klik **Simpan konfigurasi**, lalu klik **Nyalakan bot**.
 4. Masuk ke Voice Channel di Discord, lalu ketik `/musik` atau `/play <judul/url>`.
+
+> [!WARNING]
+> **Keamanan panel.** Panel ini mengendalikan `systemctl` dan `yt-dlp` sebagai root.
+> Password awal dibuat otomatis oleh `install.sh` dan disimpan di
+> `/opt/discord-music-panel.env`.
+>
+> - **Jangan** biarkan `PANEL_PASSWORD` kosong bila port `9130` bisa dijangkau
+>   perangkat lain. Tanpa password, panel sepenuhnya terbuka.
+> - Untuk LAN tak-terpercaya, set `PANEL_HOST=127.0.0.1` di
+>   `/opt/discord-music-panel.env` dan akses lewat SSH tunnel
+>   (`ssh -L 9130:127.0.0.1:9130 user@host`).
+> - `PANEL_ALLOWED_HOSTS` membatasi `Host` header yang diterima (proteksi
+>   DNS-rebinding). `install.sh` mengisinya otomatis dengan `IP_LAN:PORT`.
+>   Bila dikosongkan, panel mendeteksi sendiri alamat lokal mesin.
+> - Panel memakai HTTP polos (tanpa TLS). Jangan ekspos ke internet.
 
 ---
 
@@ -194,7 +209,7 @@ PYTHONPATH=. ./venv/bin/python -m unittest discover -s tests -v
 
 Hasil uji:
 ```
-Ran 52 tests in 3.053s
+Ran 105 tests in 8.2s
 OK
 ```
 

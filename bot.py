@@ -56,12 +56,18 @@ class QueueState:
     idle_task: asyncio.Task | None = None
     empty_task: asyncio.Task | None = None
     refresh_task: asyncio.Task | None = None
+    announce_task: asyncio.Task | None = None
 
 
 # Batas konkurensi ekstraksi yt-dlp agar STB RAM kecil tidak OOM (C4/M3).
 EXTRACT_SEM = asyncio.Semaphore(2)
 MAX_QUEUE = 500
-MAX_ERROR_STREAK = 50  # ~10 detik stall (50 x 20ms frame) lalu EOF agar after fire (C6)
+# Batas kedua lapis untuk stall buffer: mana yang tercapai lebih dulu.
+# - MAX_ERROR_STREAK: jumlah miss berurutan (tiap miss = 0,3 dtk queue timeout) ~15 dtk.
+# - STALL_EOF_SECONDS: batas wall-clock nyata, tahan jitter CDN sampai 4 dtk
+#   sebelum dianggap EOF dan lagu lanjut. 1 dtk terlalu agresif (lagu loncat).
+MAX_ERROR_STREAK = 50
+STALL_EOF_SECONDS = 4.0
 MAX_TRACK_RETRIES = 3
 
 
@@ -290,6 +296,7 @@ class BufferedAudioSource(discord.AudioSource):
         self._cleaned = False
         self._current_error: Exception | None = None
         self._misses = 0
+        self._stall_deadline: float | None = None
         self.worker = threading.Thread(target=self._reader, daemon=True)
         self.worker.start()
 
@@ -331,12 +338,22 @@ class BufferedAudioSource(discord.AudioSource):
             data = self.queue.get(timeout=0.3)
             if data is None:
                 return b''
+            self._stall_deadline = None
             self._misses = 0
             return data
         except queue.Empty:
-            # Stall ffmpeg: jangan samarkan jadi hening selamanya (C6).
+            # Stall ffmpeg/network: jangan samarkan jadi hening selamanya (C6).
+            # Hitungan miss berurutan tidak cukup — producer yang tersendat-sendat
+            # (1 chunk per >0.3s) selalu mereset counter, sehingga EOF tak pernah
+            # terjadi dan lagu tidak pernah lanjut. Pakai batas waktu nyata.
+            now = time.monotonic()
+            if self._stall_deadline is None:
+                # Toleransi nyata untuk jitter CDN: 4 detik, bukan 1 detik.
+                # Batas 1 detik terlalu agresif — CDN YouTube yang tersendat
+                # sesaat membuat lagu loncat tanpa alasan.
+                self._stall_deadline = now + STALL_EOF_SECONDS
             self._misses += 1
-            if self._misses >= MAX_ERROR_STREAK:
+            if self._misses >= MAX_ERROR_STREAK or now >= self._stall_deadline:
                 return b''
             return b'\x00' * 3840
 
@@ -362,6 +379,25 @@ class BufferedAudioSource(discord.AudioSource):
         return self.source.is_opus()
 
 
+def _source_error(source) -> Exception | None:
+    """Telusuri rantai wrapper AudioSource untuk menemukan _current_error.
+
+    discord.py hanya memeriksa getattr(self.source, '_current_error', None).
+    Di sini source adalah PCMVolumeTransformer yang membungkus
+    BufferedAudioSource -> FFmpegPCMAudio; error ffmpeg ada di elemen terdalam,
+    sehingga tanpa penelusuran ini kegagalan ffmpeg selalu senyap.
+    """
+    seen: set[int] = set()
+    current = source
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        error = getattr(current, '_current_error', None)
+        if error:
+            return error
+        current = getattr(current, 'original', None) or getattr(current, 'source', None)
+    return None
+
+
 def patch_audio_player():
     # Guard versi discord.py agar monkeypatch tidak diam-diam basi (C-note).
     if getattr(discord.player.AudioPlayer, '_vita_patched', False):
@@ -385,7 +421,7 @@ def patch_audio_player():
 
             if not data:
                 if self._current_error is None:
-                    source_error = getattr(self.source, '_current_error', None)
+                    source_error = _source_error(self.source)
                     if source_error:
                         self._current_error = source_error
                 self.stop()
@@ -678,18 +714,24 @@ class MusicPanel(discord.ui.View):
         user_ch = getattr(user_vc, 'channel', None)
         if not vc or vc_channel_id is None or not user_ch or user_ch.id != vc_channel_id:
             return await interaction.followup.send('Kamu harus di voice channel yang sama dengan bot.', ephemeral=True)
+        # Semua mutasi di dalam lock; semua await di luar lock agar followup.send
+        # yang lambat tidak memblokir advance()/enqueue.
         async with state.lock:
             if not state.history and not state.current:
-                return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
-            if state.history:
-                prev = state.history.pop()
-                if state.current:
+                had_prev = False
+            else:
+                had_prev = True
+                if state.history:
+                    prev = state.history.pop()
+                    if state.current:
+                        state.queue.appendleft(state.current)
+                    state.queue.appendleft(prev)
+                    state.current = None
+                elif state.current:
                     state.queue.appendleft(state.current)
-                state.queue.appendleft(prev)
-                state.current = None
-            elif state.current:
-                state.queue.appendleft(state.current)
-                state.current = None
+                    state.current = None
+        if not had_prev:
+            return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self.bot._stop_player(interaction.guild)
         await self.bot.advance(interaction.guild)
         await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
@@ -762,12 +804,19 @@ class MusicPanel(discord.ui.View):
         state = self.bot.states[interaction.guild.id]
         async with state.lock:
             if len(state.queue) < 2:
-                return await interaction.followup.send('Antrian kurang dari 2 lagu untuk diacak.', ephemeral=True)
-            import random
-            items = list(state.queue)
-            random.shuffle(items)
-            state.queue = deque(items)
-        await interaction.followup.send(f'Antrian berhasil diacak ({len(state.queue)} lagu).', ephemeral=True)
+                too_few = True
+            else:
+                too_few = False
+                import random
+                items = list(state.queue)
+                random.shuffle(items)
+                state.queue.clear()
+                state.queue.extend(items)
+            shuffled_len = len(state.queue)
+        if too_few:
+            # await di luar lock (lihat catatan di back()).
+            return await interaction.followup.send('Antrian kurang dari 2 lagu untuk diacak.', ephemeral=True)
+        await interaction.followup.send(f'Antrian berhasil diacak ({shuffled_len} lagu).', ephemeral=True)
         await self.bot.refresh(state)
 
     @discord.ui.button(label='Loop', emoji='🔁', style=discord.ButtonStyle.secondary, custom_id='music:loop', row=1)
@@ -830,7 +879,15 @@ class MusicBot(discord.Client):
                 try:
                     discord.opus.load_opus('libopus.so.0')
                 except OSError:
-                    discord.opus._load_default()
+                    # _load_default() menelan exception dan mengembalikan False
+                    # alih-alih raise; periksa return-nya agar kegagalan libopus
+                    # terdeteksi di sini, bukan nanti saat vc.play().
+                    if not discord.opus._load_default():
+                        raise SystemExit('libopus tidak ditemukan. Install libopus0.')
+            if not discord.opus.is_loaded():
+                raise SystemExit('libopus tidak ditemukan. Install libopus0.')
+        except SystemExit:
+            raise
         except Exception as exc:
             log.critical('libopus tidak tersedia, voice tidak bisa jalan: %s', exc)
             raise SystemExit('libopus tidak ditemukan. Install libopus0.') from exc
@@ -872,12 +929,22 @@ class MusicBot(discord.Client):
     async def _enqueue_tracks(self, guild: discord.Guild, tracks: list[Track]) -> bool:
         """Tambah track dengan cap total; return False bila penuh."""
         state = self.states.setdefault(guild.id, QueueState())
+        vc = guild.voice_client
+        playing = bool(vc and (vc.is_playing() or vc.is_paused()))
         async with state.lock:
             if len(state.queue) + len(tracks) > MAX_QUEUE:
                 return False
             state.queue.extend(tracks)
-            need_advance = not state.current
-        vc = guild.voice_client
+            # Keputusan memutar ditentukan oleh kondisi voice client nyata, bukan
+            # hanya state.current. Kalau tidak ada yang benar-benar berputar,
+            # state.current dianggap basi (mis. sisa track yang gagal diputar
+            # atau koneksi voice putus diam-diam) agar antrian tidak macet.
+            if not playing and state.current is not None:
+                state.history.append(state.current)
+                if len(state.history) > 20:
+                    state.history.popleft()
+                state.current = None
+            need_advance = not playing
         if need_advance and vc and not vc.is_playing() and not vc.is_paused():
             await self.advance(guild)
         return True
@@ -1015,10 +1082,10 @@ class MusicBot(discord.Client):
         except Exception:
             pass
         for state in list(self.states.values()):
-            for task in (state.idle_task, state.empty_task, state.refresh_task):
+            for task in (state.idle_task, state.empty_task, state.refresh_task, state.announce_task):
                 if task and not task.done():
                     task.cancel()
-            state.idle_task = state.empty_task = state.refresh_task = None
+            state.idle_task = state.empty_task = state.refresh_task = state.announce_task = None
         try:
             await self._delete_all_panels()
         except Exception:
@@ -1067,10 +1134,12 @@ class MusicBot(discord.Client):
 
             channel = interaction.channel
             if channel and hasattr(channel, 'send'):
-                if state.message is None or state.message.channel.id != channel.id:
-                    if state.message:
+                existing = state.message
+                existing_channel_id = getattr(getattr(existing, 'channel', None), 'id', None)
+                if existing is None or existing_channel_id != channel.id:
+                    if existing:
                         try:
-                            await state.message.delete()
+                            await existing.delete()
                         except Exception:
                             pass
                     try:
@@ -1130,8 +1199,10 @@ class MusicBot(discord.Client):
             import random
             items = list(state.queue)
             random.shuffle(items)
-            state.queue = deque(items)
-        await interaction.followup.send(f'Antrian berhasil diacak ({len(state.queue)} lagu).', ephemeral=True)
+            state.queue.clear()
+            state.queue.extend(items)
+            shuffled_len = len(state.queue)
+        await interaction.followup.send(f'Antrian berhasil diacak ({shuffled_len} lagu).', ephemeral=True)
         await self.refresh(state)
 
     async def cmd_loop(self, interaction: discord.Interaction, mode: str | None = None):
@@ -1175,6 +1246,17 @@ class MusicBot(discord.Client):
                     if task and not task.done():
                         task.cancel()
                 state.idle_task = state.empty_task = None
+                announce_task = state.announce_task
+                state.announce_task = None
+                old_now_message = state.now_message
+                state.now_message = None
+            if announce_task and not announce_task.done():
+                announce_task.cancel()
+            if old_now_message is not None:
+                try:
+                    await old_now_message.delete()
+                except Exception:
+                    pass
         vc = getattr(guild, 'voice_client', None)
         if vc:
             try:
@@ -1480,6 +1562,10 @@ class MusicBot(discord.Client):
 
                 vc.play(source, after=after, application='audio', bitrate=bitrate_kbps, signal_type='music')
                 # --- fase 4: commit sukses di dalam lock (C1/C2/C3) ---
+                # played harus selalu terdefinisi: mode loop 'track' mengulang
+                # track yang sama tanpa menyentuh queue/history, tetapi tetap
+                # butuh objek track untuk pengumuman now-playing.
+                played = next_track
                 async with state.lock:
                     if state.loop_mode == 'track' and state.current is next_track:
                         pass
@@ -1493,13 +1579,8 @@ class MusicBot(discord.Client):
                             if state.loop_mode == 'queue':
                                 state.queue.append(state.current)
                         state.current = next_track
-                        played = next_track
                 await self.refresh(state)
-                try:
-                    asyncio.get_running_loop().create_task(
-                        self._announce_now_playing(guild, played))
-                except RuntimeError:
-                    pass
+                self._announce(guild, played)
                 return
             except Exception as exc:
                 consecutive_errors += 1
@@ -1517,6 +1598,16 @@ class MusicBot(discord.Client):
 
         await self.refresh(state)
         async with state.lock:
+            # Kalau loop berhenti tanpa ada yang berputar, `current` tidak boleh
+            # dianggap masih diputar: kalau tidak, /play berikutnya akan mengira
+            # sudah ada track aktif dan tidak pernah memajukan antrian, dan
+            # idle-disconnect tidak akan pernah terjadwal (bot tertahan di voice).
+            if not (vc.is_playing() or vc.is_paused()):
+                if state.current is not None:
+                    state.history.append(state.current)
+                    if len(state.history) > 20:
+                        state.history.popleft()
+                    state.current = None
             schedule_idle = state.current is None and not state.queue
             gen = state.generation
         if schedule_idle:
@@ -1547,6 +1638,37 @@ class MusicBot(discord.Client):
             state.now_message = None
         except Exception:
             log.debug('Gagal kirim now-playing', exc_info=True)
+
+    def _announce(self, guild: discord.Guild, track) -> None:
+        """Jadwalkan pengumuman now-playing dengan referensi task yang disimpan.
+
+        create_task tanpa referensi bisa di-GC sebelum selesai, dan exception di
+        dalamnya hilang tanpa jejak.
+        """
+        state = self.states.get(guild.id)
+        if state is None or track is None:
+            return
+        previous = state.announce_task
+        if previous is not None and previous is not asyncio.current_task() and not previous.done():
+            previous.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._announce_now_playing(guild, track))
+        state.announce_task = task
+
+        def _done(fut):
+            if fut.cancelled():
+                return
+            try:
+                exc = fut.exception()
+            except Exception:
+                return
+            if exc:
+                log.error('Gagal mengumumkan now-playing: %s', exc)
+
+        task.add_done_callback(_done)
 
     def _schedule_idle(self, guild: discord.Guild, generation: int) -> None:
         state = self.states.get(guild.id)

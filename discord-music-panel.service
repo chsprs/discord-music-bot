@@ -11,12 +11,15 @@ ExecStart=/opt/discord-music-bot/venv/bin/python /opt/discord-music-bot/panel.py
 Restart=on-failure
 RestartSec=5
 MemoryMax=120M
-TasksMax=32
+TasksMax=128
 Environment=PYTHONDONTWRITEBYTECODE=1
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+# ProtectSystem=strict menjadikan seluruh filesystem read-only; panel WAJIB bisa
+# menulis .env (simpan konfigurasi), last_update.log, dan venv (update yt-dlp).
+ReadWritePaths=/opt/discord-music-bot
 
 [Install]
 WantedBy=multi-user.target
