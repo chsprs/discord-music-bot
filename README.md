@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-105%2F105%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-107%2F107%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -119,7 +119,7 @@ Skrip installer otomatis:
 2. Menyiapkan Python virtual environment dan menginstal dependensi (`discord.py`, `yt-dlp`).
 3. Memasang service systemd `discord-music.service` dan `discord-music-panel.service`.
 4. Mengaktifkan auto-start saat boot sistem.
-5. Menjalankan verifikasi unit test mandiri (**105/105 passing**).
+5. Menjalankan verifikasi unit test mandiri (**107/107 passing**).
 6. Menyalakan Web Control Panel di port `9130`.
 
 ---
@@ -209,7 +209,7 @@ PYTHONPATH=. ./venv/bin/python -m unittest discover -s tests -v
 
 Hasil uji:
 ```
-Ran 105 tests in 8.2s
+Ran 107 tests in 39.8s
 OK
 ```
 
