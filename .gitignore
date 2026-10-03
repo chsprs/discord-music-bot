@@ -4,3 +4,6 @@ __pycache__/
 .env
 last_update.log
 .update.lock
+# Cookies YouTube berisi sesi login: jangan pernah masuk git.
+cookies.txt
+*.cookies.txt

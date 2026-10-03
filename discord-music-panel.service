@@ -21,5 +21,26 @@ ProtectHome=true
 # menulis .env (simpan konfigurasi), last_update.log, dan venv (update yt-dlp).
 ReadWritePaths=/opt/discord-music-bot
 
+# --- Hardening tambahan ---
+# Panel mengendalikan systemctl sebagai root; persempit permukaan serangnya.
+# Berkas yang dibuat panel tidak boleh world-readable (config bisa berisi token).
+UMask=0077
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+# Hanya AF_UNIX (systemd/D-Bus) + AF_INET/AF_INET6 (panel HTTP) + AF_NETLINK
+# (resolusi DNS). Blokir AF_PACKET dan keluarga socket lain.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+
 [Install]
 WantedBy=multi-user.target

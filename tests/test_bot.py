@@ -1,10 +1,14 @@
 import asyncio
+import os
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import discord
 
-from bot import MusicBot, MusicPanel, Track, QueueState, extract_track, extract_tracks, source_for
+import bot as bot_module
+from bot import (MusicBot, MusicPanel, Track, QueueState, extract_track,
+                 extract_tracks, source_for, _cookies_file, _with_cookies)
 
 
 class MusicTests(unittest.TestCase):
@@ -833,6 +837,131 @@ class MusicTests(unittest.TestCase):
         self.assertIsNone(state.now_message)
         old_msg.delete.assert_awaited()
         self.assertTrue(pending.cancelled() or pending.done())
+
+
+class CookiesTests(unittest.TestCase):
+    """P3: cookies.txt opsional untuk video age-restricted / butuh login."""
+
+    def test_missing_cookies_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'YTDLP_COOKIES': os.path.join(tmp, 'nope.txt')},
+                            clear=False):
+                self.assertIsNone(_cookies_file())
+
+    def test_empty_cookies_file_is_ignored(self):
+        """Berkas kosong (sisa sentuhan) tidak boleh dipakai."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'cookies.txt')
+            open(path, 'w').close()
+            with patch.dict(os.environ, {'YTDLP_COOKIES': path}, clear=False):
+                self.assertIsNone(_cookies_file())
+
+    def test_env_var_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'cookies.txt')
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('# Netscape HTTP Cookie File\n')
+            with patch.dict(os.environ, {'YTDLP_COOKIES': path}, clear=False):
+                self.assertEqual(_cookies_file(), path)
+
+    def test_with_cookies_returns_copy_without_file(self):
+        """Tanpa berkas cookies, options asli harus dikembalikan apa adanya."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'YTDLP_COOKIES': os.path.join(tmp, 'nope.txt')},
+                            clear=False):
+                options = {'format': 'bestaudio'}
+                self.assertIs(_with_cookies(options), options)
+                self.assertNotIn('cookiefile', options)
+
+    def test_with_cookies_merges_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'cookies.txt')
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('# Netscape HTTP Cookie File\n')
+            with patch.dict(os.environ, {'YTDLP_COOKIES': path}, clear=False):
+                options = {'format': 'bestaudio'}
+                merged = _with_cookies(options)
+                self.assertEqual(merged['cookiefile'], path)
+                self.assertNotIn('cookiefile', options,
+                                 'options asli tidak boleh dimutasi')
+
+    def test_cookies_picked_up_without_restart(self):
+        """Berkas yang muncul setelah import harus langsung terpakai."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'cookies.txt')
+            with patch.dict(os.environ, {'YTDLP_COOKIES': path}, clear=False):
+                self.assertIsNone(_cookies_file())
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write('# Netscape HTTP Cookie File\n')
+                self.assertEqual(_cookies_file(), path,
+                                 'cookies baru tidak terpakai tanpa restart bot')
+
+    def test_gitignore_covers_cookies(self):
+        """cookies.txt berisi sesi login: jangan pernah masuk git."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, '.gitignore'), encoding='utf-8') as handle:
+            ignored = handle.read()
+        self.assertIn('cookies.txt', ignored,
+                      'cookies.txt harus ada di .gitignore (berisi sesi login)')
+
+
+class HelpCommandTests(unittest.TestCase):
+    """P4: /help harus terdaftar dan menyebut semua perintah penting."""
+
+    def _help_text(self) -> str:
+        bot = MusicBot()
+        sent = {}
+
+        async def scenario():
+            interaction = MagicMock()
+            interaction.response.send_message = AsyncMock(
+                side_effect=lambda **kw: sent.update(kw))
+            await bot.cmd_help(interaction)
+
+        asyncio.run(scenario())
+        embed = sent.get('embed')
+        self.assertIsNotNone(embed, '/help tidak mengirim embed')
+        text = embed.title + '\n'
+        text += embed.description or ''
+        for field in embed.fields:
+            text += '\n' + field.name + '\n' + field.value
+        return text
+
+    def test_help_is_registered_in_command_tree(self):
+        bot = MusicBot()
+        names = {cmd.name for cmd in bot.tree.get_commands()}
+        self.assertIn('help', names, '/help tidak terdaftar di CommandTree')
+
+    def test_help_is_ephemeral(self):
+        bot = MusicBot()
+        sent = {}
+
+        async def scenario():
+            interaction = MagicMock()
+            interaction.response.send_message = AsyncMock(
+                side_effect=lambda **kw: sent.update(kw))
+            await bot.cmd_help(interaction)
+
+        asyncio.run(scenario())
+        self.assertTrue(sent.get('ephemeral'),
+                        '/help harus ephemeral agar channel tidak kotor')
+
+    def test_help_lists_every_command(self):
+        text = self._help_text()
+        for name in ('musik', 'play', 'pause', 'skip', 'back', 'stop',
+                     'antrian', 'shuffle', 'loop', 'autoplay',
+                     'volume', 'quit', 'help'):
+            self.assertIn(f'/{name}', text,
+                          f'perintah /{name} tidak disebut di /help')
+
+    def test_help_matches_registered_commands(self):
+        """Setiap command yang terdaftar harus ada di teks /help."""
+        bot = MusicBot()
+        registered = {cmd.name for cmd in bot.tree.get_commands()}
+        text = self._help_text()
+        missing = sorted(name for name in registered if f'/{name}' not in text)
+        self.assertEqual(missing, [],
+                         f'command terdaftar tapi tidak ada di /help: {missing}')
 
 
 if __name__ == '__main__':
