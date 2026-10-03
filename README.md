@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-111%2F111%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-147%2F147%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -58,8 +58,10 @@ Bot musik Discord ultra-ringan, hemat sumber daya (<50MB RAM), dan bebas iklan y
   - **Tombol Pembaruan Manual:** Perbarui `yt-dlp` seketika lewat tombol web lengkap dengan riwayat log keluaran terminal.
   - **Pemantau Log Realtime:** Kotak log aktivitas bot (`journalctl`) yang dapat disegarkan langsung dari antarmuka web.
 - **Auto-Update Berkala & Zero-Warning JS Runtime:**
-  - **Systemd Timer Mingguan:** Menjalankan pembaruan otomatis `yt-dlp` setiap Minggu pukul 04:00 WIB agar cipher extractor YouTube selalu mutakhir.
+  - **Systemd Timer Mingguan:** Menjalankan pembaruan otomatis `yt-dlp` setiap Minggu pukul 04:00 WIB agar cipher extractor YouTube selalu mutakhir. Pembaruan memakai `pip install --upgrade` dan menuliskan versi baru kembali ke `requirements.txt`.
+  - **Restart Aman Saat Ada Pendengar:** Bila masih ada yang mendengarkan musik, restart bot ditunda agar pemutaran tidak terputus; versi yt-dlp baru otomatis dipakai pada restart berikutnya.
   - **Integrasi JS Engine:** Terhubung ke Node.js runtime untuk menyelesaikan challenge player API YouTube (EJS) tanpa pesan warning deprecation.
+- **Cookies Opsional (video age-restricted):** Taruh `cookies.txt` di direktori bot (atau set `YTDLP_COOKIES` di `.env`) untuk memutar video yang butuh login. Berkas dibaca ulang tiap ekstraksi, jadi tidak perlu restart. `cookies.txt` berisi sesi login — sudah masuk `.gitignore`, perlakukan seperti password.
 - **Auto-Sync & Auto-Start:**
   - Sinkronisasi slash command otomatis ke seluruh server Discord saat bot dinyalakan atau diundang ke server baru (`on_guild_join`).
   - Service systemd terintegrasi untuk otomatis jalan saat server / STB dinyalakan ulang.
@@ -101,6 +103,7 @@ Semua fungsi tombol juga dapat diakses lewat perintah chat slash:
 | `/shuffle` | - | Mengacak urutan antrian lagu |
 | `/loop` | `[mode]` | Mengatur mode perulangan (`track`, `queue`, atau `off`) |
 | `/autoplay`| - | Mengaktifkan atau menonaktifkan fitur AutoPlay |
+| `/help` | - | Menampilkan daftar perintah dan cara pakai bot |
 
 ---
 
@@ -119,7 +122,7 @@ Skrip installer otomatis:
 2. Menyiapkan Python virtual environment dan menginstal dependensi (`discord.py`, `yt-dlp`).
 3. Memasang service systemd `discord-music.service` dan `discord-music-panel.service`.
 4. Mengaktifkan auto-start saat boot sistem.
-5. Menjalankan verifikasi unit test mandiri (**111/111 passing**).
+5. Menjalankan verifikasi unit test mandiri (**147/147 passing**).
 6. Menyalakan Web Control Panel di port `9130`.
 
 ---
@@ -209,7 +212,7 @@ PYTHONPATH=. ./venv/bin/python -m unittest discover -s tests -v
 
 Hasil uji:
 ```
-Ran 111 tests in 40.9s
+Ran 147 tests in 43.1s
 OK
 ```
 

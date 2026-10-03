@@ -71,6 +71,26 @@ STALL_EOF_SECONDS = 4.0
 MAX_TRACK_RETRIES = 3
 
 
+def _cookies_file() -> str | None:
+    """Lokasi cookies.txt opsional untuk video age-restricted / butuh login.
+
+    Tanpa ini, lagu seperti itu gagal dengan 'Sign in to confirm you're not a
+    bot'. Berkas diisi operator sendiri (mis. hasil ekstensi 'Get cookies.txt')
+    dan hanya dibaca, tidak pernah ditulis bot. Path bisa diubah lewat
+    YTDLP_COOKIES di .env.
+    """
+    candidates = [
+        os.environ.get('YTDLP_COOKIES'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt'),
+        os.path.join(os.environ.get('XDG_CONFIG_HOME', ''), 'yt-dlp', 'cookies.txt')
+        if os.environ.get('XDG_CONFIG_HOME') else None,
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
+
 def checked_query(query: str) -> str:
     query = query.strip()
     if not query or len(query) > 500:
@@ -126,6 +146,22 @@ STREAM_OPTIONS = {
     'fragment_retries': 3,
     'js_runtimes': _JS_RUNTIME,
 }
+
+# Cookies opsional (video age-restricted / butuh login). Dibaca ulang di tiap
+# ekstraksi lewat _with_cookies(), jadi menaruh cookies.txt langsung terpakai
+# tanpa restart bot. Lihat _cookies_file().
+if _cookies_file():
+    log.info('Cookies yt-dlp terdeteksi dari %s', _cookies_file())
+
+
+def _with_cookies(options: dict) -> dict:
+    """Salinan options + cookiefile bila berkas cookies tersedia saat ini."""
+    path = _cookies_file()
+    if not path:
+        return options
+    merged = dict(options)
+    merged['cookiefile'] = path
+    return merged
 
 
 def dump_runtime_state(bot) -> None:
@@ -230,7 +266,7 @@ def clear_cache() -> None:
 
 
 def extract_stream(url: str) -> dict:
-    with yt_dlp.YoutubeDL(STREAM_OPTIONS) as ydl:
+    with yt_dlp.YoutubeDL(_with_cookies(STREAM_OPTIONS)) as ydl:
         data = ydl.extract_info(url, download=False)
     if data and 'entries' in data:
         data = next((entry for entry in data['entries'] if entry), None)
@@ -243,7 +279,7 @@ extract = extract_stream
 
 
 def _fetch_metadata(target: str) -> dict:
-    with yt_dlp.YoutubeDL(METADATA_OPTIONS) as ydl:
+    with yt_dlp.YoutubeDL(_with_cookies(METADATA_OPTIONS)) as ydl:
         return ydl.extract_info(target, download=False)
 
 
@@ -911,6 +947,7 @@ class MusicBot(discord.Client):
         self.tree.command(name='shuffle', description='Acak daftar antrian lagu')(self.cmd_shuffle)
         self.tree.command(name='loop', description='Atur mode pengulangan (off, track, queue)')(self.cmd_loop)
         self.tree.command(name='autoplay', description='Aktifkan atau nonaktifkan putar otomatis (AutoPlay)')(self.cmd_autoplay)
+        self.tree.command(name='help', description='Tampilkan daftar perintah dan cara pakai bot')(self.cmd_help)
 
     async def _stop_player(self, guild: discord.Guild) -> None:
         """Hentikan player + bump generation agar after() basi tidak fire (C7)."""
@@ -1364,6 +1401,50 @@ class MusicBot(discord.Client):
         else:
             await interaction.response.send_message(msg, ephemeral=True)
         await self.refresh(state)
+
+    async def cmd_help(self, interaction: discord.Interaction):
+        """Daftar perintah. Ephemeral agar tidak mengotori channel."""
+        embed = discord.Embed(
+            title='Perintah Bot Musik',
+            description='Semua perintah bisa dipakai setelah bot masuk voice channel.',
+            color=0x5865F2,
+        )
+        embed.add_field(
+            name='▶️ Memutar',
+            value=(
+                '`/musik` — buka panel musik & panggil bot ke voice\n'
+                '`/play <judul atau URL>` — putar lagu atau playlist\n'
+                '`/pause` — jeda atau lanjutkan pemutaran\n'
+                '`/skip` — lewati lagu sekarang\n'
+                '`/back` — putar lagu sebelumnya\n'
+                '`/stop` — hentikan musik dan keluar dari voice'
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name='📋 Antrian',
+            value=(
+                '`/antrian` — lihat daftar antrian lagu\n'
+                '`/shuffle` — acak antrian\n'
+                '`/loop <off|track|queue>` — atur mode pengulangan\n'
+                '`/autoplay` — putar rekomendasi otomatis saat antrian habis'
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name='⚙️ Lainnya',
+            value=(
+                '`/volume <0-200>` — atur volume\n'
+                '`/quit` — keluarkan bot, reset antrian, bersihkan cache\n'
+                '`/help` — tampilkan pesan ini'
+            ),
+            inline=False,
+        )
+        embed.set_footer(text='Panel tombol juga tersedia lewat /musik')
+        try:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except discord.HTTPException as exc:
+            log.debug('Gagal kirim /help: %s', exc)
 
     async def summon(self, interaction: discord.Interaction):
         voice = getattr(interaction.user, 'voice', None)
