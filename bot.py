@@ -56,12 +56,16 @@ class QueueState:
     consecutive_playback_errors: int = 0
     idle_task: asyncio.Task | None = None
     empty_task: asyncio.Task | None = None
+    afk_task: asyncio.Task | None = None
+    afk_paused: bool = False
     refresh_task: asyncio.Task | None = None
     announce_task: asyncio.Task | None = None
     _advance_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _last_skip_time: float = 0.0
     _last_pause_time: float = 0.0
 
+
+GuildState = QueueState
 
 # Batas konkurensi ekstraksi yt-dlp agar STB RAM kecil tidak OOM (C4/M3).
 EXTRACT_SEM = asyncio.Semaphore(2)
@@ -73,6 +77,19 @@ MAX_QUEUE = 500
 MAX_ERROR_STREAK = 50
 STALL_EOF_SECONDS = 4.0
 MAX_TRACK_RETRIES = 3
+AFK_TIMEOUT_SECONDS = int(os.getenv('AFK_TIMEOUT_SECONDS', '180'))
+
+
+def get_afk_timeout() -> float:
+    raw = os.getenv('AFK_TIMEOUT_SECONDS')
+    if raw is not None:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return float(AFK_TIMEOUT_SECONDS)
 
 
 def _cookies_file() -> str | None:
@@ -245,6 +262,49 @@ def dump_runtime_state_offline() -> None:
             os.remove(path)
     except Exception:
         pass
+
+
+def _persistent_queue_file() -> str:
+    path = os.environ.get('QUEUE_STATE_FILE')
+    if path:
+        return path
+    if os.path.isdir('/run/discord-music') and os.access('/run/discord-music', os.W_OK):
+        return '/run/discord-music/queue_state.json'
+    return '/tmp/discord-music-queue_state.json'
+
+
+def _track_to_dict(track) -> dict:
+    if track is None:
+        return {}
+    return {
+        'title': str(getattr(track, 'title', '')),
+        'url': str(getattr(track, 'url', '')),
+        'requester': str(getattr(track, 'requester', 'Unknown')),
+        'duration': int(getattr(track, 'duration', 0) or 0),
+        'duration_str': str(getattr(track, 'duration_str', 'Unknown')),
+        'author': str(getattr(track, 'author', 'Unknown')),
+    }
+
+
+def _dict_to_track(data: dict) -> Track | None:
+    if not isinstance(data, dict):
+        return None
+    url = data.get('url')
+    title = data.get('title')
+    if not url or not title:
+        return None
+    try:
+        dur = int(data.get('duration', 0) or 0)
+    except (ValueError, TypeError):
+        dur = 0
+    return Track(
+        title=str(title),
+        url=str(url),
+        requester=str(data.get('requester', 'Unknown')),
+        duration=dur,
+        duration_str=str(data.get('duration_str', 'Unknown')),
+        author=str(data.get('author', 'Unknown')),
+    )
 
 
 def clear_cache() -> None:
@@ -708,6 +768,7 @@ class PlaylistView(discord.ui.View):
         async with state.lock:
             count = len(state.queue)
             state.queue.clear()
+        self.bot._save_persistent_queue()
         await self.bot.refresh(state)
         await interaction.followup.send(f'Antrian berhasil dikosongkan ({count} lagu dihapus).', ephemeral=True)
 
@@ -863,6 +924,7 @@ class MusicPanel(discord.ui.View):
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self.bot._stop_player(interaction.guild)
         await self.bot.advance(interaction.guild)
+        self.bot._save_persistent_queue()
         await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
 
     @discord.ui.button(label='Pause', emoji='⏸️', style=discord.ButtonStyle.secondary, custom_id='music:pause', row=0)
@@ -916,9 +978,11 @@ class MusicPanel(discord.ui.View):
         if vc and (vc.is_playing() or vc.is_paused()):
             await self.bot._stop_player(interaction.guild)
             await self.bot.advance(interaction.guild)
+            self.bot._save_persistent_queue()
             text = 'Dilewati.'
         elif state.queue:
             await self.bot.advance(interaction.guild)
+            self.bot._save_persistent_queue()
             text = 'Memutar lagu berikutnya dari antrian.'
         else:
             text = 'Tidak ada lagu aktif.'
@@ -950,6 +1014,7 @@ class MusicPanel(discord.ui.View):
                 state.queue.clear()
                 state.queue.extend(items)
             shuffled_len = len(state.queue)
+        self.bot._save_persistent_queue()
         if too_few:
             # await di luar lock (lihat catatan di back()).
             return await interaction.followup.send('Antrian kurang dari 2 lagu untuk diacak.', ephemeral=True)
@@ -1050,6 +1115,87 @@ class MusicBot(discord.Client):
         self.tree.command(name='loop', description='Atur mode pengulangan (off, track, queue)')(self.cmd_loop)
         self.tree.command(name='autoplay', description='Aktifkan atau nonaktifkan putar otomatis (AutoPlay)')(self.cmd_autoplay)
         self.tree.command(name='help', description='Tampilkan daftar perintah dan cara pakai bot')(self.cmd_help)
+        self._queue_state_file: str | None = None
+
+    def _save_persistent_queue(self) -> None:
+        path = getattr(self, '_queue_state_file', None) or _persistent_queue_file()
+        try:
+            payload = {}
+            for gid, st in list(self.states.items()):
+                curr = _track_to_dict(st.current) if getattr(st, 'current', None) else None
+                q = [_track_to_dict(t) for t in getattr(st, 'queue', [])]
+                if curr or q:
+                    payload[str(gid)] = {
+                        'current': curr,
+                        'queue': q,
+                    }
+            if not payload:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                return
+
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp_path = path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f)
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            log.debug('Gagal menyimpan persistent queue: %s', exc)
+
+    def _restore_persistent_queue(self) -> None:
+        path = getattr(self, '_queue_state_file', None) or _persistent_queue_file()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as exc:
+            log.warning('Gagal membaca persistent queue (rusak/tidak valid): %s', exc)
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return
+
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+        if not isinstance(data, dict):
+            log.warning('Data persistent queue bukan format dict, dilewati.')
+            return
+
+        restored_guilds = 0
+        for gid_str, g_data in data.items():
+            try:
+                gid = int(gid_str)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(g_data, dict):
+                continue
+            state = self.states.setdefault(gid, QueueState())
+            has_restored = False
+            curr_data = g_data.get('current')
+            if curr_data and isinstance(curr_data, dict) and state.current is None:
+                track = _dict_to_track(curr_data)
+                if track:
+                    state.current = track
+                    has_restored = True
+            queue_data = g_data.get('queue', [])
+            if isinstance(queue_data, list):
+                for item in queue_data:
+                    track = _dict_to_track(item)
+                    if track:
+                        state.queue.append(track)
+                        has_restored = True
+            if has_restored:
+                restored_guilds += 1
+        if restored_guilds > 0:
+            log.info('Persistent queue berhasil dipulihkan untuk %d guild.', restored_guilds)
 
     async def _stop_player(self, guild: discord.Guild) -> None:
         """Hentikan player + bump generation agar after() basi tidak fire (C7)."""
@@ -1066,6 +1212,7 @@ class MusicBot(discord.Client):
                 vc.stop()
             except Exception:
                 pass
+        self._save_persistent_queue()
 
     async def _enqueue_tracks(self, guild: discord.Guild, tracks: list[Track]) -> bool:
         """Tambah track dengan cap total; return False bila penuh."""
@@ -1087,6 +1234,7 @@ class MusicBot(discord.Client):
                     state.history.popleft()
                 state.current = None
             need_advance = not playing
+        self._save_persistent_queue()
         if need_advance and vc and not vc.is_playing() and not vc.is_paused():
             await self.advance(guild)
         return True
@@ -1166,6 +1314,7 @@ class MusicBot(discord.Client):
             pass
 
     async def on_ready(self):
+        self._restore_persistent_queue()
         dump_runtime_state(self)
         guild_list = [f'{g.name} ({g.id})' for g in self.guilds]
         log.info('Bot login sebagai %s (ID: %s). Terhubung ke %d server: %s',
@@ -1178,7 +1327,12 @@ class MusicBot(discord.Client):
                 await self._sync_guild(guild)
                 await asyncio.sleep(1)
 
+    async def on_resumed(self):
+        self._restore_persistent_queue()
+        dump_runtime_state(self)
+
     async def on_guild_join(self, guild: discord.Guild):
+        self._restore_persistent_queue()
         dump_runtime_state(self)
         await self._sync_guild(guild)
 
@@ -1186,10 +1340,12 @@ class MusicBot(discord.Client):
         dump_runtime_state(self)
         state = self.states.pop(guild.id, None)
         if state:
-            for task in (state.idle_task, state.empty_task, state.refresh_task, state.announce_task):
+            for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task, state.announce_task):
                 if task and not task.done():
                     task.cancel()
-            state.idle_task = state.empty_task = state.refresh_task = state.announce_task = None
+            state.idle_task = state.empty_task = state.afk_task = state.refresh_task = state.announce_task = None
+            state.afk_paused = False
+        self._save_persistent_queue()
 
     async def _delete_all_panels(self) -> None:
         """Hapus semua pesan panel agar chat bersih saat bot mati.
@@ -1227,14 +1383,19 @@ class MusicBot(discord.Client):
 
     async def close(self):
         try:
+            self._save_persistent_queue()
+        except Exception as exc:
+            log.debug('Gagal menyimpan persistent queue saat close: %s', exc)
+        try:
             dump_runtime_state_offline()
         except Exception:
             pass
         for state in list(self.states.values()):
-            for task in (state.idle_task, state.empty_task, state.refresh_task, state.announce_task):
+            for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task, state.announce_task):
                 if task and not task.done():
                     task.cancel()
-            state.idle_task = state.empty_task = state.refresh_task = state.announce_task = None
+            state.idle_task = state.empty_task = state.afk_task = state.refresh_task = state.announce_task = None
+            state.afk_paused = False
         try:
             await self._delete_all_panels()
         except Exception:
@@ -1324,6 +1485,7 @@ class MusicBot(discord.Client):
         state._last_skip_time = now
         await self._stop_player(interaction.guild)
         await self.advance(interaction.guild)
+        self._save_persistent_queue()
         await interaction.followup.send('Lagu dilewati.', ephemeral=True)
 
     async def cmd_back(self, interaction: discord.Interaction):
@@ -1348,6 +1510,7 @@ class MusicBot(discord.Client):
                 state.current = None
         await self._stop_player(interaction.guild)
         await self.advance(interaction.guild)
+        self._save_persistent_queue()
         await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
 
     async def cmd_shuffle(self, interaction: discord.Interaction):
@@ -1367,6 +1530,7 @@ class MusicBot(discord.Client):
             state.queue.clear()
             state.queue.extend(items)
             shuffled_len = len(state.queue)
+        self._save_persistent_queue()
         await interaction.followup.send(f'Antrian berhasil diacak ({shuffled_len} lagu).', ephemeral=True)
         await self.refresh(state)
 
@@ -1407,10 +1571,11 @@ class MusicBot(discord.Client):
                     state.queue.clear()
                     state.history.clear()
                 state.current = None
-                for task in (state.idle_task, state.empty_task):
+                for task in (state.idle_task, state.empty_task, state.afk_task):
                     if task and not task.done():
                         task.cancel()
-                state.idle_task = state.empty_task = None
+                state.idle_task = state.empty_task = state.afk_task = None
+                state.afk_paused = False
                 announce_task = state.announce_task
                 state.announce_task = None
                 old_now_message = state.now_message
@@ -1425,8 +1590,14 @@ class MusicBot(discord.Client):
         vc = getattr(guild, 'voice_client', None)
         if vc:
             try:
+                source = getattr(vc, 'source', None)
                 if getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)():
                     vc.stop()
+                if source and hasattr(source, 'cleanup'):
+                    try:
+                        source.cleanup()
+                    except Exception:
+                        pass
             except Exception:
                 pass
             try:
@@ -1435,6 +1606,7 @@ class MusicBot(discord.Client):
                 pass
         if state:
             await self.refresh(state)
+        self._save_persistent_queue()
         dump_runtime_state(self)
 
     async def cmd_stop(self, interaction: discord.Interaction):
@@ -1790,6 +1962,7 @@ class MusicBot(discord.Client):
                                             st.queue.appendleft(st.current)
                                         st.current = None
                                 if circuit_broken:
+                                    self._save_persistent_queue()
                                     await self.refresh(st)
                                     self._schedule_idle(guild, st.generation)
                                     return
@@ -1840,6 +2013,7 @@ class MusicBot(discord.Client):
                             if state.loop_mode == 'queue':
                                 state.queue.append(state.current)
                         state.current = next_track
+                self._save_persistent_queue()
                 await self.refresh(state)
                 self._announce(guild, played)
                 return
@@ -1870,6 +2044,7 @@ class MusicBot(discord.Client):
                     if len(state.history) > 20:
                         state.history.popleft()
                     state.current = None
+            self._save_persistent_queue()
             schedule_idle = state.current is None and not state.queue
             gen = state.generation
         if schedule_idle:
@@ -1968,59 +2143,110 @@ class MusicBot(discord.Client):
 
     async def on_voice_state_update(self, member, before, after):
         dump_runtime_state(self)
-        # 1. Jika bot itu sendiri dikeluarkan atau terputus dari voice
-        if member.id == getattr(self.user, 'id', None):
-            if before.channel is not None and after.channel is None:
-                await asyncio.sleep(2)
-                vc = member.guild.voice_client
-                if not vc or not vc.is_connected() or not vc.channel:
-                    log.info('Bot dikeluarkan atau terputus dari voice di guild %s (%s)', member.guild.name, member.guild.id)
-                    await self.quit_voice(member.guild, clear_queue=False)
-                return
-
-        # 2. Jika seluruh user keluar dari channel (hanya tersisa bot) — single task per guild.
-        vc = member.guild.voice_client
-        if not vc or not vc.channel or any(not m.bot for m in vc.channel.members):
+        guild = getattr(member, 'guild', None)
+        if not guild:
             return
-        state = self.states.get(member.guild.id)
-        if state:
-            async with state.lock:
-                if state.empty_task and not state.empty_task.done():
-                    return
+
+        state = self.states.setdefault(guild.id, QueueState())
+        bot_user_id = getattr(getattr(self, 'user', None), 'id', None)
+        is_bot = (bot_user_id is not None and member.id == bot_user_id)
+
+        # 1. Edge case: bot itu sendiri dikeluarkan atau terputus dari voice
+        if is_bot and before.channel is not None and after.channel is None:
+            if state.afk_task and not state.afk_task.done():
+                state.afk_task.cancel()
+            state.afk_task = state.empty_task = None
+            state.afk_paused = False
+
+            await asyncio.sleep(2)
+            vc = getattr(guild, 'voice_client', None)
+            if not vc or not getattr(vc, 'is_connected', lambda: False)() or not getattr(vc, 'channel', None):
+                log.info('Bot dikeluarkan atau terputus dari voice di guild %s (%s)', getattr(guild, 'name', 'unknown'), guild.id)
+                await self.quit_voice(guild, clear_queue=False)
+            return
+
+        # 2. Cek apakah bot terhubung ke voice channel di guild ini
+        vc = getattr(guild, 'voice_client', None)
+        if not vc or not getattr(vc, 'is_connected', lambda: False)() or not getattr(vc, 'channel', None):
+            if state.afk_task and not state.afk_task.done():
+                state.afk_task.cancel()
+            state.afk_task = state.empty_task = None
+            state.afk_paused = False
+            return
+
+        bot_channel = vc.channel
+
+        # 3. Hitung jumlah pendengar manusia (bukan bot) di channel bot
+        human_listeners = [m for m in getattr(bot_channel, 'members', []) if not getattr(m, 'bot', False)]
+        num_humans = len(human_listeners)
+
+        if num_humans == 0:
+            # Tidak ada pendengar manusia di room tempat bot berada
+            # Auto-pause jika sedang memutar audio
+            if getattr(vc, 'is_playing', lambda: False)():
                 try:
-                    state.empty_task = asyncio.get_running_loop().create_task(
-                        self._empty_disconnect(member.guild, state.generation))
+                    vc.pause()
+                    state.afk_paused = True
+                except Exception:
+                    pass
+
+            # Mulai timer AFK jika belum berjalan
+            async with state.lock:
+                if state.afk_task and not state.afk_task.done():
+                    return
+                timeout = get_afk_timeout()
+                try:
+                    state.afk_task = state.empty_task = asyncio.get_running_loop().create_task(
+                        self._afk_disconnect(guild, state.generation, timeout)
+                    )
                 except RuntimeError:
                     pass
         else:
-            try:
-                asyncio.get_running_loop().create_task(
-                    self._empty_disconnect(member.guild, 0))
-            except RuntimeError:
-                pass
+            # Ada pendengar manusia di channel bot
+            # Batalkan timer AFK
+            if state.afk_task and not state.afk_task.done():
+                state.afk_task.cancel()
+            state.afk_task = state.empty_task = None
 
-    async def _empty_disconnect(self, guild: discord.Guild, generation: int):
+            # Lanjutkan pemutaran jika sebelumnya di-pause oleh AFK Guard
+            if state.afk_paused:
+                if getattr(vc, 'is_paused', lambda: False)():
+                    try:
+                        vc.resume()
+                    except Exception:
+                        pass
+                state.afk_paused = False
+
+    async def _afk_disconnect(self, guild: discord.Guild, generation: int, timeout: float | None = None):
+        if timeout is None:
+            timeout = get_afk_timeout()
         try:
-            await asyncio.sleep(30)
-            vc = guild.voice_client
-            if vc and vc.channel and not any(not m.bot for m in vc.channel.members):
-                state = self.states.get(guild.id)
-                if state and generation != state.generation and generation != 0:
-                    return
-                log.info('Voice channel kosong di guild %s, bot keluar.', guild.name)
-                await self.quit_voice(guild, clear_queue=False)
+            await asyncio.sleep(timeout)
+            vc = getattr(guild, 'voice_client', None)
+            if vc and getattr(vc, 'channel', None):
+                humans = [m for m in getattr(vc.channel, 'members', []) if not getattr(m, 'bot', False)]
+                if not humans:
+                    state = self.states.get(guild.id)
+                    if state and generation != state.generation and generation != 0:
+                        return
+                    dur_str = "3 menit" if timeout == 180 else (f"{int(timeout // 60)} menit" if timeout >= 60 else f"{int(timeout)} detik")
+                    log.info("AFK timeout: room kosong selama %s, bot keluar dari voice channel", dur_str)
+                    await self.quit_voice(guild, clear_queue=False)
         except asyncio.CancelledError:
             pass
         finally:
             state = self.states.get(guild.id)
             if state:
                 try:
-                    if state.empty_task and state.empty_task.done():
-                        state.empty_task = None
-                    elif state.empty_task is asyncio.current_task():
-                        state.empty_task = None
+                    if state.afk_task and state.afk_task.done():
+                        state.afk_task = state.empty_task = None
+                    elif state.afk_task is asyncio.current_task():
+                        state.afk_task = state.empty_task = None
                 except Exception:
                     pass
+
+    async def _empty_disconnect(self, guild: discord.Guild, generation: int):
+        await self._afk_disconnect(guild, generation)
 
 
 if __name__ == '__main__':

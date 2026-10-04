@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -7,8 +8,8 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import discord
 
 import bot as bot_module
-from bot import (MusicBot, MusicPanel, Track, QueueState, extract_track,
-                 extract_tracks, source_for, _cookies_file, _with_cookies, SearchModal)
+from bot import (MusicBot, MusicPanel, Track, QueueState, GuildState, get_afk_timeout,
+                 extract_track, extract_tracks, source_for, _cookies_file, _with_cookies, SearchModal)
 
 
 class MusicTests(unittest.TestCase):
@@ -1415,6 +1416,495 @@ class ConcurrencyAndLifecycleTests(unittest.TestCase):
         modal = SearchModal(bot)
         self.assertEqual(modal.timeout, 60)
         self.assertTrue(callable(modal.stop))
+
+
+class AFKGuardTests(unittest.TestCase):
+    def test_afk_timer_starts_and_pauses_when_human_members_zero(self):
+        """AFK Guard: Timer aktif & audio dipause saat human members = 0."""
+        bot = MusicBot()
+        bot_user = MagicMock(id=999)
+        bot._connection.user = bot_user
+        guild = MagicMock(id=112233, name='GuildAFK')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        channel = MagicMock()
+        bot_member = MagicMock(bot=True, id=999)
+        channel.members = [bot_member]
+        vc.channel = channel
+        guild.voice_client = vc
+
+        member = MagicMock(id=123, bot=False, guild=guild)
+        before = MagicMock(channel=channel)
+        after = MagicMock(channel=None)
+
+        async def run_test():
+            await bot.on_voice_state_update(member, before, after)
+            state = bot.states[guild.id]
+            self.assertIsNotNone(state.afk_task)
+            self.assertFalse(state.afk_task.done())
+            self.assertTrue(state.afk_paused)
+            vc.pause.assert_called_once()
+            state.afk_task.cancel()
+
+        with patch('bot.dump_runtime_state'):
+            asyncio.run(run_test())
+
+    def test_afk_timer_idempotent_no_duplicate_task(self):
+        """Timer AFK tidak dibuat berulang kali jika sudah ada timer berjalan."""
+        bot = MusicBot()
+        bot_user = MagicMock(id=999)
+        bot._connection.user = bot_user
+        guild = MagicMock(id=112234, name='GuildAFK')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        channel = MagicMock()
+        bot_member = MagicMock(bot=True, id=999)
+        channel.members = [bot_member]
+        vc.channel = channel
+        guild.voice_client = vc
+
+        state = QueueState()
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        state.afk_task = state.empty_task = mock_task
+        bot.states[guild.id] = state
+
+        member = MagicMock(id=124, bot=False, guild=guild)
+        before = MagicMock(channel=channel)
+        after = MagicMock(channel=None)
+
+        async def run_test():
+            with patch('asyncio.get_running_loop') as mock_loop:
+                await bot.on_voice_state_update(member, before, after)
+                mock_loop.return_value.create_task.assert_not_called()
+                self.assertIs(state.afk_task, mock_task)
+
+        with patch('bot.dump_runtime_state'):
+            asyncio.run(run_test())
+
+    def test_afk_timer_cancelled_and_resumed_when_human_joins(self):
+        """AFK Guard: Timer dibatalkan & audio di-resume saat human member masuk kembali."""
+        bot = MusicBot()
+        bot_user = MagicMock(id=999)
+        bot._connection.user = bot_user
+        guild = MagicMock(id=112233, name='GuildAFK')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = True
+        channel = MagicMock()
+        bot_member = MagicMock(bot=True, id=999)
+        human_member = MagicMock(bot=False, id=123, guild=guild)
+        channel.members = [bot_member, human_member]
+        vc.channel = channel
+        guild.voice_client = vc
+
+        state = QueueState()
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        state.afk_task = state.empty_task = mock_task
+        state.afk_paused = True
+        bot.states[guild.id] = state
+
+        before = MagicMock(channel=None)
+        after = MagicMock(channel=channel)
+
+        async def run_test():
+            await bot.on_voice_state_update(human_member, before, after)
+            mock_task.cancel.assert_called_once()
+            self.assertIsNone(state.afk_task)
+            self.assertFalse(state.afk_paused)
+            vc.resume.assert_called_once()
+
+        with patch('bot.dump_runtime_state'):
+            asyncio.run(run_test())
+
+    def test_afk_timer_cancelled_no_resume_if_not_afk_paused(self):
+        """Jika lagu dipause manual oleh user, masuknya human tidak memicu auto-resume."""
+        bot = MusicBot()
+        bot_user = MagicMock(id=999)
+        bot._connection.user = bot_user
+        guild = MagicMock(id=112235, name='GuildAFK')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = True
+        channel = MagicMock()
+        bot_member = MagicMock(bot=True, id=999)
+        human_member = MagicMock(bot=False, id=123, guild=guild)
+        channel.members = [bot_member, human_member]
+        vc.channel = channel
+        guild.voice_client = vc
+
+        state = QueueState()
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        state.afk_task = state.empty_task = mock_task
+        state.afk_paused = False
+        bot.states[guild.id] = state
+
+        before = MagicMock(channel=None)
+        after = MagicMock(channel=channel)
+
+        async def run_test():
+            await bot.on_voice_state_update(human_member, before, after)
+            mock_task.cancel.assert_called_once()
+            self.assertIsNone(state.afk_task)
+            self.assertFalse(state.afk_paused)
+            vc.resume.assert_not_called()
+
+        with patch('bot.dump_runtime_state'):
+            asyncio.run(run_test())
+
+    def test_afk_disconnect_called_when_timer_expires(self):
+        """AFK Guard: Disconnect terpanggil saat timer selesai dan channel tetap kosong."""
+        bot = MusicBot()
+        guild = MagicMock(id=112233, name='GuildAFK')
+        vc = MagicMock()
+        vc.channel = MagicMock()
+        vc.channel.members = [MagicMock(bot=True, id=999)]
+        guild.voice_client = vc
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        async def run_test():
+            with patch.object(bot, 'quit_voice', new=AsyncMock()) as mock_quit:
+                with patch('bot.log') as mock_log:
+                    await bot._afk_disconnect(guild, state.generation, timeout=0.01)
+                    mock_quit.assert_called_once_with(guild, clear_queue=False)
+                    mock_log.info.assert_called_once()
+                    log_text = str(mock_log.info.call_args)
+                    self.assertIn('AFK timeout: room kosong', log_text)
+
+        asyncio.run(run_test())
+
+    def test_afk_disconnect_aborted_if_human_joined_before_timeout(self):
+        """Jika human masuk sebelum timer timeout berakhir, bot tidak disconnect."""
+        bot = MusicBot()
+        guild = MagicMock(id=112236, name='GuildAFK')
+        vc = MagicMock()
+        vc.channel = MagicMock()
+        vc.channel.members = [MagicMock(bot=True, id=999), MagicMock(bot=False, id=101)]
+        guild.voice_client = vc
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        async def run_test():
+            with patch.object(bot, 'quit_voice', new=AsyncMock()) as mock_quit:
+                await bot._afk_disconnect(guild, state.generation, timeout=0.01)
+                mock_quit.assert_not_called()
+
+        asyncio.run(run_test())
+
+    def test_afk_disconnect_aborted_if_generation_changed(self):
+        """Jika generation state berubah saat timer berjalan, disconnect dibatalkan."""
+        bot = MusicBot()
+        guild = MagicMock(id=112237, name='GuildAFK')
+        vc = MagicMock()
+        vc.channel = MagicMock()
+        vc.channel.members = [MagicMock(bot=True, id=999)]
+        guild.voice_client = vc
+        state = QueueState()
+        state.generation = 5
+        bot.states[guild.id] = state
+
+        async def run_test():
+            with patch.object(bot, 'quit_voice', new=AsyncMock()) as mock_quit:
+                await bot._afk_disconnect(guild, generation=4, timeout=0.01)
+                mock_quit.assert_not_called()
+
+        asyncio.run(run_test())
+
+    def test_afk_bot_moved_to_empty_channel(self):
+        """Bot dipindahkan ke voice channel kosong mengaktifkan timer AFK dan pause audio."""
+        bot = MusicBot()
+        bot_user = MagicMock(id=999)
+        bot._connection.user = bot_user
+        guild = MagicMock(id=112233, name='GuildAFK')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        channel_old = MagicMock(id=1)
+        channel_new = MagicMock(id=2)
+        bot_member = MagicMock(bot=True, id=999, guild=guild)
+        channel_new.members = [bot_member]
+        vc.channel = channel_new
+        guild.voice_client = vc
+
+        before = MagicMock(channel=channel_old)
+        after = MagicMock(channel=channel_new)
+
+        async def run_test():
+            await bot.on_voice_state_update(bot_member, before, after)
+            state = bot.states[guild.id]
+            self.assertIsNotNone(state.afk_task)
+            self.assertFalse(state.afk_task.done())
+            self.assertTrue(state.afk_paused)
+            vc.pause.assert_called_once()
+            state.afk_task.cancel()
+
+        with patch('bot.dump_runtime_state'):
+            asyncio.run(run_test())
+
+    def test_afk_bot_moved_to_channel_with_humans(self):
+        """Bot dipindahkan ke voice channel yang ada manusia membatalkan timer AFK dan resume audio."""
+        bot = MusicBot()
+        bot_user = MagicMock(id=999)
+        bot._connection.user = bot_user
+        guild = MagicMock(id=112233, name='GuildAFK')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = True
+        channel_old = MagicMock(id=1)
+        channel_new = MagicMock(id=2)
+        bot_member = MagicMock(bot=True, id=999, guild=guild)
+        human_member = MagicMock(bot=False, id=123, guild=guild)
+        channel_new.members = [bot_member, human_member]
+        vc.channel = channel_new
+        guild.voice_client = vc
+
+        state = QueueState()
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        state.afk_task = state.empty_task = mock_task
+        state.afk_paused = True
+        bot.states[guild.id] = state
+
+        before = MagicMock(channel=channel_old)
+        after = MagicMock(channel=channel_new)
+
+        async def run_test():
+            await bot.on_voice_state_update(bot_member, before, after)
+            mock_task.cancel.assert_called_once()
+            self.assertIsNone(state.afk_task)
+            self.assertFalse(state.afk_paused)
+            vc.resume.assert_called_once()
+
+        with patch('bot.dump_runtime_state'):
+            asyncio.run(run_test())
+
+    def test_afk_bot_disconnected_cleans_up_afk_state(self):
+        """Bot terputus dari voice membatalkan afk_task dan reset afk_paused."""
+        bot = MusicBot()
+        bot_user = MagicMock(id=999)
+        bot._connection.user = bot_user
+        guild = MagicMock(id=112238, name='GuildAFK')
+        guild.voice_client = None
+        bot_member = MagicMock(id=999, bot=True, guild=guild)
+
+        state = QueueState()
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        state.afk_task = state.empty_task = mock_task
+        state.afk_paused = True
+        bot.states[guild.id] = state
+
+        before = MagicMock(channel=MagicMock())
+        after = MagicMock(channel=None)
+
+        async def run_test():
+            with patch.object(bot, 'quit_voice', new=AsyncMock()), patch('asyncio.sleep', new=AsyncMock()):
+                await bot.on_voice_state_update(bot_member, before, after)
+                mock_task.cancel.assert_called_once()
+                self.assertIsNone(state.afk_task)
+                self.assertFalse(state.afk_paused)
+
+        with patch('bot.dump_runtime_state'):
+            asyncio.run(run_test())
+
+    def test_afk_get_timeout_env(self):
+        """get_afk_timeout mengembalikan nilai dari environment variable atau fallback 180s."""
+        with patch.dict(os.environ, {'AFK_TIMEOUT_SECONDS': '45'}):
+            self.assertEqual(get_afk_timeout(), 45.0)
+        with patch.dict(os.environ, {'AFK_TIMEOUT_SECONDS': 'invalid'}):
+            self.assertEqual(get_afk_timeout(), 180.0)
+        with patch.dict(os.environ, {'AFK_TIMEOUT_SECONDS': '-10'}):
+            self.assertEqual(get_afk_timeout(), 180.0)
+
+
+class PersistentQueueTests(unittest.TestCase):
+    def test_persistent_queue_save_and_restore_guild_state(self):
+        """Persistent Queue: Simpan queue ke JSON saat ada antrean & muat kembali ke GuildState."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'queue_state.json')
+            bot._queue_state_file = queue_file
+
+            guild_id = 99999
+            state = GuildState()
+            state.current = Track('Lagu Aktif', 'https://youtube.com/watch?v=active', 'User1', 180, '3m 0s', 'Artis 1')
+            state.queue.append(Track('Lagu Antri 1', 'https://youtube.com/watch?v=q1', 'User2', 200, '3m 20s', 'Artis 2'))
+            state.queue.append(Track('Lagu Antri 2', 'https://youtube.com/watch?v=q2', 'User3', 240, '4m 0s', 'Artis 3'))
+            bot.states[guild_id] = state
+
+            # 1. Simpan persistent queue
+            bot._save_persistent_queue()
+            self.assertTrue(os.path.exists(queue_file))
+
+            # Verifikasi isi JSON
+            with open(queue_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.assertIn(str(guild_id), data)
+            self.assertEqual(data[str(guild_id)]['current']['title'], 'Lagu Aktif')
+            self.assertEqual(len(data[str(guild_id)]['queue']), 2)
+            self.assertEqual(data[str(guild_id)]['queue'][0]['title'], 'Lagu Antri 1')
+
+            # 2. Muat kembali ke GuildState bot baru
+            bot2 = MusicBot()
+            bot2._queue_state_file = queue_file
+            bot2._restore_persistent_queue()
+
+            # Verifikasi dipulihkan ke GuildState
+            self.assertIn(guild_id, bot2.states)
+            restored_state = bot2.states[guild_id]
+            self.assertIsInstance(restored_state, GuildState)
+            self.assertIsNotNone(restored_state.current)
+            self.assertEqual(restored_state.current.title, 'Lagu Aktif')
+            self.assertEqual(restored_state.current.url, 'https://youtube.com/watch?v=active')
+            self.assertEqual(restored_state.current.requester, 'User1')
+            self.assertEqual(restored_state.current.duration, 180)
+            self.assertEqual(len(restored_state.queue), 2)
+            self.assertEqual(restored_state.queue[0].title, 'Lagu Antri 1')
+            self.assertEqual(restored_state.queue[1].title, 'Lagu Antri 2')
+
+            # Berkas harus dihapus/dibersihkan setelah restore berhasil
+            self.assertFalse(os.path.exists(queue_file))
+
+    def test_persistent_queue_corrupt_json_fallback(self):
+        """Persistent Queue: Handling JSON corrupt ditangani anggun tanpa crash dan berkas dibersihkan."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'corrupt_queue.json')
+            bot._queue_state_file = queue_file
+
+            with open(queue_file, 'w', encoding='utf-8') as f:
+                f.write('{this is definitely not valid json:::')
+
+            bot._restore_persistent_queue()
+
+            self.assertFalse(os.path.exists(queue_file))
+            self.assertEqual(len(bot.states), 0)
+
+    def test_persistent_queue_missing_file_fallback(self):
+        """Persistent Queue: Handling berkas tidak ada tidak menimbulkan error."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'nonexistent.json')
+            bot._queue_state_file = queue_file
+
+            bot._restore_persistent_queue()
+            self.assertEqual(len(bot.states), 0)
+
+    def test_persistent_queue_invalid_json_type(self):
+        """File JSON dengan root bukan dict (misal list/string) ditangani aman."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'list_queue.json')
+            bot._queue_state_file = queue_file
+
+            with open(queue_file, 'w', encoding='utf-8') as f:
+                json.dump([1, 2, 3], f)
+
+            bot._restore_persistent_queue()
+            self.assertFalse(os.path.exists(queue_file))
+            self.assertEqual(len(bot.states), 0)
+
+    def test_persistent_queue_skips_malformed_tracks(self):
+        """Track yang tidak memiliki title atau url diskip tanpa membatalkan track lainnya."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'queue_state.json')
+            bot._queue_state_file = queue_file
+            payload = {
+                '55555': {
+                    'current': {'title': '', 'url': ''},
+                    'queue': [
+                        {'title': 'Valid Track', 'url': 'https://youtube.com/watch?v=valid'},
+                        {'corrupt': 'data'},
+                        'not-a-dict',
+                    ]
+                }
+            }
+            with open(queue_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f)
+
+            bot._restore_persistent_queue()
+            self.assertIn(55555, bot.states)
+            state = bot.states[55555]
+            self.assertIsNone(state.current)
+            self.assertEqual(len(state.queue), 1)
+            self.assertEqual(state.queue[0].title, 'Valid Track')
+
+    def test_persistent_queue_preserves_existing_in_memory_current_track(self):
+        """Jika bot sudah memiliki track aktif di memory, restore tidak menimpa state.current."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'queue_state.json')
+            bot._queue_state_file = queue_file
+            gid = 88888
+            existing_track = Track('Mem Current', 'https://youtube.com/watch?v=mem', 'user')
+            bot.states[gid] = GuildState(current=existing_track)
+
+            payload = {
+                str(gid): {
+                    'current': {'title': 'Disk Current', 'url': 'https://youtube.com/watch?v=disk'},
+                    'queue': [{'title': 'Queued 1', 'url': 'https://youtube.com/watch?v=q1'}]
+                }
+            }
+            with open(queue_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f)
+
+            bot._restore_persistent_queue()
+            state = bot.states[gid]
+            self.assertEqual(state.current.title, 'Mem Current')
+            self.assertEqual(len(state.queue), 1)
+            self.assertEqual(state.queue[0].title, 'Queued 1')
+
+    def test_persistent_queue_empty_queue_removes_file(self):
+        """Saat antrean kosong, penyimpanan membersihkan berkas agar tidak menyimpan sampah."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'queue_state.json')
+            bot._queue_state_file = queue_file
+
+            with open(queue_file, 'w', encoding='utf-8') as f:
+                json.dump({'123': {'current': None, 'queue': []}}, f)
+            self.assertTrue(os.path.exists(queue_file))
+
+            bot.states.clear()
+            bot._save_persistent_queue()
+            self.assertFalse(os.path.exists(queue_file))
+
+    def test_persistent_queue_multi_guild(self):
+        """Menyimpan dan memulihkan antrean untuk beberapa guild sekaligus."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'multi_queue.json')
+            bot._queue_state_file = queue_file
+
+            s1 = GuildState()
+            s1.current = Track('G1 Track', 'https://youtube.com/watch?v=g1', 'user1')
+            s2 = GuildState()
+            s2.queue.append(Track('G2 Queue', 'https://youtube.com/watch?v=g2', 'user2'))
+            bot.states[101] = s1
+            bot.states[102] = s2
+
+            bot._save_persistent_queue()
+
+            bot2 = MusicBot()
+            bot2._queue_state_file = queue_file
+            bot2._restore_persistent_queue()
+
+            self.assertIn(101, bot2.states)
+            self.assertIn(102, bot2.states)
+            self.assertEqual(bot2.states[101].current.title, 'G1 Track')
+            self.assertEqual(len(bot2.states[102].queue), 1)
+            self.assertEqual(bot2.states[102].queue[0].title, 'G2 Queue')
 
 
 if __name__ == '__main__':
