@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-147%2F147%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-205%2F205%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -12,20 +12,19 @@ Bot musik Discord ultra-ringan, hemat sumber daya (<50MB RAM), dan bebas iklan y
 
 ---
 
-## 📸 Tampilan Antarmuka (Music Panel)
+## 📸 Tampilan Antarmuka
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│ 🎧 MUSIC PANEL                                                         │
-│                                                                        │
-│ 💿 `MANGKU PUREL - Pakdhe Kabul , Mukidi - OM ADELLA`                  │
-│                                                                        │
-│ 🎧 Requested By         ⏱ Music Duration         🎙 Music Author       │
-│ @vitooo                 `5m 2s`                  `Henny Adella`        │
-└────────────────────────────────────────────────────────────────────────┘
- [ 🔉 Down ]   [ ⏮ Back ]   [ ⏸ Pause ]   [ ⏭ Skip ]   [ 🔊 Up ]
- [ 🔀 Shuffle ] [ 🔁 Loop ]   [ ⏹ Stop ]    [ 🔄 AutoPlay ] [ 🎵 Playlist ]
-```
+### 🎧 Discord Player (Interactive Music Panel)
+Tampilan panel interaktif modern di voice/text channel Discord dengan 10 tombol kontrol realtime, indikator bitrate/codec, dan informasi metadata lagu.
+
+![Discord Player UI](assets/screenshots/discord-player-ui.png)
+
+### 🖥️ Web Control Panel Mandiri (Port 9130)
+Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfigurasi token/server, dan log pembaruan otomatis tanpa perlu akses SSH terminal.
+
+| Desktop Dashboard | Mobile Responsive |
+| :---: | :---: |
+| ![Web Dashboard Desktop](assets/screenshots/web-panel-dashboard.png) | ![Web Dashboard Mobile](assets/screenshots/web-panel-mobile.png) |
 
 ---
 
@@ -50,6 +49,12 @@ Bot musik Discord ultra-ringan, hemat sumber daya (<50MB RAM), dan bebas iklan y
   - **Loop Mode:** Siklus pengulangan 3-arah: *Track* (ulang 1 lagu), *Queue* (ulang seluruh antrian), atau *Off*.
   - **Shuffle:** Mengacak urutan antrian lagu seketika secara acak.
   - **History Backtracking:** Menyimpan riwayat lagu yang baru diputar agar tombol `Back` dapat memutar ulang lagu sebelumnya.
+- **AFK Guard (Auto-Disconnect & Hemat Daya):**
+  - Bot otomatis mendeteksi saat tidak ada pendengar manusia di dalam voice channel.
+  - Memulai timer tunggu (default 3 menit via `AFK_TIMEOUT_SECONDS`), otomatis melanjutkan lagu jika ada user yang masuk kembali, atau mematikan proses FFmpeg dan disconnect voice jika room tetap kosong guna menghemat CPU dan RAM STB.
+- **Persistent Queue (Antrean Tahan Restart):**
+  - Antrean lagu dan track yang sedang berjalan otomatis dicadangkan ke tmpfs (`/run/discord-music/queue_state.json`).
+  - Saat bot di-restart untuk pembaruan mingguan atau server reboot, antrean dipulihkan seketika tanpa kehilangan daftar putar.
 - **Web Control Panel Mandiri & Pemantau Server/Pengguna:**
   - Web dashboard di port `9130` (dibangun murni dengan Python standard library HTTP, aman dengan proteksi CSRF token & nonce).
   - Konfigurasi token bot & ID server Discord langsung dari browser tanpa perlu SSH ke server.
@@ -122,7 +127,7 @@ Skrip installer otomatis:
 2. Menyiapkan Python virtual environment dan menginstal dependensi (`discord.py`, `yt-dlp`).
 3. Memasang service systemd `discord-music.service` dan `discord-music-panel.service`.
 4. Mengaktifkan auto-start saat boot sistem.
-5. Menjalankan verifikasi unit test mandiri (**147/147 passing**).
+5. Menjalankan verifikasi unit test mandiri (**205/205 passing**).
 6. Menyalakan Web Control Panel di port `9130`.
 
 ---
@@ -194,9 +199,13 @@ Saat membuat aplikasi bot di [Discord Developer Portal](https://discord.com/deve
 ├── .env.example                  # Templat variabel lingkungan
 ├── .gitignore
 ├── README.md                     # Dokumentasi proyek
+├── assets/
+│   └── screenshots/              # Cuplikan antarmuka Discord UI & Web Control Panel
 └── tests/
-    ├── test_bot.py               # Unit test core bot, UI View, queue, dan commands
-    └── test_panel.py             # Unit test web panel, update endpoint, keamanan CSRF
+    ├── test_bot.py               # Unit test core bot, UI View, queue, AFK guard, persistent queue
+    ├── test_panel.py             # Unit test web panel, update endpoint, CSRF, validasi DoS & input
+    ├── test_update.py            # Unit test skrip update.sh & timer behaviour
+    └── test_systemd_units.py     # Unit test validasi hardening unit systemd
 ```
 
 ---
@@ -207,12 +216,12 @@ Jalankan rangkaian unit test lengkap:
 
 ```bash
 cd /opt/discord-music-bot
-PYTHONPATH=. ./venv/bin/python -m unittest discover -s tests -v
+PYTHONPATH="" PYTHONHOME="" ./venv/bin/python -m unittest discover -s tests -v
 ```
 
 Hasil uji:
 ```
-Ran 147 tests in 43.1s
+Ran 205 tests in 60.2s
 OK
 ```
 
