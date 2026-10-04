@@ -3,6 +3,7 @@ import hmac
 import html
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -15,6 +16,11 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
+
+MAX_BODY = 65536  # 64 KB limit untuk mencegah DoS large POST body
+GUILD_ID_RE = re.compile(r'^\d{17,20}$')
+MAX_GUILD_INT = (1 << 64) - 1
+DISCORD_TOKEN_RE = re.compile(r'^[A-Za-z0-9_\-]{24,38}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{27,45}$')
 
 SERVICE = 'discord-music.service'
 TIMER = 'discord-music-update.timer'
@@ -669,41 +675,50 @@ class Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
-    def _host_ok(self, host: str) -> bool:
-        """Allowlist Host untuk mencegah DNS-rebinding (S7).
+    MAX_BODY = 65536
 
-        main() mengisi ALLOWED_HOSTS dari host bind + seluruh alamat lokal, jadi
-        proteksi aktif secara default. Daftar kosong hanya terjadi pada harness
-        unit test yang tidak memanggil main().
-        """
+    def _host_ok(self, host: str) -> bool:
+        """Allowlist Host untuk mencegah DNS-rebinding (S7)."""
         if not host:
             return False
-        if not ALLOWED_HOSTS:
-            return True
+
         candidate = host.strip().lower()
-        if candidate in ALLOWED_HOSTS:
-            return True
-        # Bandingkan juga tanpa port (Host pada port default tanpa port eksplisit,
-        # dan IPv6 dalam kurung siku).
         if candidate.startswith('['):
-            hostname = candidate.partition(']')[0] + ']'
-            bare = hostname.strip('[]')
+            if ']' not in candidate:
+                return False
+            hostname, sep, rest = candidate.partition(']')
+            hostname += ']'
+            bare = hostname[1:-1]
+            if rest:
+                if not rest.startswith(':'):
+                    return False
+                port_str = rest[1:]
+                if not port_str.isdigit() or not (1 <= int(port_str) <= 65535):
+                    return False
         else:
-            hostname = candidate.rsplit(':', 1)[0] if ':' in candidate else candidate
-            bare = hostname
-        if hostname in ALLOWED_HOSTS:
+            if ':' in candidate:
+                parts = candidate.split(':')
+                if len(parts) != 2:
+                    return False
+                hostname, port_str = parts
+                if not port_str.isdigit() or not (1 <= int(port_str) <= 65535):
+                    return False
+                bare = hostname
+            else:
+                hostname = candidate
+                bare = hostname
+
+        if not bare:
+            return False
+
+        if candidate in ALLOWED_HOSTS or hostname in ALLOWED_HOSTS:
             return True
 
-        # Terima bila nama/alamat Host memang menunjuk ke mesin ini. Ini membuat
-        # panel tetap bisa diakses lewat IP LAN apa pun tanpa harus mendaftar
-        # manual, sementara nama domain penyerang (DNS-rebinding) tetap ditolak.
         try:
             import ipaddress
-            import socket
             ip = ipaddress.ip_address(bare)
         except ValueError:
-            # bukan literal IP; hanya terima kalau persis salah satu alamat lokal
-            return bare in _local_addresses()
+            return bare in _local_addresses() or bare in {'localhost'}
         except Exception:
             return False
         if ip.is_loopback:
@@ -756,21 +771,23 @@ class Handler(BaseHTTPRequestHandler):
                          origin, host, sec_fetch_site, has_valid_nonce)
         return False
 
-    MAX_BODY = 8192
-
     def _drain_body(self, length: int) -> None:
-        """Buang sisa body yang belum dibaca.
-
-        Menutup socket dengan data masuk yang belum dibaca memicu TCP RST pada
-        banyak stack, sehingga respons 413 tidak sampai ke klien. Batasi jumlah
-        yang dikuras agar klien nakal tidak bisa memaksa kita membaca tanpa henti.
-        """
-        remaining = min(length, self.MAX_BODY * 4)
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 4096))
-            if not chunk:
-                break
-            remaining -= len(chunk)
+        """Kuras sisa body yang belum dibaca dengan timeout singkat agar thread tidak tertahan."""
+        try:
+            self.connection.settimeout(0.5)
+            remaining = min(length, self.MAX_BODY)
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 4096))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.connection.settimeout(self.timeout)
+            except Exception:
+                pass
 
     def _body(self) -> Optional[dict]:
         """Baca body form. Return None bila request sudah ditolak (413)."""
@@ -781,10 +798,10 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0:
             return {}
         if length > self.MAX_BODY:
-            # Kirim 413 lalu kuras sisa body supaya respons benar-benar terkirim
-            # dan koneksi ditutup dengan bersih.
+            self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, 'Body terlalu besar',
+                       extra={'Connection': 'close'})
+            self.close_connection = True
             self._drain_body(length)
-            self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, 'Body terlalu besar')
             return None
         raw = self.rfile.read(length).decode('utf-8', 'replace')
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
@@ -867,6 +884,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/login':
             # CSRF ditegakkan untuk /login juga: tanpa ini, situs mana pun bisa
             # membakar kuota rate-limit milik IP korban (S4).
+            if not PASSWORD:
+                return self._login_page('PANEL_PASSWORD belum dikonfigurasi di environment.',
+                                        HTTPStatus.FORBIDDEN)
             fields = self._body()
             if fields is None:
                 return  # 413 sudah dikirim oleh _body()
@@ -877,11 +897,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._login(fields)
         if path not in ('/save', '/start', '/restart', '/stop', '/update'):
             return self._send(HTTPStatus.NOT_FOUND, 'Tidak ditemukan')
-        if not self._authenticated():
-            return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
         fields = self._body()
         if fields is None:
             return  # 413 sudah dikirim; jangan jalankan aksi
+        if not PASSWORD:
+            return self._page('Akses modifikasi ditolak: PANEL_PASSWORD belum dikonfigurasi.',
+                              HTTPStatus.FORBIDDEN)
+        if not self._authenticated():
+            return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
         if not self._origin_ok(fields):
             return self._json(HTTPStatus.FORBIDDEN, {'error': 'origin'})
         if path == '/save':
@@ -920,6 +943,8 @@ class Handler(BaseHTTPRequestHandler):
                 if _flash_msg:
                     message = _flash_msg
                     _flash_msg = ''
+            if not message and not PASSWORD:
+                message = 'PERINGATAN: PANEL_PASSWORD belum dikonfigurasi. Panel dalam mode baca-saja; semua aksi modifikasi dinonaktifkan.'
         banner = f'<div class="msg">{html.escape(message)}</div>' if message else ''
         now = time.monotonic()
         with _lock:
@@ -1016,12 +1041,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def _save(self, fields):
         current = store().read()
-        token = fields.get('token', '').strip() or current['token']
+        raw_token = fields.get('token', '').strip()
         guild = fields.get('guild', '').strip()
-        if guild and not guild.isdigit():
-            return self._page('Guild ID harus berupa angka.', HTTPStatus.BAD_REQUEST)
-        if token and len(token) > 200:
-            return self._page('Token terlalu panjang.', HTTPStatus.BAD_REQUEST)
+
+        if raw_token:
+            if len(raw_token) > 200 or not DISCORD_TOKEN_RE.match(raw_token):
+                return self._page('Format Token Discord tidak valid.', HTTPStatus.BAD_REQUEST)
+            token = raw_token
+        else:
+            token = current['token']
+
+        if guild:
+            if not GUILD_ID_RE.match(guild):
+                return self._page('Guild ID harus berupa 17-20 digit angka.', HTTPStatus.BAD_REQUEST)
+            try:
+                guild_val = int(guild)
+                if not (0 < guild_val <= MAX_GUILD_INT):
+                    raise ValueError()
+            except ValueError:
+                return self._page('Guild ID di luar batas integer yang diizinkan.', HTTPStatus.BAD_REQUEST)
+
         try:
             store().write({'token': token, 'guild': guild})
         except ValueError as exc:

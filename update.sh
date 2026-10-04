@@ -82,7 +82,7 @@ if [ -n "$AFTER" ] && [ -f "$PIN" ]; then
 fi
 
 # Hapus cache yt-dlp agar extractor baru tidak memakai cache lama yang rusak.
-for cache in "${XDG_CACHE_HOME:-/run/discord-music}/yt-dlp" "$HOME/.cache/yt-dlp" /tmp/yt-dlp; do
+for cache in "${XDG_CACHE_HOME:-/run/discord-music}/yt-dlp" "${HOME:-/root}/.cache/yt-dlp" /tmp/yt-dlp; do
     [ -d "$cache" ] && rm -rf "$cache" 2>/dev/null || true
 done
 

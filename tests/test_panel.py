@@ -130,12 +130,14 @@ class PanelTests(unittest.TestCase):
 
     def test_save_persists_and_never_echoes_token(self):
         cookie = self.login()
-        status, body, _ = self.req('POST', '/save', 'token=abc123def&guild=999', cookie=cookie)
+        valid_token = 'MTAwMDAwMDAwMDAwMDAwMDAw.G12345.abcdefghijklmnopqrstuvwxyz0123456789'
+        valid_guild = '123456789012345678'
+        status, body, _ = self.req('POST', '/save', f'token={valid_token}&guild={valid_guild}', cookie=cookie)
         self.assertEqual(status, 303)
-        self.assertNotIn('abc123def', body)
+        self.assertNotIn(valid_token, body)
         saved = self.cfg.read()
-        self.assertEqual(saved['token'], 'abc123def')
-        self.assertEqual(saved['guild'], '999')
+        self.assertEqual(saved['token'], valid_token)
+        self.assertEqual(saved['guild'], valid_guild)
         if os.name == 'posix':
             mode = stat.S_IMODE(os.stat(self.env).st_mode)
             self.assertEqual(mode, 0o600)
@@ -477,7 +479,11 @@ class HostAllowlistTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         panel.STORE = panel.ConfigStore(os.path.join(self.tmp.name, '.env'))
-        panel.PASSWORD = ''
+        panel.PASSWORD = 'host-test'
+        self.valid_token = 'MTAwMDAwMDAwMDAwMDAwMDAw.G12345.abcdefghijklmnopqrstuvwxyz0123456789'
+        self.valid_guild = '123456789012345678'
+        self.session_token = panel._mint_session()
+        self.cookie = f'{panel.COOKIE}={self.session_token}'
         self._saved_hosts = set(panel.ALLOWED_HOSTS)
         self.server = panel.build_server('127.0.0.1', 0)
         self.port = self.server.server_address[1]
@@ -491,6 +497,8 @@ class HostAllowlistTests(unittest.TestCase):
     def req(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
         hdrs = dict(headers or {})
+        if 'Cookie' not in hdrs and getattr(self, 'cookie', None):
+            hdrs['Cookie'] = self.cookie
         if body is not None:
             hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
         conn.request(method, path, body=body, headers=hdrs)
@@ -501,14 +509,14 @@ class HostAllowlistTests(unittest.TestCase):
 
     def test_foreign_host_with_matching_origin_is_rejected(self):
         """DNS-rebinding: Host & Origin palsu yang konsisten tetap ditolak."""
-        status, _ = self.req('POST', '/save', 'token=abc&guild=7',
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}',
                              headers={'Host': 'evil.example:9130',
                                       'Origin': 'http://evil.example:9130'})
         self.assertEqual(status, 403)
         self.assertEqual(panel.ConfigStore(panel.STORE.path).read()['token'], '')
 
     def test_allowed_host_passes_origin_check(self):
-        status, _ = self.req('POST', '/save', 'token=abc&guild=7',
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}',
                              headers={'Origin': f'http://127.0.0.1:{self.port}'})
         self.assertEqual(status, 303)
 
@@ -524,7 +532,7 @@ class HostAllowlistTests(unittest.TestCase):
 
     def test_allowed_host_get_passes(self):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
-        conn.request('GET', '/', headers={'Host': f'127.0.0.1:{self.port}'})
+        conn.request('GET', '/', headers={'Host': f'127.0.0.1:{self.port}', 'Cookie': self.cookie})
         res = conn.getresponse()
         res.read()
         conn.close()
@@ -533,7 +541,7 @@ class HostAllowlistTests(unittest.TestCase):
     def test_loopback_host_variants_accepted(self):
         """IP loopback apa pun (127.0.0.0/8) tetap diterima."""
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
-        conn.request('GET', '/', headers={'Host': '127.0.0.5:9130'})
+        conn.request('GET', '/', headers={'Host': '127.0.0.5:9130', 'Cookie': self.cookie})
         res = conn.getresponse()
         res.read()
         conn.close()
@@ -636,7 +644,9 @@ class RobustnessTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.env = os.path.join(self.tmp.name, '.env')
         panel.STORE = panel.ConfigStore(self.env)
-        panel.PASSWORD = ''
+        panel.PASSWORD = 'robust-test'
+        self.session_token = panel._mint_session()
+        self.cookie = f'{panel.COOKIE}={self.session_token}'
         self.server = panel.build_server('127.0.0.1', 0)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -656,11 +666,12 @@ class RobustnessTests(unittest.TestCase):
 
     def test_oversized_body_is_rejected_413(self):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
-        payload = 'a' * 9000
+        payload = 'a' * 70000
         conn.request('POST', '/save', body=payload,
                      headers={'Content-Type': 'application/x-www-form-urlencoded',
                               'Host': f'127.0.0.1:{self.port}',
-                              'Origin': f'http://127.0.0.1:{self.port}'})
+                              'Origin': f'http://127.0.0.1:{self.port}',
+                              'Cookie': self.cookie})
         res = conn.getresponse()
         res.read()
         conn.close()
@@ -668,17 +679,20 @@ class RobustnessTests(unittest.TestCase):
 
     def test_oversized_body_does_not_execute_action(self):
         """413 harus membatalkan aksi; .env tidak boleh berubah (M1)."""
-        panel.ConfigStore(self.env).write({'token': 'original', 'guild': '9'})
+        valid_tok = 'MTAwMDAwMDAwMDAwMDAwMDAw.G12345.abcdefghijklmnopqrstuvwxyz0123456789'
+        valid_g = '123456789012345678'
+        panel.ConfigStore(self.env).write({'token': valid_tok, 'guild': valid_g})
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
-        conn.request('POST', '/save', body='token=HIJACK&guild=1' + 'x' * 9000,
+        conn.request('POST', '/save', body='token=HIJACK&guild=1' + 'x' * 70000,
                      headers={'Content-Type': 'application/x-www-form-urlencoded',
                               'Host': f'127.0.0.1:{self.port}',
-                              'Origin': f'http://127.0.0.1:{self.port}'})
+                              'Origin': f'http://127.0.0.1:{self.port}',
+                              'Cookie': self.cookie})
         res = conn.getresponse()
         res.read()
         conn.close()
         self.assertEqual(res.status, 413)
-        self.assertEqual(panel.ConfigStore(self.env).read()['token'], 'original')
+        self.assertEqual(panel.ConfigStore(self.env).read()['token'], valid_tok)
 
     def test_login_outside_allowlisted_host_is_rejected(self):
         """POST /login juga harus melewati cek origin (S4)."""
@@ -699,7 +713,8 @@ class RobustnessTests(unittest.TestCase):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=15)
         conn.request('POST', '/stop', body='',
                      headers={'Content-Type': 'application/x-www-form-urlencoded',
-                              'Origin': origin})
+                              'Origin': origin,
+                              'Cookie': self.cookie})
         res = conn.getresponse()
         body = res.read().decode('utf-8', 'replace')
         conn.close()
@@ -708,7 +723,7 @@ class RobustnessTests(unittest.TestCase):
 
 
 class PasswordlessTests(unittest.TestCase):
-    """PANEL_PASSWORD kosong = panel terbuka, tapi CSRF tetap berlaku."""
+    """PANEL_PASSWORD kosong: mode baca-saja, semua aksi modifikasi (POST) ditolak (403)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -727,6 +742,8 @@ class PasswordlessTests(unittest.TestCase):
         hdrs = dict(headers or {})
         if body is not None:
             hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
+            if 'Origin' not in hdrs:
+                hdrs['Origin'] = f'http://127.0.0.1:{self.port}'
         conn.request(method, path, body=body, headers=hdrs)
         res = conn.getresponse()
         payload = res.read().decode('utf-8', 'replace')
@@ -737,6 +754,7 @@ class PasswordlessTests(unittest.TestCase):
         status, body = self.req('GET', '/')
         self.assertEqual(status, 200)
         self.assertIn('Panel Bot Musik', body)
+        self.assertIn('mode baca-saja', body)
 
     def test_api_status_opens_without_login(self):
         status, body = self.req('GET', '/api/status')
@@ -748,104 +766,24 @@ class PasswordlessTests(unittest.TestCase):
                              headers={'Origin': 'http://evil.example'})
         self.assertEqual(status, 403)
 
-    def test_same_origin_save_works_without_login(self):
-        origin = f'http://127.0.0.1:{self.port}'
-        status, _ = self.req('POST', '/save', 'token=abc&guild=7',
-                             headers={'Origin': origin})
-        self.assertEqual(status, 303)
-        self.assertEqual(panel.ConfigStore(self.env).read()['token'], 'abc')
-
-    def test_start_without_token_is_rejected(self):
-        origin = f'http://127.0.0.1:{self.port}'
-        status, _ = self.req('POST', '/start', '', headers={'Origin': origin})
-        self.assertEqual(status, 400)
-
-    def test_post_redirect_get_no_resubmit_on_refresh(self):
-        # Klik tombol lalu GET ulang: tidak ada POST ulang, tidak ada 405/409.
-        # Lalu refresh berkali-kali tetap GET 200 tanpa warning resubmit browser.
-        origin = f'http://127.0.0.1:{self.port}'
-        self.req('POST', '/save', 'token=abc&guild=7', headers={'Origin': origin})
-        status, body = self.req('GET', '/')
-        self.assertEqual(status, 200)
-        self.assertIn('Konfigurasi disimpan.', body)
-        # Flash sekali tampil: refresh berikutnya bersih, tanpa warning POST.
-        status, body = self.req('GET', '/')
-        self.assertEqual(status, 200)
-        self.assertNotIn('Konfigurasi disimpan.', body)
-
-    def test_passwordless_update_executes(self):
-        origin = f'http://127.0.0.1:{self.port}'
-        panel.UPDATE_RUNNER = lambda: (True, '[Mock] Update OK')
-        self.addCleanup(setattr, panel, 'UPDATE_RUNNER', _no_update)
-        status, body = self.req('POST', '/update', '', headers={'Origin': origin})
-        # PRG: POST redirect 303, pesan via flash di GET berikutnya.
-        self.assertEqual(status, 303)
-        status, body = self.req('GET', '/')
-        self.assertEqual(status, 200)
-        self.assertIn('Pembaruan yt-dlp berhasil dijalankan', body)
-        self.assertIn('[Mock] Update OK', body)
-
-    def test_browser_form_without_origin_uses_page_nonce(self):
-        status, page = self.req('GET', '/')
-        self.assertEqual(status, 200)
-        match = re.search(r'name="form_token" value="([^"]+)"', page)
-        if match is None:
-            self.fail('Form token tidak muncul di panel')
-        token = match.group(1)
-        status, _ = self.req('POST', '/save', f'token=abc&guild=7&form_token={token}')
-        self.assertEqual(status, 303)
-        self.assertEqual(panel.ConfigStore(self.env).read()['token'], 'abc')
-
-    def test_no_origin_start_with_page_nonce_reaches_validation(self):
-        _, page = self.req('GET', '/')
-        match = re.search(r'name="form_token" value="([^"]+)"', page)
-        if match is None:
-            self.fail('Form token tidak muncul di panel')
-        status, body = self.req('POST', '/start', f'form_token={match.group(1)}')
-        self.assertEqual(status, 400)
-        self.assertIn('Token Discord belum diisi', body)
-
-    def test_no_origin_without_page_nonce_stays_rejected(self):
-        status, _ = self.req('POST', '/save', 'token=abc&guild=7')
+    def test_same_origin_save_rejected_when_passwordless(self):
+        status, body = self.req('POST', '/save', 'token=abc&guild=7')
         self.assertEqual(status, 403)
-
-    def test_origin_null_with_page_nonce_is_accepted(self):
-        _, page = self.req('GET', '/')
-        match = re.search(r'name="form_token" value="([^"]+)"', page)
-        if match is None:
-            self.fail('Form token tidak muncul di panel')
-        token = match.group(1)
-        status, _ = self.req('POST', '/save', f'token=abc&guild=7&form_token={token}',
-                             headers={'Origin': 'null'})
-        self.assertEqual(status, 303)
-        self.assertEqual(panel.ConfigStore(self.env).read()['token'], 'abc')
-
-    def test_origin_null_without_nonce_is_rejected(self):
-        status, _ = self.req('POST', '/save', 'token=abc&guild=7',
-                             headers={'Origin': 'null'})
-        self.assertEqual(status, 403)
-
-    def test_cross_site_fetch_site_with_page_nonce_is_rejected(self):
-        _, page = self.req('GET', '/')
-        match = re.search(r'name="form_token" value="([^"]+)"', page)
-        if match is None:
-            self.fail('Form token tidak muncul di panel')
-        token = match.group(1)
-        status, _ = self.req('POST', '/save', f'token=abc&guild=7&form_token={token}',
-                             headers={'Sec-Fetch-Site': 'cross-site'})
-        # Sec-Fetch-Site: cross-site ditolak tanpa syarat; nonce bukan pengganti
-        # sinyal eksplisit dari browser.
-        self.assertEqual(status, 403)
+        self.assertIn('Akses modifikasi ditolak', body)
         self.assertEqual(panel.ConfigStore(self.env).read()['token'], '')
 
-    def test_foreign_origin_rejected_even_with_nonce(self):
-        _, page = self.req('GET', '/')
-        match = re.search(r'name="form_token" value="([^"]+)"', page)
-        if match is None:
-            self.fail('Form token tidak muncul di panel')
-        token = match.group(1)
-        status, _ = self.req('POST', '/save', f'token=abc&guild=7&form_token={token}',
-                             headers={'Origin': 'http://evil.example'})
+    def test_start_rejected_when_passwordless(self):
+        status, body = self.req('POST', '/start', '')
+        self.assertEqual(status, 403)
+        self.assertIn('Akses modifikasi ditolak', body)
+
+    def test_update_rejected_when_passwordless(self):
+        status, body = self.req('POST', '/update', '')
+        self.assertEqual(status, 403)
+        self.assertIn('Akses modifikasi ditolak', body)
+
+    def test_login_post_rejected_when_passwordless(self):
+        status, _ = self.req('POST', '/login', 'password=apapun')
         self.assertEqual(status, 403)
 
     def test_login_page_redirects_home_when_passwordless(self):
@@ -857,6 +795,112 @@ class PasswordlessTests(unittest.TestCase):
         conn.close()
         self.assertEqual(res.status, 303)
         self.assertEqual(location, '/')
+
+
+class CsrfAndNonceTests(unittest.TestCase):
+    """Pengujian proteksi CSRF, nonce form, dan PRG (Post-Redirect-Get)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = os.path.join(self.tmp.name, '.env')
+        self.cfg = panel.ConfigStore(self.env)
+        panel.STORE = self.cfg
+        panel.PASSWORD = 'rahasia-csrf'
+        self.valid_token = 'MTAwMDAwMDAwMDAwMDAwMDAw.G12345.abcdefghijklmnopqrstuvwxyz0123456789'
+        self.valid_guild = '123456789012345678'
+        self.server = panel.build_server('127.0.0.1', 0)
+        self.port = self.server.server_address[1]
+        self.cookie = f'{panel.COOKIE}={panel._mint_session()}'
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.tmp.cleanup)
+
+    def req(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        hdrs = dict(headers or {})
+        if 'Cookie' not in hdrs:
+            hdrs['Cookie'] = self.cookie
+        if body is not None:
+            hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
+        conn.request(method, path, body=body, headers=hdrs)
+        res = conn.getresponse()
+        payload = res.read().decode('utf-8', 'replace')
+        conn.close()
+        return res.status, payload
+
+    def test_post_redirect_get_no_resubmit_on_refresh(self):
+        origin = f'http://127.0.0.1:{self.port}'
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}', headers={'Origin': origin})
+        self.assertEqual(status, 303)
+        status, body = self.req('GET', '/')
+        self.assertEqual(status, 200)
+        self.assertIn('Konfigurasi disimpan.', body)
+        status, body = self.req('GET', '/')
+        self.assertEqual(status, 200)
+        self.assertNotIn('Konfigurasi disimpan.', body)
+
+    def test_browser_form_without_origin_uses_page_nonce(self):
+        status, page = self.req('GET', '/')
+        self.assertEqual(status, 200)
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        token = match.group(1)
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}&form_token={token}')
+        self.assertEqual(status, 303)
+        self.assertEqual(panel.ConfigStore(self.env).read()['token'], self.valid_token)
+
+    def test_no_origin_start_with_page_nonce_reaches_validation(self):
+        self.cfg.write({'token': '', 'guild': ''})
+        _, page = self.req('GET', '/')
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        status, body = self.req('POST', '/start', f'form_token={match.group(1)}')
+        self.assertEqual(status, 400)
+        self.assertIn('Token Discord belum diisi', body)
+
+    def test_no_origin_without_page_nonce_stays_rejected(self):
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}')
+        self.assertEqual(status, 403)
+
+    def test_origin_null_with_page_nonce_is_accepted(self):
+        _, page = self.req('GET', '/')
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        token = match.group(1)
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}&form_token={token}',
+                             headers={'Origin': 'null'})
+        self.assertEqual(status, 303)
+        self.assertEqual(panel.ConfigStore(self.env).read()['token'], self.valid_token)
+
+    def test_origin_null_without_nonce_is_rejected(self):
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}',
+                             headers={'Origin': 'null'})
+        self.assertEqual(status, 403)
+
+    def test_cross_site_fetch_site_with_page_nonce_is_rejected(self):
+        _, page = self.req('GET', '/')
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        token = match.group(1)
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}&form_token={token}',
+                             headers={'Sec-Fetch-Site': 'cross-site'})
+        self.assertEqual(status, 403)
+        self.assertEqual(panel.ConfigStore(self.env).read()['token'], '')
+
+    def test_foreign_origin_rejected_even_with_nonce(self):
+        _, page = self.req('GET', '/')
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        if match is None:
+            self.fail('Form token tidak muncul di panel')
+        token = match.group(1)
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}&form_token={token}',
+                             headers={'Origin': 'http://evil.example'})
+        self.assertEqual(status, 403)
 
 
 class ShutdownTests(unittest.TestCase):
@@ -956,7 +1000,8 @@ class NoRealSystemdTests(unittest.TestCase):
             env = os.path.join(tmp.name, '.env')
             panel.STORE = panel.ConfigStore(env)
             panel.ConfigStore(env).write({'token': 'tok', 'guild': '1'})
-            panel.PASSWORD = ''
+            panel.PASSWORD = 'no-real-test'
+            cookie = f'{panel.COOKIE}={panel._mint_session()}'
             saved_hosts = set(panel.ALLOWED_HOSTS)
             self.addCleanup(setattr, panel, 'ALLOWED_HOSTS', saved_hosts)
 
@@ -970,12 +1015,176 @@ class NoRealSystemdTests(unittest.TestCase):
             conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
             conn.request('POST', '/stop', body='',
                          headers={'Content-Type': 'application/x-www-form-urlencoded',
-                                  'Origin': f'http://127.0.0.1:{port}'})
+                                  'Origin': f'http://127.0.0.1:{port}',
+                                  'Cookie': cookie})
             res = conn.getresponse()
             res.read()
             conn.close()
         self.assertEqual(calls, ['stop'], 'hook SERVICE_RUNNER tidak dipakai')
         self.assertEqual(res.status, 303)
+
+
+class SecurityAuditValidationTests(unittest.TestCase):
+    """Unit test untuk temuan audit t_824f34ce:
+    1. DoS large POST body (>64KB -> 413, socket drain bersih).
+    2. Validasi Guild ID (regex ^\d{17,20}$, batas 64-bit int, proteksi DoS digit integer).
+    3. Validasi Token Discord (regex format, cegah string rusak tersimpan).
+    4. Host header check (parsing port secara benar, tolak 127.0.0.1:evil.com).
+    5. Empty PANEL_PASSWORD (tolak seluruh aksi modifikasi POST dengan 403).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = os.path.join(self.tmp.name, '.env')
+        self.cfg = panel.ConfigStore(self.env)
+        panel.STORE = self.cfg
+        panel.PASSWORD = 'audit-pass'
+        self.server = panel.build_server('127.0.0.1', 0)
+        self.port = self.server.server_address[1]
+        self.session_token = panel._mint_session()
+        self.cookie = f'{panel.COOKIE}={self.session_token}'
+        self.valid_token = 'MTAwMDAwMDAwMDAwMDAwMDAw.G12345.abcdefghijklmnopqrstuvwxyz0123456789'
+        self.valid_guild = '123456789012345678'
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.tmp.cleanup)
+
+    def req(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        hdrs = dict(headers or {})
+        if 'Cookie' not in hdrs:
+            hdrs['Cookie'] = self.cookie
+        if body is not None:
+            hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
+            if 'Origin' not in hdrs:
+                hdrs['Origin'] = f'http://127.0.0.1:{self.port}'
+        conn.request(method, path, body=body, headers=hdrs)
+        res = conn.getresponse()
+        payload = res.read().decode('utf-8', 'replace')
+        conn.close()
+        return res.status, payload
+
+    # 1. DoS large POST body
+    def test_body_over_64kb_rejected_with_413(self):
+        payload = 'a' * 65537
+        status, _ = self.req('POST', '/save', body=payload)
+        self.assertEqual(status, 413)
+
+    def test_body_under_64kb_not_rejected_with_413(self):
+        payload = f'token={self.valid_token}&guild={self.valid_guild}'
+        status, _ = self.req('POST', '/save', body=payload)
+        self.assertEqual(status, 303)
+
+    # 2. Validasi Guild ID
+    def test_guild_id_rejects_non_numeric(self):
+        status, body = self.req('POST', '/save', f'token={self.valid_token}&guild=notanumber')
+        self.assertEqual(status, 400)
+        self.assertIn('Guild ID harus berupa 17-20 digit angka', body)
+
+    def test_guild_id_rejects_under_17_digits(self):
+        status, body = self.req('POST', '/save', f'token={self.valid_token}&guild=1234567890123456')
+        self.assertEqual(status, 400)
+        self.assertIn('Guild ID harus berupa 17-20 digit angka', body)
+
+    def test_guild_id_rejects_over_20_digits(self):
+        status, body = self.req('POST', '/save', f'token={self.valid_token}&guild=123456789012345678901')
+        self.assertEqual(status, 400)
+        self.assertIn('Guild ID harus berupa 17-20 digit angka', body)
+
+    def test_guild_id_cve_2020_10735_large_digits_blocked_by_regex(self):
+        huge_guild = '9' * 4500
+        status, body = self.req('POST', '/save', f'token={self.valid_token}&guild={huge_guild}')
+        self.assertEqual(status, 400)
+        self.assertIn('Guild ID harus berupa 17-20 digit angka', body)
+
+    def test_guild_id_rejects_out_of_64bit_range(self):
+        huge_snowflake = '99999999999999999999'
+        status, body = self.req('POST', '/save', f'token={self.valid_token}&guild={huge_snowflake}')
+        self.assertEqual(status, 400)
+        self.assertIn('Guild ID di luar batas integer', body)
+
+    def test_guild_id_valid_snowflakes_accepted(self):
+        for snowflake in ('12345678901234567', '123456789012345678', '18446744073709551615'):
+            status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={snowflake}')
+            self.assertEqual(status, 303)
+            self.assertEqual(self.cfg.read()['guild'], snowflake)
+
+    def test_guild_id_empty_allowed(self):
+        status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild=')
+        self.assertEqual(status, 303)
+        self.assertEqual(self.cfg.read()['guild'], '')
+
+    # 3. Validasi Token Discord
+    def test_discord_token_rejects_arbitrary_string(self):
+        status, body = self.req('POST', '/save', f'token=not_a_discord_token&guild={self.valid_guild}')
+        self.assertEqual(status, 400)
+        self.assertIn('Format Token Discord tidak valid', body)
+
+    def test_discord_token_rejects_missing_dots(self):
+        status, body = self.req('POST', '/save', f'token=MTAwMDAwMDAwMDAwMDAwMDAwG12345abcdefghijklmnopqrstuvwxyz0123456789&guild={self.valid_guild}')
+        self.assertEqual(status, 400)
+        self.assertIn('Format Token Discord tidak valid', body)
+
+    def test_discord_token_rejects_invalid_characters(self):
+        bad_token = 'MTAwMDAwMDAwMDAwMDAwMDAw.G12345.abc!@#$%^&*()_+'
+        status, body = self.req('POST', '/save', f'token={bad_token}&guild={self.valid_guild}')
+        self.assertEqual(status, 400)
+        self.assertIn('Format Token Discord tidak valid', body)
+
+    def test_discord_token_preserves_current_when_empty_in_form(self):
+        self.cfg.write({'token': self.valid_token, 'guild': self.valid_guild})
+        new_guild = '987654321098765432'
+        status, _ = self.req('POST', '/save', f'token=&guild={new_guild}')
+        self.assertEqual(status, 303)
+        saved = self.cfg.read()
+        self.assertEqual(saved['token'], self.valid_token)
+        self.assertEqual(saved['guild'], new_guild)
+
+    # 4. Host header check
+    def test_host_header_rejects_malformed_port(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        conn.request('GET', '/', headers={'Host': '127.0.0.1:evil.com'})
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        self.assertEqual(res.status, 403)
+
+    def test_host_header_rejects_port_out_of_range(self):
+        for bad_port in ('0', '70000', 'abc'):
+            conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+            conn.request('GET', '/', headers={'Host': f'127.0.0.1:{bad_port}'})
+            res = conn.getresponse()
+            res.read()
+            conn.close()
+            self.assertEqual(res.status, 403)
+
+    def test_host_header_rejects_multiple_colons(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        conn.request('GET', '/', headers={'Host': '127.0.0.1:9130:extra'})
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        self.assertEqual(res.status, 403)
+
+    # 5. Empty PANEL_PASSWORD privilege escalation prevention
+    def test_empty_password_blocks_modifications(self):
+        panel.PASSWORD = ''
+        try:
+            origin = f'http://127.0.0.1:{self.port}'
+            endpoints = [
+                ('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}'),
+                ('POST', '/start', ''),
+                ('POST', '/restart', ''),
+                ('POST', '/stop', ''),
+                ('POST', '/update', ''),
+            ]
+            for method, endpoint, body in endpoints:
+                status, resp = self.req(method, endpoint, body=body, headers={'Origin': origin})
+                self.assertEqual(status, 403, f'{method} {endpoint} harus ditolak 403 saat PASSWORD kosong')
+                self.assertIn('Akses modifikasi ditolak', resp)
+        finally:
+            panel.PASSWORD = 'audit-pass'
 
 
 if __name__ == '__main__':

@@ -53,10 +53,14 @@ class QueueState:
     message: discord.Message | None = None
     now_message: discord.Message | None = None
     _skip_armed: bool = False  # skip/back manual: after() basi, advance manual yang jalan
+    consecutive_playback_errors: int = 0
     idle_task: asyncio.Task | None = None
     empty_task: asyncio.Task | None = None
     refresh_task: asyncio.Task | None = None
     announce_task: asyncio.Task | None = None
+    _advance_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _last_skip_time: float = 0.0
+    _last_pause_time: float = 0.0
 
 
 # Batas konkurensi ekstraksi yt-dlp agar STB RAM kecil tidak OOM (C4/M3).
@@ -126,7 +130,6 @@ METADATA_OPTIONS = {
     'format': 'bestaudio/best',
     'quiet': True,
     'extract_flat': 'in_playlist',
-    'ignoreerrors': True,
     'skip_download': True,
     'socket_timeout': 15,
     'retries': 3,
@@ -266,12 +269,32 @@ def clear_cache() -> None:
 
 
 def extract_stream(url: str) -> dict:
-    with yt_dlp.YoutubeDL(_with_cookies(STREAM_OPTIONS)) as ydl:
-        data = ydl.extract_info(url, download=False)
+    max_attempts = 2
+    data = None
+    for attempt in range(max_attempts):
+        try:
+            with yt_dlp.YoutubeDL(_with_cookies(STREAM_OPTIONS)) as ydl:
+                data = ydl.extract_info(url, download=False)
+            break
+        except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
+            msg = str(exc)
+            msg_lower = msg.lower()
+            if '429' in msg_lower or 'too many requests' in msg_lower:
+                if attempt < max_attempts - 1:
+                    log.warning('Rate limit 429 pada extract_stream, retry setelah jeda 2s: %s', url)
+                    time.sleep(2.0)
+                    continue
+                raise ValueError('YouTube sedang membatasi permintaan bot (Rate Limit 429). Mohon tunggu beberapa saat.') from exc
+            if any(k in msg_lower for k in ('confirm your age', 'age-restricted', 'age restricted')):
+                raise ValueError('Video terkena batasan usia YouTube (age-restricted). Butuh cookies.txt untuk memutar (simpan di direktori bot atau set YTDLP_COOKIES).') from exc
+            raise
+
     if data and 'entries' in data:
         data = next((entry for entry in data['entries'] if entry), None)
     if not data or not data.get('url'):
         raise ValueError('Stream audio tidak tersedia.')
+    if data.get('is_live') or data.get('live_status') == 'is_live':
+        raise ValueError('Video siaran langsung (livestream) tidak didukung oleh pemutar audio statis.')
     return data
 
 
@@ -285,17 +308,48 @@ def _fetch_metadata(target: str) -> dict:
 
 async def extract_tracks(query: str, requester: str) -> list[Track]:
     target = checked_query(query)
-    async with EXTRACT_SEM:
-        data = await asyncio.wait_for(asyncio.to_thread(_fetch_metadata, target), timeout=60)
+    data = None
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        try:
+            async with EXTRACT_SEM:
+                data = await asyncio.wait_for(asyncio.to_thread(_fetch_metadata, target), timeout=60)
+            break
+        except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
+            msg = str(exc)
+            msg_lower = msg.lower()
+            if '429' in msg_lower or 'too many requests' in msg_lower:
+                # ponytail: batasi retry 429 ke 1x backoff 2s; jika butuh distributed IP rotation, gunakan proxy pool
+                if attempt < max_attempts - 1:
+                    log.warning('YouTube HTTP 429 rate limit saat ekstraksi metadata, backoff 2s (percobaan %d/%d): %s', attempt + 1, max_attempts, target)
+                    await asyncio.sleep(2.0)
+                    continue
+                raise ValueError('YouTube sedang membatasi permintaan bot (Rate Limit 429). Mohon tunggu beberapa saat.') from exc
+            if any(k in msg_lower for k in ('confirm your age', 'age-restricted', 'age restricted')):
+                raise ValueError('Video terkena batasan usia YouTube (age-restricted). Butuh cookies.txt untuk memutar (simpan di direktori bot atau set YTDLP_COOKIES).') from exc
+            if any(k in msg_lower for k in ('private video', 'video unavailable', 'is unavailable', 'not found')):
+                raise ValueError('Lagu tidak tersedia (video privat atau telah dihapus).') from exc
+            raise ValueError(f'Gagal mengekstrak lagu: {msg}') from exc
+
     if not data:
         raise ValueError('Lagu atau playlist tidak ditemukan.')
 
+    if data.get('is_live') or data.get('live_status') == 'is_live':
+        raise ValueError('Video siaran langsung (livestream) tidak didukung oleh pemutar audio statis.')
+
     tracks: list[Track] = []
     if 'entries' in data:
+        live_skipped = 0
         for entry in data.get('entries') or []:
             if not entry:
                 continue
-            title = entry.get('title') or 'Tanpa judul'
+            if entry.get('is_live') or entry.get('live_status') == 'is_live':
+                live_skipped += 1
+                continue
+            title = (entry.get('title') or '').strip()
+            # ponytail: saring video private/deleted/unavailable agar tidak mengisi antrean dengan track mati
+            if not title or title in ('[Private video]', '[Deleted video]', '[Unavailable video]'):
+                continue
             url = entry.get('url') or entry.get('webpage_url')
             if not url or not url.startswith('http'):
                 vid_id = entry.get('id') or url
@@ -305,8 +359,12 @@ async def extract_tracks(query: str, requester: str) -> list[Track]:
             tracks.append(Track(title, url, requester, duration=dur, duration_str=format_duration(dur), author=author))
             if len(tracks) >= 100:
                 break
+        if not tracks and live_skipped > 0:
+            raise ValueError('Video siaran langsung (livestream) tidak didukung oleh pemutar audio statis.')
     else:
-        title = data.get('title') or 'Tanpa judul'
+        title = (data.get('title') or '').strip()
+        if not title or title in ('[Private video]', '[Deleted video]', '[Unavailable video]'):
+            raise ValueError('Lagu tidak tersedia (video privat atau telah dihapus).')
         url = data.get('webpage_url') or data.get('url') or target
         dur = data.get('duration') or 0
         author = data.get('uploader') or data.get('channel') or data.get('artist') or 'Unknown'
@@ -332,6 +390,7 @@ class BufferedAudioSource(discord.AudioSource):
         self._cleaned = False
         self._current_error: Exception | None = None
         self._misses = 0
+        self._consecutive_hits = 0
         self._stall_deadline: float | None = None
         self.worker = threading.Thread(target=self._reader, daemon=True)
         self.worker.start()
@@ -368,14 +427,22 @@ class BufferedAudioSource(discord.AudioSource):
     def read(self) -> bytes:
         if not self.ready_event.is_set():
             self.ready_event.wait(timeout=2.0)
+            self.ready_event.set()
         if self.stop_event.is_set():
+            return b''
+        now = time.monotonic()
+        if self._stall_deadline is not None and now >= self._stall_deadline:
             return b''
         try:
             data = self.queue.get(timeout=0.3)
             if data is None:
                 return b''
-            self._stall_deadline = None
-            self._misses = 0
+            self._consecutive_hits += 1
+            if self._consecutive_hits >= 10 or self.queue.qsize() >= 5:
+                self._stall_deadline = None
+                self._misses = 0
+            elif self._stall_deadline is not None and time.monotonic() >= self._stall_deadline:
+                return b''
             return data
         except queue.Empty:
             # Stall ffmpeg/network: jangan samarkan jadi hening selamanya (C6).
@@ -389,6 +456,7 @@ class BufferedAudioSource(discord.AudioSource):
                 # sesaat membuat lagu loncat tanpa alasan.
                 self._stall_deadline = now + STALL_EOF_SECONDS
             self._misses += 1
+            self._consecutive_hits = 0
             if self._misses >= MAX_ERROR_STREAK or now >= self._stall_deadline:
                 return b''
             return b'\x00' * 3840
@@ -502,8 +570,15 @@ def source_for(data: dict, volume: float = 1.0) -> discord.PCMVolumeTransformer:
         before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5',
         options='-vn'
     )
-    buffered = BufferedAudioSource(pcm)
-    return discord.PCMVolumeTransformer(buffered, volume=volume)
+    try:
+        buffered = BufferedAudioSource(pcm)
+        return discord.PCMVolumeTransformer(buffered, volume=volume)
+    except Exception:
+        try:
+            pcm.cleanup()
+        except Exception:
+            pass
+        raise
 
 
 def _check_same_voice(interaction: discord.Interaction) -> tuple[bool, str]:
@@ -535,10 +610,11 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
     query = discord.ui.TextInput(label='Judul atau URL YouTube Music', max_length=500)
 
     def __init__(self, bot: 'MusicBot'):
-        super().__init__()
+        super().__init__(timeout=60)
         self.bot = bot
 
     async def on_submit(self, interaction: discord.Interaction):
+        self.stop()
         voice = getattr(interaction.user, 'voice', None)
         if not interaction.guild or not voice or not voice.channel:
             return await interaction.response.send_message('Masuk ke voice channel dulu.', ephemeral=True)
@@ -580,6 +656,7 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
             await interaction.followup.send(f'Gagal memproses lagu: {exc}', ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
+        self.stop()
         log.error('Search modal error: %s', error, exc_info=error)
         msg = f'Terjadi kesalahan saat memproses lagu: {error}'
         try:
@@ -683,6 +760,11 @@ class MusicPanel(discord.ui.View):
                     else:
                         await interaction.followup.send(msg, ephemeral=True)
                     return False
+                if not interaction.response.is_done():
+                    try:
+                        await interaction.response.defer(ephemeral=True)
+                    except Exception:
+                        pass
                 vc = await voice.channel.connect(timeout=20, self_deaf=True)
             except (asyncio.TimeoutError, TimeoutError):
                 log.warning('Timeout connect voice dari panel')
@@ -715,6 +797,17 @@ class MusicPanel(discord.ui.View):
             return False
 
         state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        if interaction.message and state.message and getattr(state.message, 'id', None) != getattr(interaction.message, 'id', None):
+            try:
+                await interaction.message.delete()
+            except Exception:
+                pass
+            msg = 'Panel ini sudah tidak aktif. Gunakan panel terbaru atau ketik /musik.'
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
+            return False
         state.message = interaction.message
         return True
 
@@ -786,6 +879,10 @@ class MusicPanel(discord.ui.View):
         if not vc:
             return await interaction.followup.send('Bot tidak ada di voice channel.', ephemeral=True)
         state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        now = time.monotonic()
+        if now - getattr(state, '_last_pause_time', 0.0) < 0.5:
+            return await interaction.followup.send('Mohon tunggu sebentar sebelum menekan pause/resume lagi.', ephemeral=True)
+        state._last_pause_time = now
         if vc.is_playing():
             vc.pause()
             text = 'Dijeda.'
@@ -812,6 +909,10 @@ class MusicPanel(discord.ui.View):
         if not vc or vc_channel_id is None or not user_ch or user_ch.id != vc_channel_id:
             return await interaction.followup.send('Kamu harus di voice channel yang sama dengan bot.', ephemeral=True)
         state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        now = time.monotonic()
+        if now - getattr(state, '_last_skip_time', 0.0) < 0.5:
+            return await interaction.followup.send('Mohon tunggu sebentar sebelum menekan skip lagi.', ephemeral=True)
+        state._last_skip_time = now
         if vc and (vc.is_playing() or vc.is_paused()):
             await self.bot._stop_player(interaction.guild)
             await self.bot.advance(interaction.guild)
@@ -868,7 +969,7 @@ class MusicPanel(discord.ui.View):
         await self.bot.refresh(state)
 
     @discord.ui.button(label='Stop', emoji='⏹️', style=discord.ButtonStyle.secondary, custom_id='music:stop', row=1)
-    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def button_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         if not await self.guard(interaction):
             return
@@ -931,6 +1032,7 @@ class MusicBot(discord.Client):
         intents.voice_states = True
         super().__init__(intents=intents)
         self._exporter_task: asyncio.Task | None = None
+        self._panel_view: MusicPanel | None = None
         self._synced_guilds: set[int] = set()
         self.tree = discord.app_commands.CommandTree(self)
         self.tree.on_error = self.on_tree_error
@@ -952,12 +1054,14 @@ class MusicBot(discord.Client):
     async def _stop_player(self, guild: discord.Guild) -> None:
         """Hentikan player + bump generation agar after() basi tidak fire (C7)."""
         state = self.states.get(guild.id)
+        vc = guild.voice_client
+        was_playing = bool(vc and (vc.is_playing() or vc.is_paused()))
         if state:
             async with state.lock:
                 state.generation += 1
-                state._skip_armed = True
-        vc = guild.voice_client
-        if vc and (vc.is_playing() or vc.is_paused()):
+                state._skip_armed = was_playing
+                state.consecutive_playback_errors = 0
+        if was_playing:
             try:
                 vc.stop()
             except Exception:
@@ -972,6 +1076,7 @@ class MusicBot(discord.Client):
             if len(state.queue) + len(tracks) > MAX_QUEUE:
                 return False
             state.queue.extend(tracks)
+            state.consecutive_playback_errors = 0
             # Keputusan memutar ditentukan oleh kondisi voice client nyata, bukan
             # hanya state.current. Kalau tidak ada yang benar-benar berputar,
             # state.current dianggap basi (mis. sisa track yang gagal diputar
@@ -1035,7 +1140,8 @@ class MusicBot(discord.Client):
         log.info('Slash commands tersinkron ke server: %s (%s)', getattr(guild, 'name', gid), gid)
 
     async def setup_hook(self):
-        self.add_view(MusicPanel(self))
+        self._panel_view = MusicPanel(self)
+        self.add_view(self._panel_view)
         try:
             self._exporter_task = asyncio.get_running_loop().create_task(self._state_exporter_loop())
         except RuntimeError:
@@ -1078,6 +1184,12 @@ class MusicBot(discord.Client):
 
     async def on_guild_remove(self, guild: discord.Guild):
         dump_runtime_state(self)
+        state = self.states.pop(guild.id, None)
+        if state:
+            for task in (state.idle_task, state.empty_task, state.refresh_task, state.announce_task):
+                if task and not task.done():
+                    task.cancel()
+            state.idle_task = state.empty_task = state.refresh_task = state.announce_task = None
 
     async def _delete_all_panels(self) -> None:
         """Hapus semua pesan panel agar chat bersih saat bot mati.
@@ -1127,6 +1239,16 @@ class MusicBot(discord.Client):
             await self._delete_all_panels()
         except Exception:
             pass
+        for view in list(getattr(self, 'persistent_views', [])):
+            try:
+                view.stop()
+            except Exception:
+                pass
+        if getattr(self, '_panel_view', None):
+            try:
+                self._panel_view.stop()
+            except Exception:
+                pass
         if self._exporter_task and not self._exporter_task.done():
             self._exporter_task.cancel()
         await super().close()
@@ -1175,6 +1297,7 @@ class MusicBot(discord.Client):
                 existing_channel_id = getattr(getattr(existing, 'channel', None), 'id', None)
                 if existing is None or existing_channel_id != channel.id:
                     if existing:
+                        state.message = None
                         try:
                             await existing.delete()
                         except Exception:
@@ -1194,6 +1317,11 @@ class MusicBot(discord.Client):
         ok, msg = _check_same_voice(interaction)
         if not ok:
             return await interaction.followup.send(msg, ephemeral=True)
+        state = self.states.setdefault(interaction.guild.id, QueueState())
+        now = time.monotonic()
+        if now - getattr(state, '_last_skip_time', 0.0) < 0.5:
+            return await interaction.followup.send('Mohon tunggu sebentar sebelum lewati lagu lagi.', ephemeral=True)
+        state._last_skip_time = now
         await self._stop_player(interaction.guild)
         await self.advance(interaction.guild)
         await interaction.followup.send('Lagu dilewati.', ephemeral=True)
@@ -1356,6 +1484,11 @@ class MusicBot(discord.Client):
         vc = interaction.guild.voice_client
         if not vc:
             return await interaction.followup.send('Bot tidak ada di voice channel.', ephemeral=True)
+        state = self.states.setdefault(interaction.guild.id, QueueState())
+        now = time.monotonic()
+        if now - getattr(state, '_last_pause_time', 0.0) < 0.5:
+            return await interaction.followup.send('Mohon tunggu sebentar sebelum menekan pause/resume lagi.', ephemeral=True)
+        state._last_pause_time = now
         if vc.is_playing():
             vc.pause()
             await interaction.followup.send('Pemutaran dijeda.', ephemeral=True)
@@ -1363,15 +1496,12 @@ class MusicBot(discord.Client):
             vc.resume()
             await interaction.followup.send('Pemutaran dilanjutkan.', ephemeral=True)
         else:
-            state = self.states.get(interaction.guild.id)
             if state and state.queue:
                 await self.advance(interaction.guild)
                 await interaction.followup.send('Melanjutkan pemutaran antrian lagu.', ephemeral=True)
             else:
                 await interaction.followup.send('Tidak ada lagu yang aktif atau antrian kosong.', ephemeral=True)
-        state = self.states.get(interaction.guild.id)
-        if state:
-            await self.refresh(state)
+        await self.refresh(state)
 
     async def cmd_volume(self, interaction: discord.Interaction, tingkat: int):
         voice = getattr(interaction.user, 'voice', None)
@@ -1404,6 +1534,11 @@ class MusicBot(discord.Client):
 
     async def cmd_help(self, interaction: discord.Interaction):
         """Daftar perintah. Ephemeral agar tidak mengotori channel."""
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+        except Exception as exc:
+            log.debug('Gagal defer /help: %s', exc)
         embed = discord.Embed(
             title='Perintah Bot Musik',
             description='Semua perintah bisa dipakai setelah bot masuk voice channel.',
@@ -1442,7 +1577,10 @@ class MusicBot(discord.Client):
         )
         embed.set_footer(text='Panel tombol juga tersedia lewat /musik')
         try:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
         except discord.HTTPException as exc:
             log.debug('Gagal kirim /help: %s', exc)
 
@@ -1475,11 +1613,12 @@ class MusicBot(discord.Client):
                 return await interaction.followup.send('Gagal masuk voice. Cek izin Connect/Speak.', ephemeral=True)
         state = self.states.setdefault(interaction.guild.id, QueueState())
         if state.message:
+            old_msg = state.message
+            state.message = None
             try:
-                await state.message.delete()
+                await old_msg.delete()
             except Exception:
                 pass
-            state.message = None
 
         channel = interaction.channel
         if channel is None and interaction.channel_id and interaction.guild:
@@ -1527,7 +1666,7 @@ class MusicBot(discord.Client):
                 try:
                     async with state.lock:
                         embed = self.embed(state)
-                    await state.message.edit(embed=embed, view=MusicPanel(self))
+                    await state.message.edit(embed=embed)
                 except discord.HTTPException:
                     state.message = None
         try:
@@ -1541,12 +1680,15 @@ class MusicBot(discord.Client):
         vc = guild.voice_client
         if not vc or not vc.is_connected():
             return
-        async with state.lock:
-            if state.idle_task and not state.idle_task.done():
-                state.idle_task.cancel()
-            state.idle_task = None
-            if vc.is_playing() or vc.is_paused():
-                return
+        if state._advance_lock.locked():
+            return
+        async with state._advance_lock:
+            async with state.lock:
+                if state.idle_task and not state.idle_task.done():
+                    state.idle_task.cancel()
+                state.idle_task = None
+                if vc.is_playing() or vc.is_paused():
+                    return
 
         loop = asyncio.get_running_loop()
         consecutive_errors = 0
@@ -1590,64 +1732,102 @@ class MusicBot(discord.Client):
             try:
                 async with EXTRACT_SEM:
                     data = await asyncio.wait_for(asyncio.to_thread(extract, next_track.url), timeout=60)
-                if isinstance(data, dict) and data.get('is_live'):
+                if isinstance(data, dict) and (data.get('is_live') or data.get('live_status') == 'is_live'):
                     log.warning('Live stream dilewati: %s', next_track.title)
                     async with state.lock:
                         if state.queue and state.queue[0] is next_track:
                             state.queue.popleft()
                     consecutive_errors += 1
                     continue
-                bitrate_kbps = getattr(getattr(vc, 'channel', None), 'bitrate', 96000) // 1000
-                bitrate_kbps = min(max(bitrate_kbps, 64), 160)
-                source = source_for(data, volume=state.volume)
-                async with state.lock:
-                    if vc.is_playing() or vc.is_paused():
+                channel = getattr(vc, 'channel', None)
+                raw_bitrate = getattr(channel, 'bitrate', 96000)
+                try:
+                    bitrate_kbps = int(raw_bitrate) // 1000
+                    bitrate_kbps = min(max(bitrate_kbps, 64), 160)
+                except (TypeError, ValueError):
+                    bitrate_kbps = 96
+                source = None
+                try:
+                    source = source_for(data, volume=state.volume)
+                    async with state.lock:
+                        if vc.is_playing() or vc.is_paused():
+                            try:
+                                source.cleanup()
+                            except Exception:
+                                pass
+                            return
+                        generation = state.generation
+
+                    def after(error, _gen=generation):
+                        if error:
+                            log.error('Audio playback error: %s', error)
+                        # Skip/back manual: after() dari vc.stop() diabaikan,
+                        # advance manual di handler yang jalan — anti dobel.
+                        async def _after_dispatch():
+                            st = self.states.get(guild.id)
+                            if st is None:
+                                return
+                            skip = False
+                            async with st.lock:
+                                if getattr(st, '_skip_armed', False):
+                                    if _gen != st.generation:
+                                        skip = True
+                                    st._skip_armed = False
+                            if skip:
+                                return
+                            if error:
+                                circuit_broken = False
+                                async with st.lock:
+                                    st.consecutive_playback_errors = getattr(st, 'consecutive_playback_errors', 0) + 1
+                                    if st.consecutive_playback_errors >= MAX_TRACK_RETRIES:
+                                        circuit_broken = True
+                                        log.error(
+                                            '%d lagu berturut-turut gagal diputar di guild %s akibat stream error. '
+                                            'Circuit breaker aktif, pemutaran dihentikan agar antrian aman.',
+                                            st.consecutive_playback_errors, guild.name
+                                        )
+                                        if st.current and (not st.queue or st.queue[0] is not st.current):
+                                            st.queue.appendleft(st.current)
+                                        st.current = None
+                                if circuit_broken:
+                                    await self.refresh(st)
+                                    self._schedule_idle(guild, st.generation)
+                                    return
+                                await asyncio.sleep(1.0)
+                            else:
+                                async with st.lock:
+                                    st.consecutive_playback_errors = 0
+                            await self.finished(guild, _gen)
+                        try:
+                            fut = asyncio.run_coroutine_threadsafe(_after_dispatch(), loop)
+                        except RuntimeError:
+                            return
+                        def _cb(f):
+                            if f.cancelled():
+                                return
+                            try:
+                                exc = f.exception()
+                            except Exception:
+                                return
+                            if exc:
+                                log.error('Queue advance failed: %s', exc)
+                        fut.add_done_callback(_cb)
+
+                    vc.play(source, after=after, application='audio', bitrate=bitrate_kbps, signal_type='music')
+                except Exception:
+                    if source is not None:
                         try:
                             source.cleanup()
                         except Exception:
                             pass
-                        return
-                    generation = state.generation
-
-                def after(error, _gen=generation):
-                    if error:
-                        log.error('Audio playback error: %s', error)
-                    # Skip/back manual: after() dari vc.stop() diabaikan,
-                    # advance manual di handler yang jalan — anti dobel.
-                    async def _after_dispatch():
-                        st = self.states.get(guild.id)
-                        if st is None:
-                            return
-                        skip = False
-                        async with st.lock:
-                            if getattr(st, '_skip_armed', False):
-                                st._skip_armed = False
-                                skip = True
-                        if skip:
-                            return
-                        await self.finished(guild, _gen)
-                    try:
-                        fut = asyncio.run_coroutine_threadsafe(_after_dispatch(), loop)
-                    except RuntimeError:
-                        return
-                    def _cb(f):
-                        if f.cancelled():
-                            return
-                        try:
-                            exc = f.exception()
-                        except Exception:
-                            return
-                        if exc:
-                            log.error('Queue advance failed: %s', exc)
-                    fut.add_done_callback(_cb)
-
-                vc.play(source, after=after, application='audio', bitrate=bitrate_kbps, signal_type='music')
+                    raise
                 # --- fase 4: commit sukses di dalam lock (C1/C2/C3) ---
                 # played harus selalu terdefinisi: mode loop 'track' mengulang
                 # track yang sama tanpa menyentuh queue/history, tetapi tetap
                 # butuh objek track untuk pengumuman now-playing.
                 played = next_track
                 async with state.lock:
+                    state._skip_armed = False
                     if state.loop_mode == 'track' and state.current is next_track:
                         pass
                     else:
@@ -1684,6 +1864,7 @@ class MusicBot(discord.Client):
             # sudah ada track aktif dan tidak pernah memajukan antrian, dan
             # idle-disconnect tidak akan pernah terjadwal (bot tertahan di voice).
             if not (vc.is_playing() or vc.is_paused()):
+                state._skip_armed = False
                 if state.current is not None:
                     state.history.append(state.current)
                     if len(state.history) > 20:

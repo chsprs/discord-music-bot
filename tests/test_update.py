@@ -91,6 +91,13 @@ class UpdateScriptStaticTests(unittest.TestCase):
         self.assertNotRegex(self.src, r'^\s*python3?\s+-c.*yt_dlp',
                             'jangan pakai python sistem untuk membaca versi yt-dlp')
 
+    def test_home_variable_has_default_for_set_u(self):
+        """HOME tidak boleh dipanggil mentah tanpa default di bawah set -u."""
+        self.assertIn('${HOME:-/root}', self.src,
+                      'HOME harus memiliki default ${HOME:-/root} agar tidak crash di timer systemd')
+        self.assertNotIn('$HOME/.cache', self.src,
+                         'ditemukan $HOME/.cache tanpa default fallback')
+
 
 class UpdateScriptBehaviourTests(unittest.TestCase):
     """Jalankan skrip dengan venv tiruan agar perilaku nyata teruji."""
@@ -130,9 +137,11 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
             json.dump(state, handle)
         return bot_dir
 
-    def _run(self, bot_dir: str, extra_env: dict) -> subprocess.CompletedProcess:
+    def _run(self, bot_dir: str, extra_env: dict, unset_env: list | None = None) -> subprocess.CompletedProcess:
         env = dict(os.environ, BOT_DIR=bot_dir, BOT_STATE_FILE=os.path.join(bot_dir, 'state.json'))
         env.update(extra_env)
+        for key in (unset_env or []):
+            env.pop(key, None)
         # systemctl palsu: selalu "active" agar jalur restart teruji.
         fake_bin = os.path.join(bot_dir, 'fakebin')
         os.makedirs(fake_bin, exist_ok=True)
@@ -143,6 +152,13 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
         os.chmod(sc, 0o755)
         env['PATH'] = fake_bin + os.pathsep + env.get('PATH', '')
         return subprocess.run(['bash', SCRIPT], capture_output=True, text=True, env=env, timeout=60)
+
+    def test_home_unset_runs_without_unbound_error(self):
+        """Timer systemd sering mengeksekusi skrip tanpa $HOME saat set -u aktif."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_dir = self._make_fake_venv(tmp, listeners=0)
+            proc = self._run(bot_dir, {}, unset_env=['HOME', 'XDG_CACHE_HOME'])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_upgrade_flag_reaches_pip(self):
         with tempfile.TemporaryDirectory() as tmp:

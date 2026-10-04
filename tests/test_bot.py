@@ -8,7 +8,7 @@ import discord
 
 import bot as bot_module
 from bot import (MusicBot, MusicPanel, Track, QueueState, extract_track,
-                 extract_tracks, source_for, _cookies_file, _with_cookies)
+                 extract_tracks, source_for, _cookies_file, _with_cookies, SearchModal)
 
 
 class MusicTests(unittest.TestCase):
@@ -501,6 +501,124 @@ class MusicTests(unittest.TestCase):
             self.assertEqual(tracks[0].title, 'Single Track')
             self.assertEqual(tracks[0].url, 'https://youtube.com/watch?v=abc')
 
+    def test_extract_tracks_rejects_livestream(self):
+        # 1. Single video dengan is_live=True
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                'title': 'Live Stream Video',
+                'webpage_url': 'https://youtube.com/watch?v=live1',
+                'is_live': True
+            }
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(extract_tracks('https://youtube.com/watch?v=live1', 'vito'))
+            self.assertIn('livestream', str(ctx.exception).lower())
+
+        # 2. Single video dengan live_status='is_live'
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                'title': 'Live Stream Video 2',
+                'webpage_url': 'https://youtube.com/watch?v=live2',
+                'live_status': 'is_live'
+            }
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(extract_tracks('https://youtube.com/watch?v=live2', 'vito'))
+            self.assertIn('livestream', str(ctx.exception).lower())
+
+        # 3. Search query yang hanya menghasilkan livestream
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                'entries': [
+                    {'title': 'Search Live', 'url': 'https://youtube.com/watch?v=slive', 'live_status': 'is_live'}
+                ]
+            }
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(extract_tracks('search live query', 'vito'))
+            self.assertIn('livestream', str(ctx.exception).lower())
+
+    def test_extract_tracks_filters_dead_and_live_playlist_items(self):
+        entries = [
+            {'title': 'Track 1', 'url': 'https://youtube.com/watch?v=t1'},
+            {'title': None, 'id': 'dead1', 'url': None},
+            {'title': '[Private video]', 'id': 'priv1', 'url': 'https://youtube.com/watch?v=priv1'},
+            {'title': '[Deleted video]', 'id': 'del1', 'url': 'https://youtube.com/watch?v=del1'},
+            {'title': 'Live in playlist', 'url': 'https://youtube.com/watch?v=live', 'is_live': True},
+            {'title': 'Track 2', 'url': 'https://youtube.com/watch?v=t2'},
+        ]
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                '_type': 'playlist',
+                'title': 'Test Playlist Mixed',
+                'entries': entries
+            }
+            tracks = asyncio.run(extract_tracks('https://youtube.com/playlist?list=PLmixed', 'vito'))
+            self.assertEqual(len(tracks), 2)
+            self.assertEqual(tracks[0].title, 'Track 1')
+            self.assertEqual(tracks[1].title, 'Track 2')
+            for t in tracks:
+                self.assertNotIn('Tanpa judul', t.title)
+                self.assertNotIn('Private', t.title)
+
+    def test_extract_tracks_age_restricted_shows_cookies_hint(self):
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.side_effect = (
+                bot_module.yt_dlp.utils.DownloadError("ERROR: [youtube] xyz: Sign in to confirm your age")
+            )
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(extract_tracks('https://youtube.com/watch?v=xyz', 'vito'))
+            self.assertIn('age-restricted', str(ctx.exception).lower())
+            self.assertIn('cookies.txt', str(ctx.exception))
+
+    def test_extract_tracks_rate_limit_429_backoff_and_retry(self):
+        with patch('bot.yt_dlp.YoutubeDL') as downloader, patch('bot.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            downloader.return_value.__enter__.return_value.extract_info.side_effect = [
+                bot_module.yt_dlp.utils.DownloadError("HTTP Error 429: Too Many Requests"),
+                {'title': 'Success After 429', 'webpage_url': 'https://youtube.com/watch?v=rec', 'url': 'https://cdn'}
+            ]
+            tracks = asyncio.run(extract_tracks('https://youtube.com/watch?v=rec', 'vito'))
+            self.assertEqual(len(tracks), 1)
+            self.assertEqual(tracks[0].title, 'Success After 429')
+            mock_sleep.assert_awaited_once_with(2.0)
+
+    def test_extract_tracks_rate_limit_429_exhausted(self):
+        with patch('bot.yt_dlp.YoutubeDL') as downloader, patch('bot.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            downloader.return_value.__enter__.return_value.extract_info.side_effect = (
+                bot_module.yt_dlp.utils.DownloadError("HTTP Error 429: Too Many Requests")
+            )
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(extract_tracks('https://youtube.com/watch?v=rec', 'vito'))
+            self.assertIn('429', str(ctx.exception))
+            self.assertEqual(mock_sleep.await_count, 1)
+
+    def test_extract_stream_edge_cases(self):
+        # 1. Livestream ditolak
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                'url': 'https://manifest.googlevideo.com/hls.m3u8',
+                'is_live': True
+            }
+            with self.assertRaises(ValueError) as ctx:
+                bot_module.extract_stream('https://youtube.com/watch?v=live')
+            self.assertIn('livestream', str(ctx.exception).lower())
+
+        # 2. 429 retry lalu berhasil
+        with patch('bot.yt_dlp.YoutubeDL') as downloader, patch('bot.time.sleep') as mock_sleep:
+            downloader.return_value.__enter__.return_value.extract_info.side_effect = [
+                bot_module.yt_dlp.utils.DownloadError("HTTP Error 429: Too Many Requests"),
+                {'url': 'https://cdn.googlevideo.com/audio.webm'}
+            ]
+            res = bot_module.extract_stream('https://youtube.com/watch?v=stream429')
+            self.assertEqual(res['url'], 'https://cdn.googlevideo.com/audio.webm')
+            mock_sleep.assert_called_once_with(2.0)
+
+        # 3. Age-restricted memberikan instruksi cookies.txt
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.side_effect = (
+                bot_module.yt_dlp.utils.DownloadError("ERROR: [youtube] Sign in to confirm your age")
+            )
+            with self.assertRaises(ValueError) as ctx:
+                bot_module.extract_stream('https://youtube.com/watch?v=stream18')
+            self.assertIn('cookies.txt', str(ctx.exception))
+
     # --- Regresi hasil audit -------------------------------------------------
 
     def test_advance_track_loop_replay_does_not_raise_nameerror(self):
@@ -914,7 +1032,10 @@ class HelpCommandTests(unittest.TestCase):
 
         async def scenario():
             interaction = MagicMock()
+            interaction.response.defer = AsyncMock()
             interaction.response.send_message = AsyncMock(
+                side_effect=lambda **kw: sent.update(kw))
+            interaction.followup.send = AsyncMock(
                 side_effect=lambda **kw: sent.update(kw))
             await bot.cmd_help(interaction)
 
@@ -938,7 +1059,10 @@ class HelpCommandTests(unittest.TestCase):
 
         async def scenario():
             interaction = MagicMock()
+            interaction.response.defer = AsyncMock()
             interaction.response.send_message = AsyncMock(
+                side_effect=lambda **kw: sent.update(kw))
+            interaction.followup.send = AsyncMock(
                 side_effect=lambda **kw: sent.update(kw))
             await bot.cmd_help(interaction)
 
@@ -962,6 +1086,335 @@ class HelpCommandTests(unittest.TestCase):
         missing = sorted(name for name in registered if f'/{name}' not in text)
         self.assertEqual(missing, [],
                          f'command terdaftar tapi tidak ada di /help: {missing}')
+
+
+class AudioPipelineHardeningTests(unittest.TestCase):
+    """Pengujian temuan audit audio pipeline (t_c1458af6)."""
+
+    def test_play_exception_cleans_up_source(self):
+        """vc.play gagal harus memanggil source.cleanup() agar ffmpeg tidak bocor."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88801
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.play.side_effect = discord.ClientException('Simulated play error')
+        guild.voice_client = vc
+
+        state = QueueState()
+        track = Track('t1', 'https://example.com/1', 'user')
+        state.queue.append(track)
+        bot.states[guild.id] = state
+
+        mock_source = MagicMock()
+        with patch('bot.extract', return_value={'url': 'http://cdn/1'}), \
+             patch('bot.source_for', return_value=mock_source), \
+             patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(bot.advance(guild))
+
+        mock_source.cleanup.assert_called_once()
+
+    def test_after_error_circuit_breaker_prevents_queue_burn(self):
+        """after(error) berturut-turut harus mengaktifkan circuit breaker sebelum antrean habis."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88802
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        for i in range(10):
+            state.queue.append(Track(f't{i}', f'https://example.com/{i}', 'user'))
+        bot.states[guild.id] = state
+
+        async def scenario():
+            after_cb = None
+            def fake_play(src, after=None, **kwargs):
+                nonlocal after_cb
+                after_cb = after
+            vc.play.side_effect = fake_play
+
+            with patch('bot.extract', return_value={'url': 'http://cdn/audio'}), \
+                 patch('bot.source_for', return_value=MagicMock()), \
+                 patch.object(bot, 'refresh', new=AsyncMock()):
+                await bot.advance(guild)
+                self.assertIsNotNone(after_cb)
+
+                for i in range(3):
+                    cur_cb = after_cb
+                    self.assertIsNotNone(cur_cb)
+                    cur_cb(RuntimeError(f'Stream drop {i+1}'))
+                    for _ in range(50):
+                        await asyncio.sleep(0.05)
+                        if state.consecutive_playback_errors >= i + 1:
+                            break
+
+                self.assertEqual(state.consecutive_playback_errors, 3)
+                self.assertIsNone(state.current)
+                self.assertGreaterEqual(len(state.queue), 7)
+
+        asyncio.run(scenario())
+
+    def test_buffered_source_trickle_stall_eof(self):
+        """BufferedAudioSource harus EOF saat paket masuk teramat lambat (trickle-stall)."""
+        from bot import BufferedAudioSource
+        import time as _time
+        class TrickleSlowAudio(discord.AudioSource):
+            def __init__(self):
+                self.count = 0
+            def read(self):
+                self.count += 1
+                _time.sleep(0.35)
+                return b'\x05' * 3840
+
+        buf = BufferedAudioSource(TrickleSlowAudio(), buffer_size=2)
+        buf.ready_event.set()
+        eof = False
+        start = _time.monotonic()
+        while _time.monotonic() - start < 10.0:
+            frame = buf.read()
+            if frame == b'':
+                eof = True
+                break
+        self.assertTrue(eof, 'Trickle stream tidak memicu stall EOF')
+        buf.cleanup()
+
+    def test_skip_armed_latch_does_not_poison_natural_finish(self):
+        """_skip_armed yang stale tidak boleh menggagalkan advance saat track selesai alami."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88804
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        t1 = Track('t1', 'https://example.com/1', 'user')
+        t2 = Track('t2', 'https://example.com/2', 'user')
+        state.queue.extend([t1, t2])
+        bot.states[guild.id] = state
+
+        async def scenario():
+            after_cb = None
+            def fake_play(src, after=None, **kwargs):
+                nonlocal after_cb
+                after_cb = after
+            vc.play.side_effect = fake_play
+
+            with patch('bot.extract', return_value={'url': 'http://cdn/audio'}), \
+                 patch('bot.source_for', return_value=MagicMock()), \
+                 patch.object(bot, 'refresh', new=AsyncMock()):
+                await bot.advance(guild)
+                self.assertEqual(state.current.title, 't1')
+                self.assertFalse(state._skip_armed)
+
+                # Simulasikan latch stale ter-set True karena race condition
+                state._skip_armed = True
+
+                # t1 selesai alami
+                after_cb(None)
+                await asyncio.sleep(0.05)
+
+                self.assertFalse(state._skip_armed)
+                self.assertEqual(state.current.title, 't2')
+
+        asyncio.run(scenario())
+
+    def test_stop_player_only_arms_skip_when_playing(self):
+        """_stop_player hanya men-set _skip_armed jika voice client sedang aktif."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88805
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        asyncio.run(bot._stop_player(guild))
+        self.assertFalse(state._skip_armed)
+        vc.stop.assert_not_called()
+
+
+class ConcurrencyAndLifecycleTests(unittest.TestCase):
+    def test_button_skip_debounce(self):
+        """Spam klik skip dalam <500ms ditolak debounce dan tidak memicu advance ganda."""
+        bot = MusicBot()
+        guild = MagicMock(id=123)
+        vc = MagicMock()
+        vc.channel.id = 1
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        bot.states[123] = state
+
+        view = MusicPanel(bot)
+        interaction = MagicMock(guild=guild)
+        interaction.user.voice.channel.id = 1
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch.object(bot, '_stop_player', new=AsyncMock()), \
+             patch.object(bot, 'advance', new=AsyncMock()) as mock_advance:
+            with patch.object(view, 'guard', new=AsyncMock(return_value=True)):
+                asyncio.run(view.skip.callback(interaction))
+                mock_advance.assert_called_once()
+                mock_advance.reset_mock()
+                interaction.followup.send.reset_mock()
+
+                # Klik kedua <500ms
+                asyncio.run(view.skip.callback(interaction))
+                mock_advance.assert_not_called()
+                msg = interaction.followup.send.call_args[0][0]
+                self.assertIn('tunggu sebentar', msg.lower())
+
+    def test_button_pause_debounce(self):
+        """Spam klik pause dalam <500ms ditolak debounce dan tidak memicu toggle ganda."""
+        bot = MusicBot()
+        guild = MagicMock(id=124)
+        vc = MagicMock()
+        vc.channel.id = 1
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        bot.states[124] = state
+
+        view = MusicPanel(bot)
+        interaction = MagicMock(guild=guild)
+        interaction.user.voice.channel.id = 1
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch.object(bot, 'refresh', new=AsyncMock()):
+            with patch.object(view, 'guard', new=AsyncMock(return_value=True)):
+                asyncio.run(view.pause.callback(interaction))
+                vc.pause.assert_called_once()
+                vc.pause.reset_mock()
+                interaction.followup.send.reset_mock()
+
+                # Klik kedua <500ms
+                asyncio.run(view.pause.callback(interaction))
+                vc.pause.assert_not_called()
+                vc.resume.assert_not_called()
+                msg = interaction.followup.send.call_args[0][0]
+                self.assertIn('tunggu sebentar', msg.lower())
+
+    def test_advance_single_flight_lock(self):
+        """advance() tidak berjalan paralel jika _advance_lock sedang dipegang."""
+        bot = MusicBot()
+        guild = MagicMock(id=125)
+        vc = MagicMock(is_connected=lambda: True)
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.queue.append(Track('song1', 'https://youtube.com/watch?v=1', 'u'))
+        bot.states[125] = state
+
+        async def scenario():
+            await state._advance_lock.acquire()
+            try:
+                with patch('bot.extract') as mock_extract:
+                    await bot.advance(guild)
+                    mock_extract.assert_not_called()
+            finally:
+                state._advance_lock.release()
+
+        asyncio.run(scenario())
+
+    def test_help_defers_safely(self):
+        """Perintah /help melakukan deferral aman terlebih dahulu."""
+        bot = MusicBot()
+        interaction = MagicMock()
+        is_done = False
+        def fake_defer(**kw):
+            nonlocal is_done
+            is_done = True
+        interaction.response.defer = AsyncMock(side_effect=fake_defer)
+        interaction.response.is_done = MagicMock(side_effect=lambda: is_done)
+        interaction.followup.send = AsyncMock()
+
+        asyncio.run(bot.cmd_help(interaction))
+        interaction.response.defer.assert_called_once_with(ephemeral=True)
+        interaction.followup.send.assert_called_once()
+
+    def test_guard_defers_before_voice_connect(self):
+        """guard() melakukan deferral aman sebelum connect voice channel."""
+        bot = MusicBot()
+        view = MusicPanel(bot)
+        interaction = MagicMock()
+        interaction.guild.voice_client = None
+        interaction.user.voice.channel = MagicMock()
+        interaction.response.is_done.return_value = False
+        interaction.response.defer = AsyncMock()
+        interaction.user.voice.channel.connect = AsyncMock()
+
+        with patch('bot.log'):
+            asyncio.run(view.guard(interaction, require_voice=True))
+        interaction.response.defer.assert_called_once_with(ephemeral=True)
+        interaction.user.voice.channel.connect.assert_called_once()
+
+    def test_guard_cleans_up_stale_panel_message(self):
+        """guard() mendeteksi dan menghapus panel lama yang stale agar tidak split-brain."""
+        bot = MusicBot()
+        view = MusicPanel(bot)
+        interaction = MagicMock()
+        interaction.guild.id = 126
+        vc = MagicMock()
+        vc.channel.id = 1
+        interaction.guild.voice_client = vc
+        interaction.user.voice.channel.id = 1
+
+        active_msg = MagicMock(id=100)
+        stale_msg = MagicMock(id=90)
+        stale_msg.delete = AsyncMock()
+
+        state = QueueState(message=active_msg)
+        bot.states[126] = state
+
+        interaction.message = stale_msg
+        interaction.response.is_done.return_value = True
+        interaction.followup.send = AsyncMock()
+
+        res = asyncio.run(view.guard(interaction))
+        self.assertFalse(res)
+        stale_msg.delete.assert_called_once()
+        self.assertEqual(state.message.id, 100)
+
+    def test_panel_stop_and_bot_close_lifecycle(self):
+        """view.stop() dapat dipanggil pada persistent view dan dibersihkan saat close()."""
+        bot = MusicBot()
+        panel = MusicPanel(bot)
+        self.assertTrue(callable(panel.stop), 'panel.stop harus method View.stop, bukan Button')
+        bot.add_view(panel)
+        bot._panel_view = panel
+        self.assertIn(panel, bot.persistent_views)
+
+        with patch('bot.dump_runtime_state_offline'), patch.object(MusicBot.__bases__[0], 'close', new=AsyncMock()):
+            asyncio.run(bot.close())
+
+        self.assertNotIn(panel, bot.persistent_views)
+
+    def test_search_modal_lifecycle(self):
+        """SearchModal memiliki timeout eksplisit 60 detik dan stop() saat submit."""
+        bot = MusicBot()
+        modal = SearchModal(bot)
+        self.assertEqual(modal.timeout, 60)
+        self.assertTrue(callable(modal.stop))
 
 
 if __name__ == '__main__':
