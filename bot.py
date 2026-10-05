@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -67,6 +68,7 @@ class QueueState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     message: discord.Message | None = None
     now_message: discord.Message | None = None
+    text_channel_id: int | None = None
     _skip_armed: bool = False  # skip/back manual: after() basi, advance manual yang jalan
     consecutive_playback_errors: int = 0
     idle_task: asyncio.Task | None = None
@@ -887,6 +889,10 @@ class MusicPanel(discord.ui.View):
                 await interaction.followup.send(msg, ephemeral=True)
             return False
         state.message = interaction.message
+        if getattr(interaction, 'channel_id', None):
+            state.text_channel_id = interaction.channel_id
+        elif getattr(interaction, 'channel', None) and hasattr(interaction.channel, 'id'):
+            state.text_channel_id = interaction.channel.id
         return True
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
@@ -1142,10 +1148,18 @@ class MusicBot(discord.Client):
                 curr = _track_to_dict(st.current) if getattr(st, 'current', None) else None
                 q = [_track_to_dict(t) for t in getattr(st, 'queue', [])]
                 if curr or q:
-                    payload[str(gid)] = {
+                    g_entry = {
                         'current': curr,
                         'queue': q,
                     }
+                    msg = getattr(st, 'message', None)
+                    msg_id = getattr(msg, 'id', msg if isinstance(msg, int) else None)
+                    if msg_id is not None:
+                        g_entry['panel_message_id'] = msg_id
+                    ch_id = getattr(getattr(msg, 'channel', None), 'id', None) or getattr(st, 'text_channel_id', None)
+                    if ch_id is not None:
+                        g_entry['text_channel_id'] = ch_id
+                    payload[str(gid)] = g_entry
             if not payload:
                 if os.path.exists(path):
                     try:
@@ -1209,6 +1223,12 @@ class MusicBot(discord.Client):
                     if track:
                         state.queue.append(track)
                         has_restored = True
+            panel_message_id = g_data.get('panel_message_id')
+            if panel_message_id is not None and state.message is None:
+                state.message = panel_message_id
+            text_channel_id = g_data.get('text_channel_id')
+            if text_channel_id is not None and getattr(state, 'text_channel_id', None) is None:
+                state.text_channel_id = text_channel_id
             if has_restored:
                 restored_guilds += 1
         if restored_guilds > 0:
@@ -1305,6 +1325,7 @@ class MusicBot(discord.Client):
         log.info('Slash commands tersinkron ke server: %s (%s)', getattr(guild, 'name', gid), gid)
 
     async def setup_hook(self):
+        self._register_signals()
         self._panel_view = MusicPanel(self)
         self.add_view(self._panel_view)
         try:
@@ -1364,30 +1385,105 @@ class MusicBot(discord.Client):
             state.afk_paused = False
         self._save_persistent_queue()
 
+    def _register_signals(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: self._handle_signal(s))
+            except (NotImplementedError, RuntimeError, ValueError, AttributeError):
+                pass
+
+    def _handle_signal(self, sig: int) -> None:
+        signame = signal.Signals(sig).name if hasattr(signal, 'Signals') else str(sig)
+        log.info('Menerima sinyal %s, menjadwalkan graceful shutdown...', signame)
+        if getattr(self, '_stopping', False):
+            return
+        self._stopping = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, 'loop', None)
+        if loop and not loop.is_closed():
+            self._close_task = loop.create_task(self.close())
+
+    async def _safe_delete_msg(self, msg, channel: discord.abc.Messageable | None = None, guild: discord.Guild | None = None) -> None:
+        """Hapus pesan Discord secara aman dan idempoten.
+
+        Mendukung Message object dan fallback PartialMessage bila hanya tersisa ID.
+        Menoleransi NotFound, Forbidden, HTTPException.
+        """
+        if msg is None:
+            return
+        if hasattr(msg, 'delete') and callable(msg.delete):
+            try:
+                res = msg.delete()
+                if hasattr(res, '__await__'):
+                    await res
+                return
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                log.debug('Gagal menghapus pesan: %s', exc)
+                return
+            except Exception:
+                log.debug('Gagal menghapus pesan (unexpected)', exc_info=True)
+                return
+
+        # Fallback bila pesan hanya berupa ID (misal int/str setelah restart atau obj tanpa delete)
+        target_channel = channel or getattr(msg, 'channel', None)
+        if not target_channel and guild and hasattr(guild, 'get_channel'):
+            ch_id = getattr(msg, 'channel_id', None)
+            if ch_id:
+                try:
+                    target_channel = guild.get_channel(int(ch_id))
+                except (ValueError, TypeError):
+                    pass
+        if not target_channel and guild and hasattr(guild, 'text_channels') and guild.text_channels:
+            target_channel = guild.text_channels[0]
+
+        msg_id = getattr(msg, 'id', msg)
+        if target_channel and hasattr(target_channel, 'get_partial_message'):
+            try:
+                msg_id_int = int(msg_id)
+                partial = target_channel.get_partial_message(msg_id_int)
+                if hasattr(partial, 'delete') and callable(partial.delete):
+                    res = partial.delete()
+                    if hasattr(res, '__await__'):
+                        await res
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                log.debug('Gagal menghapus partial message: %s', exc)
+            except Exception:
+                log.debug('Gagal menghapus partial message (unexpected)', exc_info=True)
+
     async def _delete_all_panels(self) -> None:
         """Hapus semua pesan panel agar chat bersih saat bot mati.
 
         Dipanggil dari close() selagi koneksi HTTP masih hidup —
         super().close() menutup http/ws setelahnya.
         """
-        targets = [(gid, st.message) for gid, st in list(self.states.items())
-                   if getattr(st, 'message', None) is not None]
-        targets += [(gid, st.now_message) for gid, st in list(self.states.items())
-                    if getattr(st, 'now_message', None) is not None]
+        targets = []
+        for gid, st in list(self.states.items()):
+            if getattr(st, 'message', None) is not None:
+                targets.append((gid, st.message))
+            if getattr(st, 'now_message', None) is not None:
+                targets.append((gid, st.now_message))
         if not targets:
             return
 
-        async def _del(msg) -> None:
-            try:
-                await msg.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                log.debug('Gagal hapus panel saat shutdown: %s', exc)
-            except Exception:
-                log.debug('Gagal hapus panel saat shutdown', exc_info=True)
+        async def _del(gid: int, msg) -> None:
+            state = self.states.get(gid)
+            guild = self.get_guild(gid) if hasattr(self, 'get_guild') else None
+            ch = getattr(msg, 'channel', None)
+            if not ch and state and getattr(state, 'text_channel_id', None) and guild and hasattr(guild, 'get_channel'):
+                ch = guild.get_channel(state.text_channel_id)
+            if not ch and guild and hasattr(guild, 'text_channels') and guild.text_channels:
+                ch = guild.text_channels[0]
+            await self._safe_delete_msg(msg, channel=ch, guild=guild)
 
         try:
             await asyncio.wait_for(
-                asyncio.gather(*(_del(m) for _, m in targets), return_exceptions=True),
+                asyncio.gather(*(_del(gid, m) for gid, m in targets), return_exceptions=True),
                 timeout=15,
             )
         except (asyncio.TimeoutError, TimeoutError):
@@ -1399,6 +1495,15 @@ class MusicBot(discord.Client):
                 state.now_message = None
 
     async def close(self):
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.remove_signal_handler(sig)
+                except (NotImplementedError, RuntimeError, ValueError, AttributeError):
+                    pass
+        except RuntimeError:
+            pass
         try:
             self._save_persistent_queue()
         except Exception as exc:
@@ -1482,6 +1587,8 @@ class MusicBot(discord.Client):
                             pass
                     try:
                         state.message = await channel.send(embed=self.embed(state), view=MusicPanel(self))
+                        if hasattr(channel, 'id'):
+                            state.text_channel_id = channel.id
                     except Exception:
                         log.exception('Gagal memunculkan panel otomatis saat play')
         except Exception as exc:
@@ -1579,8 +1686,10 @@ class MusicBot(discord.Client):
         await interaction.followup.send(f'AutoPlay sekarang: **{status}**', ephemeral=True)
         await self.refresh(state)
 
-    async def quit_voice(self, guild: discord.Guild, clear_queue: bool = False) -> None:
+    async def quit_voice(self, guild: discord.Guild, clear_queue: bool = False, delete_panel: bool = True) -> None:
         state = self.states.get(guild.id)
+        old_now_message = None
+        old_message = None
         if state:
             async with state.lock:
                 state.generation += 1
@@ -1588,22 +1697,29 @@ class MusicBot(discord.Client):
                     state.queue.clear()
                     state.history.clear()
                 state.current = None
-                for task in (state.idle_task, state.empty_task, state.afk_task):
+                for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task):
                     if task and not task.done():
                         task.cancel()
-                state.idle_task = state.empty_task = state.afk_task = None
+                state.idle_task = state.empty_task = state.afk_task = state.refresh_task = None
                 state.afk_paused = False
                 announce_task = state.announce_task
                 state.announce_task = None
                 old_now_message = state.now_message
                 state.now_message = None
+                if delete_panel:
+                    old_message = state.message
+                    state.message = None
             if announce_task and not announce_task.done():
                 announce_task.cancel()
             if old_now_message is not None:
-                try:
-                    await old_now_message.delete()
-                except Exception:
-                    pass
+                await self._safe_delete_msg(old_now_message, guild=guild)
+            if delete_panel and old_message is not None:
+                ch = getattr(old_message, 'channel', None)
+                if not ch and getattr(state, 'text_channel_id', None) and hasattr(guild, 'get_channel'):
+                    ch = guild.get_channel(state.text_channel_id)
+                if not ch and hasattr(guild, 'text_channels') and guild.text_channels:
+                    ch = guild.text_channels[0]
+                await self._safe_delete_msg(old_message, channel=ch, guild=guild)
         vc = getattr(guild, 'voice_client', None)
         if vc:
             try:
@@ -1621,7 +1737,7 @@ class MusicBot(discord.Client):
                 await vc.disconnect(force=True)
             except Exception:
                 pass
-        if state:
+        if state and not delete_panel:
             await self.refresh(state)
         self._save_persistent_queue()
         dump_runtime_state(self)
@@ -1818,6 +1934,8 @@ class MusicBot(discord.Client):
 
         try:
             state.message = await channel.send(embed=self.embed(state), view=MusicPanel(self))
+            if hasattr(channel, 'id'):
+                state.text_channel_id = channel.id
             await interaction.followup.send('Panel musik aktif di channel ini.', ephemeral=True)
         except discord.Forbidden:
             await interaction.followup.send('Bot butuh izin Send Messages + Embed Links di channel ini.', ephemeral=True)

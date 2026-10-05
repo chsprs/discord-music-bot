@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import signal
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -163,7 +164,7 @@ class MusicTests(unittest.TestCase):
         bot.states[99999] = state
 
         with patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh:
-            asyncio.run(bot.quit_voice(guild, clear_queue=True))
+            asyncio.run(bot.quit_voice(guild, clear_queue=True, delete_panel=False))
             self.assertEqual(len(state.queue), 0)
             self.assertIsNone(state.current)
             self.assertEqual(state.generation, 2)
@@ -1918,6 +1919,272 @@ class PersistentQueueTests(unittest.TestCase):
             self.assertEqual(bot2.states[101].current.title, 'G1 Track')
             self.assertEqual(len(bot2.states[102].queue), 1)
             self.assertEqual(bot2.states[102].queue[0].title, 'G2 Queue')
+
+
+class VoiceExitPanelCleanupTests(unittest.TestCase):
+    """Test suite untuk memastikan pesan panel & now-playing dibersihkan saat bot keluar voice."""
+
+    def test_quit_voice_deletes_panel_and_now_playing_by_default(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 70001
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.disconnect = AsyncMock()
+        guild.voice_client = vc
+
+        state = QueueState()
+        panel_msg = MagicMock()
+        panel_msg.delete = AsyncMock()
+        state.message = panel_msg
+
+        now_msg = MagicMock()
+        now_msg.delete = AsyncMock()
+        state.now_message = now_msg
+        state.current = Track('Lagu', 'https://example.com/lagu', 'user')
+        state.queue.append(Track('Next', 'https://example.com/next', 'user'))
+        bot.states[guild.id] = state
+
+        with patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh, \
+             patch('bot.dump_runtime_state'):
+            asyncio.run(bot.quit_voice(guild, clear_queue=True))
+
+        panel_msg.delete.assert_awaited_once()
+        now_msg.delete.assert_awaited_once()
+        self.assertIsNone(state.message)
+        self.assertIsNone(state.now_message)
+        self.assertIsNone(state.current)
+        self.assertEqual(len(state.queue), 0)
+        mock_refresh.assert_not_called()
+
+    def test_quit_voice_delete_panel_false_preserves_panel_and_refreshes(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 70002
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.disconnect = AsyncMock()
+        guild.voice_client = vc
+
+        state = QueueState()
+        panel_msg = MagicMock()
+        panel_msg.delete = AsyncMock()
+        state.message = panel_msg
+
+        now_msg = MagicMock()
+        now_msg.delete = AsyncMock()
+        state.now_message = now_msg
+        bot.states[guild.id] = state
+
+        with patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh, \
+             patch('bot.dump_runtime_state'):
+            asyncio.run(bot.quit_voice(guild, clear_queue=False, delete_panel=False))
+
+        panel_msg.delete.assert_not_called()
+        now_msg.delete.assert_awaited_once()
+        self.assertEqual(state.message, panel_msg)
+        self.assertIsNone(state.now_message)
+        mock_refresh.assert_called_once_with(state)
+
+    def test_quit_voice_fallback_to_partial_message_when_only_id(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 70003
+        vc = MagicMock()
+        vc.disconnect = AsyncMock()
+        guild.voice_client = vc
+
+        channel = MagicMock()
+        mock_partial = MagicMock()
+        mock_partial.delete = AsyncMock()
+        channel.get_partial_message.return_value = mock_partial
+        guild.get_channel.return_value = channel
+
+        state = QueueState()
+        state.message = 99887766  # hanya int ID sisa restart
+        state.text_channel_id = 554433
+        bot.states[guild.id] = state
+
+        with patch('bot.dump_runtime_state'):
+            asyncio.run(bot.quit_voice(guild))
+
+        guild.get_channel.assert_called_once_with(554433)
+        channel.get_partial_message.assert_called_once_with(99887766)
+        mock_partial.delete.assert_awaited_once()
+        self.assertIsNone(state.message)
+
+    def test_quit_voice_tolerates_not_found_on_panel_and_now_message(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 70004
+        guild.voice_client = None
+
+        state = QueueState()
+        resp = MagicMock()
+        resp.status = 404
+        panel_msg = MagicMock()
+        panel_msg.delete = AsyncMock(side_effect=discord.NotFound(resp, 'Message not found'))
+        now_msg = MagicMock()
+        now_msg.delete = AsyncMock(side_effect=discord.NotFound(resp, 'Message not found'))
+        state.message = panel_msg
+        state.now_message = now_msg
+        bot.states[guild.id] = state
+
+        with patch('bot.dump_runtime_state'):
+            asyncio.run(bot.quit_voice(guild))
+
+        self.assertIsNone(state.message)
+        self.assertIsNone(state.now_message)
+
+    def test_idle_disconnect_deletes_panel(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 70005
+        guild.name = "TestGuild"
+        vc = MagicMock()
+        vc.disconnect = AsyncMock()
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.generation = 3
+        state.current = None
+        state.queue.clear()
+        panel_msg = MagicMock()
+        panel_msg.delete = AsyncMock()
+        state.message = panel_msg
+        bot.states[guild.id] = state
+
+        with patch('asyncio.sleep', new=AsyncMock()), \
+             patch('bot.dump_runtime_state'):
+            asyncio.run(bot.idle_disconnect(guild, generation=3))
+
+        panel_msg.delete.assert_awaited_once()
+        self.assertIsNone(state.message)
+
+    def test_on_voice_state_update_kick_deletes_panel(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 70006
+        guild.name = "KickGuild"
+        guild.voice_client = None
+
+        state = QueueState()
+        panel_msg = MagicMock()
+        panel_msg.delete = AsyncMock()
+        now_msg = MagicMock()
+        now_msg.delete = AsyncMock()
+        state.message = panel_msg
+        state.now_message = now_msg
+        bot.states[guild.id] = state
+
+        bot_user = MagicMock()
+        bot_user.id = 1234
+        bot._connection.user = bot_user
+
+        member = MagicMock()
+        member.id = 1234
+        member.guild = guild
+        before = MagicMock(channel=MagicMock(id=991))
+        after = MagicMock(channel=None)
+
+        with patch('asyncio.sleep', new=AsyncMock()), \
+             patch('bot.dump_runtime_state'):
+            asyncio.run(bot.on_voice_state_update(member, before, after))
+
+        panel_msg.delete.assert_awaited_once()
+        now_msg.delete.assert_awaited_once()
+        self.assertIsNone(state.message)
+        self.assertIsNone(state.now_message)
+
+    def test_afk_disconnect_deletes_panel(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 70007
+        vc = MagicMock()
+        vc.channel = MagicMock(members=[])
+        vc.disconnect = AsyncMock()
+        guild.voice_client = vc
+
+        state = QueueState()
+        panel_msg = MagicMock()
+        panel_msg.delete = AsyncMock()
+        state.message = panel_msg
+        bot.states[guild.id] = state
+
+        with patch('asyncio.sleep', new=AsyncMock()), \
+             patch('bot.dump_runtime_state'):
+            asyncio.run(bot._afk_disconnect(guild, generation=state.generation, timeout=0.1))
+
+        panel_msg.delete.assert_awaited_once()
+        self.assertIsNone(state.message)
+
+    def test_signal_handler_sigterm_graceful_close(self):
+        bot = MusicBot()
+        async def run_test():
+            with patch.object(bot, 'close', new=AsyncMock()) as mock_close:
+                bot._handle_signal(signal.SIGTERM)
+                self.assertTrue(bot._stopping)
+                await asyncio.sleep(0.01)
+                mock_close.assert_awaited_once()
+        asyncio.run(run_test())
+
+    def test_persistent_queue_saves_and_restores_panel_message_id(self):
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'queue_panel.json')
+            bot._queue_state_file = queue_file
+
+            gid = 70008
+            state = QueueState()
+            state.current = Track('Track A', 'https://example.com/a', 'user')
+            msg = MagicMock()
+            msg.id = 11223344
+            msg.channel = MagicMock(id=556677)
+            state.message = msg
+            state.text_channel_id = 556677
+            bot.states[gid] = state
+
+            bot._save_persistent_queue()
+
+            with open(queue_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.assertEqual(data[str(gid)]['panel_message_id'], 11223344)
+            self.assertEqual(data[str(gid)]['text_channel_id'], 556677)
+
+            bot2 = MusicBot()
+            bot2._queue_state_file = queue_file
+            bot2._restore_persistent_queue()
+
+            self.assertIn(gid, bot2.states)
+            self.assertEqual(bot2.states[gid].message, 11223344)
+            self.assertEqual(bot2.states[gid].text_channel_id, 556677)
+
+    def test_delete_all_panels_with_partial_message_fallback(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        bot.get_guild = MagicMock(return_value=guild)
+        channel = MagicMock()
+        mock_partial = MagicMock()
+        mock_partial.delete = AsyncMock()
+        channel.get_partial_message.return_value = mock_partial
+        guild.get_channel.return_value = channel
+
+        state = QueueState()
+        state.message = 1234567
+        state.text_channel_id = 9988
+        bot.states = {8888: state}
+
+        asyncio.run(bot._delete_all_panels())
+        channel.get_partial_message.assert_called_once_with(1234567)
+        mock_partial.delete.assert_awaited_once()
+        self.assertIsNone(state.message)
+
+    def test_setup_hook_registers_signals(self):
+        bot = MusicBot()
+        with patch.object(bot, '_register_signals') as mock_reg, \
+             patch.object(bot, '_sync_guild', new=AsyncMock()):
+            asyncio.run(bot.setup_hook())
+            mock_reg.assert_called_once()
 
 
 if __name__ == '__main__':
