@@ -1593,6 +1593,45 @@ class AudioPipelineHardeningTests(unittest.TestCase):
         self.assertTrue(eof, 'Trickle stream tidak memicu stall EOF')
         buf.cleanup()
 
+    def test_buffered_source_recovering_stream_after_jitter_not_premature_eof(self):
+        """BufferedAudioSource tidak boleh memotong lagu saat data mengalir perlahan (<10 hits) pasca jitter."""
+        from bot import BufferedAudioSource
+        import time as _time
+
+        class RecoveringAudio(discord.AudioSource):
+            def __init__(self):
+                self.count = 0
+            def read(self):
+                self.count += 1
+                if self.count == 1:
+                    return b'A' * 3840
+                if self.count == 2:
+                    # Simulasikan jitter CDN mendekati batas stall deadline (misal 3.6s)
+                    _time.sleep(3.6)
+                    return b'B' * 3840
+                if self.count <= 8:
+                    # Aliran audio masuk perlahan (70ms per paket, <10 hits)
+                    _time.sleep(0.07)
+                    return b'C' * 3840
+                return b''
+
+        buf = BufferedAudioSource(RecoveringAudio(), buffer_size=10)
+        buf.ready_event.set()
+        received = []
+        start = _time.monotonic()
+        while _time.monotonic() - start < 8.0:
+            frame = buf.read()
+            if frame == b'':
+                break
+            if frame != b'\x00' * 3840:
+                received.append(frame[:1])
+            _time.sleep(0.02)
+        self.assertEqual(len(received), 8, f'Semua 8 frame harus terputar lengkap, terputar: {len(received)}')
+        self.assertEqual(received[0], b'A')
+        self.assertEqual(received[1], b'B')
+        self.assertEqual(received[2:], [b'C'] * 6)
+        buf.cleanup()
+
     def test_skip_armed_latch_does_not_poison_natural_finish(self):
         """_skip_armed yang stale tidak boleh menggagalkan advance saat track selesai alami."""
         bot = MusicBot()
@@ -2313,6 +2352,130 @@ class PersistentQueueTests(unittest.TestCase):
             self.assertEqual(bot2.states[101].current.title, 'G1 Track')
             self.assertEqual(len(bot2.states[102].queue), 1)
             self.assertEqual(bot2.states[102].queue[0].title, 'G2 Queue')
+
+    def test_persistent_queue_save_and_restore_volume_loop_autoplay(self):
+        """Persistent Queue: Menyimpan dan memulihkan volume, loop_mode, dan autoplay."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'queue_state.json')
+            bot._queue_state_file = queue_file
+
+            gid = 12345
+            state = GuildState()
+            state.current = Track('Track 1', 'https://youtube.com/watch?v=t1', 'User')
+            state.volume = 0.85
+            state.loop_mode = 'queue'
+            state.autoplay = True
+            bot.states[gid] = state
+
+            bot._save_persistent_queue()
+
+            with open(queue_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.assertIn(str(gid), data)
+            self.assertEqual(data[str(gid)]['volume'], 0.85)
+            self.assertEqual(data[str(gid)]['loop_mode'], 'queue')
+            self.assertEqual(data[str(gid)]['autoplay'], True)
+
+            bot2 = MusicBot()
+            bot2._queue_state_file = queue_file
+            bot2._restore_persistent_queue()
+
+            self.assertIn(gid, bot2.states)
+            restored = bot2.states[gid]
+            self.assertEqual(restored.volume, 0.85)
+            self.assertEqual(restored.loop_mode, 'queue')
+            self.assertTrue(restored.autoplay)
+
+    def test_persistent_queue_restore_invalid_volume_loop_autoplay(self):
+        """Persistent Queue: Nilai volume dan loop_mode tidak valid diabaikan dan kembali default."""
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            queue_file = os.path.join(tmpdir, 'queue_state.json')
+            bot._queue_state_file = queue_file
+            payload = {
+                '12345': {
+                    'current': {'title': 'Track A', 'url': 'https://example.com/a'},
+                    'queue': [],
+                    'volume': 'bukan-angka',
+                    'loop_mode': 'invalid-mode',
+                }
+            }
+            with open(queue_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f)
+
+            bot._restore_persistent_queue()
+            state = bot.states[12345]
+            self.assertEqual(state.volume, 0.5)
+            self.assertEqual(state.loop_mode, 'off')
+
+    def test_change_volume_triggers_save_persistent_queue(self):
+        """change_volume memicu pemanggilan _save_persistent_queue."""
+        bot = MusicBot()
+        interaction = MagicMock()
+        interaction.guild.id = 1111
+        interaction.response.is_done.return_value = True
+        interaction.followup.send = AsyncMock()
+        with patch.object(bot, '_save_persistent_queue') as mock_save:
+            asyncio.run(bot.change_volume(interaction, 0.75))
+            mock_save.assert_called_once()
+            self.assertEqual(bot.states[1111].volume, 0.75)
+
+    def test_cmd_loop_triggers_save_persistent_queue(self):
+        """cmd_loop memicu pemanggilan _save_persistent_queue."""
+        bot = MusicBot()
+        interaction = MagicMock()
+        interaction.guild.id = 2222
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        with patch.object(bot, '_save_persistent_queue') as mock_save:
+            asyncio.run(bot.cmd_loop(interaction, 'track'))
+            mock_save.assert_called_once()
+            self.assertEqual(bot.states[2222].loop_mode, 'track')
+
+    def test_button_loop_triggers_save_persistent_queue(self):
+        """Tombol loop pada MusicPanel memicu pemanggilan _save_persistent_queue."""
+        bot = MusicBot()
+        bot.states[3333] = QueueState()
+        panel = MusicPanel(bot)
+        interaction = MagicMock()
+        interaction.guild.id = 3333
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        with patch.object(panel, 'guard', new=AsyncMock(return_value=True)), \
+             patch.object(bot, '_save_persistent_queue') as mock_save, \
+             patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(panel.loop.callback(interaction))
+            mock_save.assert_called_once()
+            self.assertEqual(bot.states[3333].loop_mode, 'track')
+
+    def test_cmd_autoplay_triggers_save_persistent_queue(self):
+        """cmd_autoplay memicu pemanggilan _save_persistent_queue."""
+        bot = MusicBot()
+        interaction = MagicMock()
+        interaction.guild.id = 4444
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        with patch.object(bot, '_save_persistent_queue') as mock_save:
+            asyncio.run(bot.cmd_autoplay(interaction))
+            mock_save.assert_called_once()
+            self.assertTrue(bot.states[4444].autoplay)
+
+    def test_button_autoplay_triggers_save_persistent_queue(self):
+        """Tombol autoplay pada MusicPanel memicu pemanggilan _save_persistent_queue."""
+        bot = MusicBot()
+        bot.states[5555] = QueueState()
+        panel = MusicPanel(bot)
+        interaction = MagicMock()
+        interaction.guild.id = 5555
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        with patch.object(panel, 'guard', new=AsyncMock(return_value=True)), \
+             patch.object(bot, '_save_persistent_queue') as mock_save, \
+             patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(panel.autoplay.callback(interaction))
+            mock_save.assert_called_once()
+            self.assertTrue(bot.states[5555].autoplay)
 
 
 class VoiceExitPanelCleanupTests(unittest.TestCase):

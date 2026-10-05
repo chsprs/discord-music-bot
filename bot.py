@@ -724,18 +724,19 @@ class BufferedAudioSource(discord.AudioSource):
         if self.stop_event.is_set():
             return b''
         now = time.monotonic()
-        if self._stall_deadline is not None and now >= self._stall_deadline:
+        if self._stall_deadline is not None and now >= self._stall_deadline and self.queue.empty():
             return b''
         try:
             data = self.queue.get(timeout=0.3)
             if data is None:
                 return b''
             self._consecutive_hits += 1
-            if self._consecutive_hits >= 10 or self.queue.qsize() >= 5:
+            if self._consecutive_hits >= 3 or self.queue.qsize() >= 2:
                 self._stall_deadline = None
                 self._misses = 0
-            elif self._stall_deadline is not None and time.monotonic() >= self._stall_deadline:
-                return b''
+            elif self._stall_deadline is not None:
+                # ponytail: deadline diperpanjang 0.1s per chunk saat jitter; jika butuh adaptive window berbasis bitrate, hitung frame duration dinamis
+                self._stall_deadline += 0.1
             return data
         except queue.Empty:
             # Stall ffmpeg/network: jangan samarkan jadi hening selamanya (C6).
