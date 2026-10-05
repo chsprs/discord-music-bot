@@ -12,7 +12,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import discord
 import yt_dlp
@@ -183,6 +183,18 @@ STREAM_OPTIONS = {
     'extractor_retries': 3,
     'fragment_retries': 3,
     'js_runtimes': _JS_RUNTIME,
+}
+
+# YouTube Mix (radio `list=RD<id>`): berapa entri playlist yang diekstrak.
+MIX_RESULT_LIMIT = int(os.environ.get('MIX_RESULT_LIMIT', '15'))
+
+# Salinan METADATA_OPTIONS + playlistend (tanpa noplaylist) agar yt-dlp mau
+# mengikuti playlist Mix. extract_flat='in_playlist' sudah dibawa dari
+# METADATA_OPTIONS. Dict dasar ini TIDAK dimutasi; opsi per-panggilan dibuat
+# lewat _mix_options(limit).
+MIX_OPTIONS = {
+    **METADATA_OPTIONS,
+    'playlistend': MIX_RESULT_LIMIT,
 }
 
 # Cookies opsional (video age-restricted / butuh login). Dibaca ulang di tiap
@@ -500,16 +512,36 @@ def _clean_seed_title(title: str | None) -> str:
 
 
 async def fetch_recommendations(history_titles: list[str], exclude_urls: set[str],
-                                requester: str = 'AutoPlay') -> list[Track]:
+                                requester: str = 'AutoPlay',
+                                seed_urls: list[str] | None = None) -> list[Track]:
     """Ambil kandidat lagu rekomendasi berbasis riwayat lagu sebelumnya.
 
-    Menyaring URL yang sudah pernah diputar (exclude_urls) supaya AutoPlay tidak
-    mengulang lagu yang sama, dan mengembalikan kandidat terurut sesuai
-    relevansi pencarian.
+    Bila seed_urls diisi, utamakan YouTube Mix (radio nyata = paling relevan):
+    iterasi seed terbaru dulu, kembalikan kandidat pertama yang non-kosong.
+    Bila seed_urls kosong / semua mix kosong, fallback ke pencarian teks lama
+    (kueri ytsearch5: dari build_recommendation_queries). Menyaring URL yang
+    sudah pernah diputar (exclude_urls) supaya AutoPlay tidak mengulang lagu.
     """
-    queries = build_recommendation_queries(history_titles)
     seen: set[str] = set(exclude_urls or set())
-    candidates: list[Track] = []
+
+    # --- Prioritas 1: YouTube Mix dari seed URL (terbaru dulu) ---
+    for seed_url in list(seed_urls or []):
+        video_id = extract_video_id(seed_url)
+        if not video_id:
+            continue
+        mix_tracks = await fetch_youtube_mix(video_id, seen, requester)
+        candidates: list[Track] = []
+        for track in mix_tracks:
+            if track.url in seen:
+                continue
+            seen.add(track.url)
+            candidates.append(track)
+        if candidates:
+            return candidates
+
+    # --- Prioritas 2 (fallback): pencarian teks lama ---
+    queries = build_recommendation_queries(history_titles)
+    candidates = []
     for query in queries:
         try:
             async with EXTRACT_SEM:
@@ -533,6 +565,112 @@ async def fetch_recommendations(history_titles: list[str], exclude_urls: set[str
             # Kueri seed pertama sudah menghasilkan kandidat: cukup, hemat kuota.
             break
     return candidates
+
+
+def _mix_options(limit: int) -> dict:
+    """Opsi yt-dlp untuk YouTube Mix, dihitung ulang per-panggilan.
+
+    Menyalin METADATA_OPTIONS (membawa extract_flat='in_playlist') dan
+    menambahkan playlistend=limit agar ekstraksi cepat (~1.5s, bukan ~20s).
+    TIDAK memutasi dict global, jadi limit berbeda aman dipakai bersamaan.
+    """
+    return {**METADATA_OPTIONS, 'playlistend': int(limit)}
+
+
+def _fetch_mix_metadata(url: str, limit: int) -> dict:
+    """Ekstraksi sinkron satu halaman YouTube Mix (dipanggil via to_thread)."""
+    with yt_dlp.YoutubeDL(_with_cookies(_mix_options(limit))) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+# Regex videoId YouTube (11 karakter) untuk path non-query (youtu.be, /embed, dst).
+_VIDEO_ID_RE = re.compile(r'[A-Za-z0-9_-]{11}')
+_VIDEO_ID_PATHS = ('embed', 'shorts', 'live', 'v')
+
+
+def extract_video_id(url: str | None) -> str | None:
+    """Ambil videoId YouTube (11 char) dari URL. None bila tidak bisa.
+
+    Dukung: /watch?v=ID, youtu.be/ID, /embed/ID, /shorts/ID, /live/ID,
+    music.youtube.com. Abaikan parameter list= / start_radio=.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return None
+    host = (parsed.hostname or '').lower()
+    if not host:
+        return None
+    if host.startswith('www.'):
+        host = host[4:]
+    if host not in ('youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'):
+        return None
+
+    # Bentuk query: /watch?v=ID (parameter list=/start_radio= diabaikan).
+    if parsed.query:
+        try:
+            values = parse_qs(parsed.query).get('v')
+        except ValueError:
+            values = None
+        if values:
+            candidate = values[0].strip()
+            match = _VIDEO_ID_RE.fullmatch(candidate)
+            if match:
+                return candidate
+
+    # Bentuk path: youtu.be/ID, /embed/ID, /shorts/ID, /live/ID, /v/ID.
+    segments = [seg for seg in parsed.path.split('/') if seg]
+    if not segments:
+        return None
+    if host == 'youtu.be':
+        candidate = segments[0]
+    elif segments[0] in _VIDEO_ID_PATHS and len(segments) >= 2:
+        candidate = segments[1]
+    else:
+        return None
+    match = _VIDEO_ID_RE.fullmatch(candidate.strip())
+    return candidate.strip() if match else None
+
+
+def build_mix_url(video_id: str) -> str:
+    """URL YouTube Mix (radio) untuk sebuah videoId."""
+    return f'https://www.youtube.com/watch?v={video_id}&list=RD{video_id}&start_radio=1'
+
+
+async def fetch_youtube_mix(video_id: str, exclude_urls: set[str] | None = None,
+                            requester: str = 'AutoPlay',
+                            limit: int | None = None) -> list[Track]:
+    """Ambil lagu dari YouTube Mix untuk videoId.
+
+    - limit default = MIX_RESULT_LIMIT (playlistend).
+    - WAJIB playlistend=limit (tanpa ini ekstraksi ~20s).
+    - Pakai _with_cookies(...) + js_runtimes.
+    - Buang track yang url-nya ada di exclude_urls.
+    - Buang livestream/dead entry (lewat _tracks_from_metadata).
+    - Kembalikan list[Track]; KOSONG bila gagal (JANGAN raise ke pemanggil).
+    """
+    if not video_id:
+        return []
+    effective_limit = MIX_RESULT_LIMIT if limit is None else limit
+    url = build_mix_url(video_id)
+    try:
+        async with EXTRACT_SEM:
+            data = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_mix_metadata, url, effective_limit),
+                timeout=60)
+    except Exception as exc:
+        log.warning('YouTube Mix gagal untuk videoId %s: %s', video_id, exc)
+        return []
+    if not data:
+        return []
+    try:
+        tracks = _tracks_from_metadata(data, requester, url)
+    except ValueError:
+        return []
+    excluded = exclude_urls or set()
+    return [t for t in tracks if t.url not in excluded]
 
 
 class BufferedAudioSource(discord.AudioSource):
@@ -1945,7 +2083,7 @@ class MusicBot(discord.Client):
                 '`/antrian` — lihat daftar antrian lagu\n'
                 '`/shuffle` — acak antrian\n'
                 '`/loop <off|track|queue>` — atur mode pengulangan\n'
-                '`/autoplay` — rekomendasi otomatis berbasis lagu sebelumnya saat antrian habis'
+                '`/autoplay` — rekomendasi otomatis berbasis YouTube Mix saat antrian habis'
             ),
             inline=False,
         )
@@ -2101,19 +2239,21 @@ class MusicBot(discord.Client):
                 try:
                     async with state.lock:
                         seed_titles = [t.title for t in list(state.history)[-5:]]
+                        seed_urls = [t.url for t in list(state.history)[-5:]]
                         if state.current:
                             seed_titles.append(state.current.title)
+                            seed_urls.append(state.current.url)
                         played_urls = {t.url for t in list(state.history)[-20:]}
                         if state.current:
                             played_urls.add(state.current.url)
-                    candidates = await fetch_recommendations(seed_titles, played_urls)
+                    candidates = await fetch_recommendations(
+                        seed_titles, played_urls, seed_urls=seed_urls)
                     next_track = next((c for c in candidates
                                        if c.url not in played_urls), None)
                     if next_track is None:
                         log.info('AutoPlay: tidak ada rekomendasi baru, pemutaran berhenti.')
                         break
-                    log.info('AutoPlay memilih rekomendasi berbasis %d lagu sebelumnya: %s',
-                             len(seed_titles), next_track.title)
+                    log.info('AutoPlay (Mix) memilih: %s', next_track.title)
                 except Exception as exc:
                     log.warning('AutoPlay failed: %s', exc)
                     break

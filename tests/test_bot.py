@@ -12,7 +12,8 @@ import bot as bot_module
 from bot import (MusicBot, MusicPanel, Track, QueueState, GuildState, get_afk_timeout,
                  DEFAULT_VOLUME, get_default_volume,
                  build_recommendation_queries, _clean_seed_title, fetch_recommendations,
-                 extract_track, extract_tracks, source_for, _cookies_file, _with_cookies, SearchModal)
+                 extract_track, extract_tracks, source_for, _cookies_file, _with_cookies, SearchModal,
+                 extract_video_id, build_mix_url, fetch_youtube_mix, MIX_RESULT_LIMIT)
 
 
 class MusicTests(unittest.TestCase):
@@ -1217,6 +1218,174 @@ class AutoplayRecommendationTests(unittest.TestCase):
 
         mock_extract.assert_not_called()
         vc.play.assert_not_called()
+
+
+class YouTubeMixTests(unittest.TestCase):
+    """KAN-5: YouTube Mix (radio `list=RD`) — helper + integrasi AutoPlay.
+
+    Semua tes mem-mock `yt_dlp.YoutubeDL` / `bot._fetch_metadata` sehingga
+    tidak pernah menyentuh jaringan nyata.
+    """
+
+    # ID 11 karakter yang valid untuk helper (regex fullmatch).
+    _VIDEO_ID = 'dQw4w9WgXcQ'
+    _SEED_URL = 'https://youtube.com/watch?v=dQw4w9WgXcQ'
+
+    def test_extract_video_id_variants(self):
+        """Semua bentuk URL YouTube yang didukung mengembalikan videoId yang sama."""
+        vid = self._VIDEO_ID
+        cases = {
+            f'https://www.youtube.com/watch?v={vid}': vid,
+            f'https://youtube.com/watch?v={vid}': vid,
+            f'https://youtu.be/{vid}': vid,
+            f'https://www.youtube.com/shorts/{vid}': vid,
+            f'https://www.youtube.com/embed/{vid}': vid,
+            f'https://music.youtube.com/watch?v={vid}': vid,
+            # Parameter list=/start_radio= harus diabaikan.
+            f'https://www.youtube.com/watch?v={vid}&list=RD{vid}&start_radio=1': vid,
+        }
+        for url, expected in cases.items():
+            self.assertEqual(extract_video_id(url), expected, f'gagal untuk {url}')
+
+    def test_extract_video_id_invalid_returns_none(self):
+        self.assertIsNone(extract_video_id('bukan url'))
+        self.assertIsNone(extract_video_id(''))
+        self.assertIsNone(extract_video_id(None))
+        # ID bukan 11 karakter / host non-YouTube.
+        self.assertIsNone(extract_video_id('https://youtube.com/watch?v=abc'))
+        self.assertIsNone(extract_video_id('https://example.com/watch?v=dQw4w9WgXcQ'))
+
+    def test_build_mix_url_format(self):
+        self.assertEqual(
+            build_mix_url('abc'),
+            'https://www.youtube.com/watch?v=abc&list=RDabc&start_radio=1')
+
+    def test_fetch_youtube_mix_parses_entries(self):
+        """Entri playlist diubah jadi Track dan `playlistend` wajib dipakai."""
+        mock_entries = [
+            {'title': f'Song {i}', 'url': f'https://youtube.com/watch?v=s{i}', 'id': f's{i}'}
+            for i in range(30)
+        ]
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                '_type': 'playlist',
+                'entries': mock_entries,
+            }
+            tracks = asyncio.run(fetch_youtube_mix(self._VIDEO_ID))
+
+        self.assertEqual(len(tracks), 30)
+        self.assertEqual(tracks[0].title, 'Song 0')
+        self.assertEqual(tracks[0].url, 'https://youtube.com/watch?v=s0')
+        self.assertEqual(tracks[0].requester, 'AutoPlay')
+
+        # Opsi yt-dlp harus membawa playlistend (hemat waktu) = MIX_RESULT_LIMIT.
+        opts = downloader.call_args[0][0]
+        self.assertIn('playlistend', opts)
+        self.assertEqual(opts['playlistend'], MIX_RESULT_LIMIT)
+        # URL yang diekstrak harus bentuk Mix yang benar.
+        self.assertEqual(downloader.return_value.__enter__.return_value.extract_info.call_args[0][0],
+                         build_mix_url(self._VIDEO_ID))
+
+    def test_fetch_youtube_mix_respects_custom_limit(self):
+        """Limit yang diminta harus diteruskan sebagai playlistend."""
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                'entries': [{'title': 'S', 'url': 'https://youtube.com/watch?v=s0'}],
+            }
+            asyncio.run(fetch_youtube_mix(self._VIDEO_ID, limit=7))
+        self.assertEqual(downloader.call_args[0][0]['playlistend'], 7)
+
+    def test_fetch_youtube_mix_returns_empty_on_error(self):
+        """DownloadError tidak boleh bocor ke pemanggil: hasilnya []."""
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.side_effect = (
+                bot_module.yt_dlp.utils.DownloadError('boom'))
+            result = asyncio.run(fetch_youtube_mix(self._VIDEO_ID))
+        self.assertEqual(result, [])
+
+    def test_fetch_youtube_mix_empty_video_id_short_circuits(self):
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            self.assertEqual(asyncio.run(fetch_youtube_mix('')), [])
+            downloader.assert_not_called()
+
+    def test_fetch_youtube_mix_filters_exclude_urls(self):
+        entries = [
+            {'title': 'Keep', 'url': 'https://youtube.com/watch?v=keep'},
+            {'title': 'Drop', 'url': 'https://youtube.com/watch?v=drop'},
+        ]
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                'entries': entries,
+            }
+            tracks = asyncio.run(fetch_youtube_mix(
+                self._VIDEO_ID, exclude_urls={'https://youtube.com/watch?v=drop'}))
+        self.assertEqual([t.title for t in tracks], ['Keep'])
+
+    def test_fetch_youtube_mix_builds_url_from_id(self):
+        """URL Mix dibentuk dari videoId lewat build_mix_url."""
+        with patch('bot.yt_dlp.YoutubeDL') as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                'entries': [{'title': 'S', 'url': 'https://youtube.com/watch?v=s0'}],
+            }
+            asyncio.run(fetch_youtube_mix(self._VIDEO_ID))
+        called_url = downloader.return_value.__enter__.return_value.extract_info.call_args[0][0]
+        self.assertEqual(called_url, build_mix_url(self._VIDEO_ID))
+
+    def test_fetch_recommendations_prefers_mix_when_seed_urls(self):
+        """Ada seed URL valid + Mix menghasilkan track → pakai Mix, bukan pencarian teks."""
+        rec = Track('Mix Song', 'https://youtube.com/watch?v=mix00000001', 'AutoPlay')
+        with patch('bot.fetch_youtube_mix', new=AsyncMock(return_value=[rec])) as mock_mix, \
+             patch('bot._fetch_metadata') as mock_fetch:
+            recs = asyncio.run(fetch_recommendations(
+                ['Seed Lagu'], set(), seed_urls=[self._SEED_URL]))
+
+        self.assertEqual(recs, [rec])
+        mock_mix.assert_awaited_once()
+        # videoId dari seed URL diteruskan ke fetch_youtube_mix.
+        self.assertEqual(mock_mix.await_args.args[0], self._VIDEO_ID)
+        # Jalur teks TIDAK boleh dipakai saat Mix berhasil.
+        mock_fetch.assert_not_called()
+
+    def test_fetch_recommendations_falls_back_to_text_when_mix_empty(self):
+        """Mix kosong → fallback ke pencarian teks lama tetap menghasilkan kandidat."""
+        with patch('bot.fetch_youtube_mix', new=AsyncMock(return_value=[])) as mock_mix, \
+             patch('bot._fetch_metadata') as mock_fetch:
+            mock_fetch.return_value = {
+                'entries': [{'title': 'Hasil Teks',
+                             'url': 'https://youtube.com/watch?v=text0000001'}],
+            }
+            recs = asyncio.run(fetch_recommendations(
+                ['Seed Lagu'], set(), seed_urls=[self._SEED_URL]))
+
+        self.assertEqual([t.title for t in recs], ['Hasil Teks'])
+        mock_mix.assert_awaited_once()
+        mock_fetch.assert_called()
+
+    def test_fetch_recommendations_skips_invalid_seed_url(self):
+        """Seed URL tanpa videoId valid → Mix dilewati, langsung fallback teks."""
+        with patch('bot.fetch_youtube_mix', new=AsyncMock(return_value=[])) as mock_mix, \
+             patch('bot._fetch_metadata') as mock_fetch:
+            mock_fetch.return_value = {
+                'entries': [{'title': 'Hasil Teks',
+                             'url': 'https://youtube.com/watch?v=text0000002'}],
+            }
+            recs = asyncio.run(fetch_recommendations(
+                ['Seed Lagu'], set(), seed_urls=['https://youtube.com/watch?v=abc']))
+
+        self.assertEqual([t.title for t in recs], ['Hasil Teks'])
+        mock_mix.assert_not_called()
+
+    def test_fetch_recommendations_filters_exclude_urls_from_mix(self):
+        """Track Mix yang URL-nya sudah pernah diputar harus tersaring."""
+        played_url = 'https://youtube.com/watch?v=played00001'
+        dup = Track('Sudah Diputar', played_url, 'AutoPlay')
+        fresh = Track('Baru', 'https://youtube.com/watch?v=fresh000001', 'AutoPlay')
+        with patch('bot.fetch_youtube_mix', new=AsyncMock(return_value=[dup, fresh])):
+            recs = asyncio.run(fetch_recommendations(
+                ['Seed Lagu'], {played_url}, seed_urls=[self._SEED_URL]))
+
+        self.assertEqual([t.title for t in recs], ['Baru'])
+        self.assertTrue(all(t.requester == 'AutoPlay' for t in recs))
 
 
 class AudioPipelineHardeningTests(unittest.TestCase):

@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-224%2F224%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-237%2F237%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -45,7 +45,7 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
   - Video private / dihapus otomatis dilewati tanpa menghentikan pemutaran (`ignoreerrors`).
   - Ekstraksi stream secara *lazy* (hanya saat giliran lagu dimulai) agar URL CDN tidak kedaluwarsa dan menghemat bandwidth.
 - **Fitur Cerdas (AutoPlay, Loop, Shuffle & History):**
-  - **AutoPlay:** Saat antrian/playlist habis, bot otomatis mencari dan memutar lagu rekomendasi **berdasarkan beberapa lagu sebelumnya** (riwayat + lagu yang sedang diputar) sebagai seed pencarian. Rekomendasi yang sudah pernah diputar disaring agar tidak mengulang lagu yang sama; bila tidak ada kandidat baru, pemutaran berhenti dengan rapi.
+  - **AutoPlay (YouTube Mix):** Saat antrian/playlist habis, bot mengambil rekomendasi langsung dari **YouTube Mix** — algoritma radio resmi YouTube (`watch?v=<id>&list=RD<id>&start_radio=1`) yang di-seed dari lagu yang baru diputar, sehingga hasilnya mengikuti "radio" asli YouTube, bukan sekadar pencarian kata kunci. Bila ekstraksi Mix gagal (video tak tersedia / radio tidak dapat dibuka), bot otomatis **fallback ke pencarian teks** berbasis riwayat lagu sebelumnya. Semua kandidat disaring terhadap lagu yang pernah diputar (**anti-ulang**) agar tidak mengulang lagu yang sama; bila tidak ada kandidat baru, pemutaran berhenti dengan rapi. Jumlah lagu yang ditarik per rekomendasi diatur lewat `MIX_RESULT_LIMIT` (default `15`).
   - **Loop Mode:** Siklus pengulangan 3-arah: *Track* (ulang 1 lagu), *Queue* (ulang seluruh antrian), atau *Off*.
   - **Shuffle:** Mengacak urutan antrian lagu seketika secara acak.
   - **History Backtracking:** Menyimpan riwayat lagu yang baru diputar agar tombol `Back` dapat memutar ulang lagu sebelumnya.
@@ -87,7 +87,7 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
 | **Baris 2** | **Shuffle** | 🔀 | Mengacak seluruh urutan lagu di dalam antrian |
 | | **Loop** | 🔁 | Mengubah mode perulangan: *Track* ➔ *Queue* ➔ *Off* |
 | | **Stop** | ⏹️ | Menghentikan musik, mengosongkan antrian, dan keluar voice |
-| | **AutoPlay** | 🔄 | Mengaktifkan/menonaktifkan rekomendasi lagu otomatis (berbasis lagu sebelumnya) |
+| | **AutoPlay** | 🔄 | Mengaktifkan/menonaktifkan rekomendasi lagu otomatis (berbasis YouTube Mix) |
 | | **Playlist** | 🎵 | Melihat daftar antrian & tombol cepat tambah lagu |
 
 ### 💬 Slash Commands Discord
@@ -107,7 +107,7 @@ Semua fungsi tombol juga dapat diakses lewat perintah chat slash:
 | `/volume` | `<0-200>` | Mengatur tingkat volume suara lagu (persentase) |
 | `/shuffle` | - | Mengacak urutan antrian lagu |
 | `/loop` | `[mode]` | Mengatur mode perulangan (`track`, `queue`, atau `off`) |
-| `/autoplay`| - | Mengaktifkan atau menonaktifkan fitur AutoPlay |
+| `/autoplay`| - | Mengaktifkan atau menonaktifkan fitur AutoPlay (berbasis YouTube Mix) |
 | `/help` | - | Menampilkan daftar perintah dan cara pakai bot |
 
 ---
@@ -156,6 +156,20 @@ Skrip installer otomatis:
 >   DNS-rebinding). `install.sh` mengisinya otomatis dengan `IP_LAN:PORT`.
 >   Bila dikosongkan, panel mendeteksi sendiri alamat lokal mesin.
 > - Panel memakai HTTP polos (tanpa TLS). Jangan ekspos ke internet.
+
+---
+
+## ⚙️ Variabel Lingkungan (`.env`)
+
+Semua variabel opsional kecuali `DISCORD_TOKEN`. Lihat `.env.example` untuk templatnya.
+
+| Variabel | Default | Keterangan |
+| :--- | :---: | :--- |
+| `DISCORD_TOKEN` | — | **Wajib.** Token bot dari Discord Developer Portal. |
+| `DISCORD_GUILD_ID` | — | Opsional. Server uji untuk pendaftaran slash command cepat. |
+| `DEFAULT_VOLUME` | `0.5` | Volume suara bawaan bot (0.0–2.0). |
+| `YTDLP_COOKIES` | `./cookies.txt` | Lokasi `cookies.txt` untuk video age-restricted / butuh login. |
+| `MIX_RESULT_LIMIT` | `15` | Jumlah lagu yang diambil dari YouTube Mix tiap rekomendasi AutoPlay (1–50). Makin besar makin banyak pilihan, tapi ekstraksi makin lambat. |
 
 ---
 
@@ -221,7 +235,7 @@ PYTHONPATH="" PYTHONHOME="" ./venv/bin/python -m unittest discover -s tests -v
 
 Hasil uji:
 ```
-Ran 224 tests in 60.2s
+Ran 237 tests in 60.2s
 OK
 ```
 
