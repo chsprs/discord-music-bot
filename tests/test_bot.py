@@ -9,6 +9,7 @@ import discord
 
 import bot as bot_module
 from bot import (MusicBot, MusicPanel, Track, QueueState, GuildState, get_afk_timeout,
+                 DEFAULT_VOLUME, get_default_volume,
                  extract_track, extract_tracks, source_for, _cookies_file, _with_cookies, SearchModal)
 
 
@@ -66,6 +67,18 @@ class MusicTests(unittest.TestCase):
             source = source_for({'url': 'https://example.com/audio'}, volume=0.75)
             self.assertIsInstance(source, discord.PCMVolumeTransformer)
             self.assertEqual(source.volume, 0.75)
+
+    def test_default_volume_is_fifty_percent(self):
+        state = QueueState()
+        self.assertEqual(state.volume, 0.5)
+        self.assertEqual(DEFAULT_VOLUME, 0.5)
+        self.assertEqual(get_default_volume(), 0.5)
+        class DummyAudio(discord.AudioSource):
+            def read(self): return b''
+        with patch('bot.discord.FFmpegPCMAudio', return_value=DummyAudio()):
+            source = source_for({'url': 'https://example.com/audio'})
+            self.assertIsInstance(source, discord.PCMVolumeTransformer)
+            self.assertEqual(source.volume, 0.5)
 
     def test_buffered_audio_source_fallback_and_cleanup(self):
         from bot import BufferedAudioSource

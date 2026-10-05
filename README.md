@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-205%2F205%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-206%2F206%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)

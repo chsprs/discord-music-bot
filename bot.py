@@ -40,12 +40,27 @@ class Track:
     author: str = "Unknown"
 
 
+DEFAULT_VOLUME = 0.5
+
+
+def get_default_volume() -> float:
+    raw = os.getenv('DEFAULT_VOLUME')
+    if raw is not None:
+        try:
+            val = float(raw)
+            if 0.0 <= val <= 2.0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return DEFAULT_VOLUME
+
+
 @dataclass
 class QueueState:
     queue: deque[Track] = field(default_factory=deque)
     history: deque[Track] = field(default_factory=deque)
     current: Track | None = None
-    volume: float = 1.0
+    volume: float = field(default_factory=get_default_volume)
     loop_mode: str = 'off'  # 'off', 'track', 'queue'
     autoplay: bool = False
     generation: int = 0
@@ -624,7 +639,9 @@ def patch_audio_player():
 patch_audio_player()
 
 
-def source_for(data: dict, volume: float = 1.0) -> discord.PCMVolumeTransformer:
+def source_for(data: dict, volume: float | None = None) -> discord.PCMVolumeTransformer:
+    if volume is None:
+        volume = get_default_volume()
     pcm = discord.FFmpegPCMAudio(
         data['url'],
         before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5',
