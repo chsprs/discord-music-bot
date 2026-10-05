@@ -71,6 +71,19 @@ class MusicTests(unittest.TestCase):
             self.assertIsInstance(source, discord.PCMVolumeTransformer)
             self.assertEqual(source.volume, 0.75)
 
+    def test_source_for_ffmpeg_options_no_reconnect_at_eof(self):
+        class DummyAudio(discord.AudioSource):
+            def read(self): return b''
+        with patch('bot.discord.FFmpegPCMAudio', return_value=DummyAudio()) as mock_ffmpeg:
+            source_for({'url': 'https://example.com/audio'})
+            mock_ffmpeg.assert_called_once()
+            _, kwargs = mock_ffmpeg.call_args
+            before_options = kwargs.get('before_options', '')
+            self.assertIn('-reconnect 1', before_options)
+            self.assertIn('-reconnect_streamed 1', before_options)
+            self.assertNotIn('-reconnect_at_eof', before_options)
+            self.assertIn('-reconnect_on_network_error 1', before_options)
+
     def test_default_volume_is_fifty_percent(self):
         state = QueueState()
         self.assertEqual(state.volume, 0.5)
