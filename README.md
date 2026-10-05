@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-206%2F206%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-224%2F224%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -45,7 +45,7 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
   - Video private / dihapus otomatis dilewati tanpa menghentikan pemutaran (`ignoreerrors`).
   - Ekstraksi stream secara *lazy* (hanya saat giliran lagu dimulai) agar URL CDN tidak kedaluwarsa dan menghemat bandwidth.
 - **Fitur Cerdas (AutoPlay, Loop, Shuffle & History):**
-  - **AutoPlay:** Secara otomatis mencari dan memutar lagu rekomendasi YouTube terkait saat antrian lagu habis.
+  - **AutoPlay:** Saat antrian/playlist habis, bot otomatis mencari dan memutar lagu rekomendasi **berdasarkan beberapa lagu sebelumnya** (riwayat + lagu yang sedang diputar) sebagai seed pencarian. Rekomendasi yang sudah pernah diputar disaring agar tidak mengulang lagu yang sama; bila tidak ada kandidat baru, pemutaran berhenti dengan rapi.
   - **Loop Mode:** Siklus pengulangan 3-arah: *Track* (ulang 1 lagu), *Queue* (ulang seluruh antrian), atau *Off*.
   - **Shuffle:** Mengacak urutan antrian lagu seketika secara acak.
   - **History Backtracking:** Menyimpan riwayat lagu yang baru diputar agar tombol `Back` dapat memutar ulang lagu sebelumnya.
@@ -87,7 +87,7 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
 | **Baris 2** | **Shuffle** | 🔀 | Mengacak seluruh urutan lagu di dalam antrian |
 | | **Loop** | 🔁 | Mengubah mode perulangan: *Track* ➔ *Queue* ➔ *Off* |
 | | **Stop** | ⏹️ | Menghentikan musik, mengosongkan antrian, dan keluar voice |
-| | **AutoPlay** | 🔄 | Mengaktifkan/menonaktifkan rekomendasi lagu otomatis |
+| | **AutoPlay** | 🔄 | Mengaktifkan/menonaktifkan rekomendasi lagu otomatis (berbasis lagu sebelumnya) |
 | | **Playlist** | 🎵 | Melihat daftar antrian & tombol cepat tambah lagu |
 
 ### 💬 Slash Commands Discord
@@ -221,7 +221,7 @@ PYTHONPATH="" PYTHONHOME="" ./venv/bin/python -m unittest discover -s tests -v
 
 Hasil uji:
 ```
-Ran 205 tests in 60.2s
+Ran 224 tests in 60.2s
 OK
 ```
 

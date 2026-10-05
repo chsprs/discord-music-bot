@@ -11,6 +11,7 @@ import discord
 import bot as bot_module
 from bot import (MusicBot, MusicPanel, Track, QueueState, GuildState, get_afk_timeout,
                  DEFAULT_VOLUME, get_default_volume,
+                 build_recommendation_queries, _clean_seed_title, fetch_recommendations,
                  extract_track, extract_tracks, source_for, _cookies_file, _with_cookies, SearchModal)
 
 
@@ -1101,6 +1102,121 @@ class HelpCommandTests(unittest.TestCase):
         missing = sorted(name for name in registered if f'/{name}' not in text)
         self.assertEqual(missing, [],
                          f'command terdaftar tapi tidak ada di /help: {missing}')
+
+
+class AutoplayRecommendationTests(unittest.TestCase):
+    """Rekomendasi lagu saat antrian/playlist habis (berbasis lagu sebelumnya)."""
+
+    def test_clean_seed_title_strips_noise(self):
+        self.assertEqual(
+            _clean_seed_title('Song A (Official Music Video)'),
+            'Song A')
+        self.assertEqual(_clean_seed_title('Song B [Lyric Video] HD'), 'Song B')
+        self.assertEqual(_clean_seed_title(None), '')
+        self.assertEqual(_clean_seed_title(''), '')
+
+    def test_build_queries_uses_latest_history_first(self):
+        queries = build_recommendation_queries(
+            ['A', 'B', 'C', 'D'], current_title='E')
+        self.assertEqual(len(queries), 3)
+        self.assertIn('E', queries[0])
+        self.assertIn('D', queries[1])
+        self.assertIn('C', queries[2])
+        self.assertTrue(all(q.startswith('ytsearch5:') for q in queries))
+
+    def test_build_queries_dedups_seeds(self):
+        queries = build_recommendation_queries(['Same', 'Same'], 'Same')
+        self.assertEqual(len(queries), 1)
+
+    def test_fetch_recommendations_filters_already_played(self):
+        played = {'https://youtube.com/watch?v=played'}
+        with patch('bot._fetch_metadata') as fetch:
+            fetch.return_value = {
+                'entries': [
+                    {'title': 'Sudah diputar', 'url': 'https://youtube.com/watch?v=played'},
+                    {'title': 'Lagu Baru', 'url': 'https://youtube.com/watch?v=new1'},
+                    {'title': 'Lagu Baru 2', 'url': 'https://youtube.com/watch?v=new2'},
+                ]
+            }
+            recs = asyncio.run(fetch_recommendations(['Seed Lagu'], played))
+        self.assertEqual([t.title for t in recs], ['Lagu Baru', 'Lagu Baru 2'])
+        self.assertTrue(all(t.requester == 'AutoPlay' for t in recs))
+
+    def test_fetch_recommendations_falls_back_to_older_seed(self):
+        calls = []
+
+        def fake_fetch(target):
+            calls.append(target)
+            if len(calls) == 1:
+                raise bot_module.yt_dlp.utils.DownloadError('boom')
+            return {'entries': [{'title': 'Hasil Cadangan',
+                                 'url': 'https://youtube.com/watch?v=fallback'}]}
+
+        with patch('bot._fetch_metadata', side_effect=fake_fetch):
+            recs = asyncio.run(fetch_recommendations(['Seed Baru', 'Seed Lama'], set()))
+        self.assertEqual([t.title for t in recs], ['Hasil Cadangan'])
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_advance_autoplay_picks_recommendation_and_avoids_repeat(self):
+        """Antrian habis + AutoPlay aktif: ambil rekomendasi baru, bukan ulang lagu lama."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88901
+        guild.name = 'AutoGuild'
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.autoplay = True
+        state.current = Track('Lagu Sekarang', 'https://youtube.com/watch?v=cur', 'u')
+        state.history.append(Track('Lagu Lama', 'https://youtube.com/watch?v=old', 'u'))
+        bot.states[guild.id] = state
+
+        rec = Track('Rekomendasi Baru', 'https://youtube.com/watch?v=rec', 'AutoPlay')
+        with patch('bot.fetch_recommendations', new=AsyncMock(return_value=[rec])) as mock_rec, \
+             patch('bot.extract', return_value={'url': 'https://cdn/audio'}), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(bot.advance(guild))
+
+        mock_rec.assert_awaited_once()
+        # Seed memuat riwayat + lagu sekarang.
+        seeds, played = mock_rec.await_args.args[0], mock_rec.await_args.args[1]
+        self.assertIn('Lagu Sekarang', seeds)
+        self.assertIn('Lagu Lama', seeds)
+        self.assertIn('https://youtube.com/watch?v=cur', played)
+        self.assertEqual(state.current.title, 'Rekomendasi Baru')
+
+    def test_advance_autoplay_stops_when_no_new_recommendation(self):
+        """Bila semua rekomendasi sudah pernah diputar, bot berhenti (tidak mengulang)."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88902
+        guild.name = 'AutoGuild2'
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.autoplay = True
+        state.current = Track('Lagu', 'https://youtube.com/watch?v=x', 'u')
+        bot.states[guild.id] = state
+
+        # Kandidat hanya berisi URL yang sudah diputar (lagu sekarang).
+        dup = Track('Duplikat', 'https://youtube.com/watch?v=x', 'AutoPlay')
+        with patch('bot.fetch_recommendations', new=AsyncMock(return_value=[dup])), \
+             patch('bot.extract') as mock_extract, \
+             patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(bot.advance(guild))
+
+        mock_extract.assert_not_called()
+        vc.play.assert_not_called()
 
 
 class AudioPipelineHardeningTests(unittest.TestCase):

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import signal
 import sys
@@ -411,6 +412,11 @@ async def extract_tracks(query: str, requester: str) -> list[Track]:
     if not data:
         raise ValueError('Lagu atau playlist tidak ditemukan.')
 
+    return _tracks_from_metadata(data, requester, target)
+
+
+def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track]:
+    """Ubah hasil yt-dlp (video tunggal / playlist / hasil pencarian) jadi Track."""
     if data.get('is_live') or data.get('live_status') == 'is_live':
         raise ValueError('Video siaran langsung (livestream) tidak didukung oleh pemutar audio statis.')
 
@@ -455,6 +461,78 @@ async def extract_tracks(query: str, requester: str) -> list[Track]:
 async def extract_track(query: str, requester: str) -> Track:
     tracks = await extract_tracks(query, requester)
     return tracks[0]
+
+
+def build_recommendation_queries(history_titles: list[str], current_title: str | None = None) -> list[str]:
+    """Susun kueri pencarian rekomendasi dari beberapa lagu terakhir.
+
+    Lagu paling baru dipakai sebagai seed utama, lalu ditambah seed dari
+    riwayat sebelumnya sebagai cadangan bila seed utama tidak menghasilkan
+    kandidat baru. Kueri di-dedup agar tidak menembak pencarian yang sama
+    berkali-kali.
+    """
+    seeds: list[str] = []
+    for title in list(history_titles or []) + ([current_title] if current_title else []):
+        clean = _clean_seed_title(title)
+        if clean and clean not in seeds:
+            seeds.append(clean)
+    # Seed terbaru dulu (paling relevan), batasi agar tidak spam pencarian.
+    seeds = list(reversed(seeds))[:3]
+    queries: list[str] = []
+    for seed in seeds:
+        queries.append(f'ytsearch5:{seed} related songs mix')
+    return queries
+
+
+def _clean_seed_title(title: str | None) -> str:
+    """Bersihkan judul lagu dari noise umum agar pencarian rekomendasi relevan."""
+    if not title:
+        return ''
+    text = str(title)
+    # Hapus dulu frasa panjang supaya sisa potongannya tidak tertinggal.
+    for noise in ('Official Music Video', 'Official Video', 'Official Audio',
+                  'Lyric Video', 'Lyrics Video', 'Music Video', 'Audio Only',
+                  'Official', 'Lyrics', 'Audio', 'MV', 'HD', '4K', 'HQ'):
+        text = re.sub(re.escape(noise), ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'[\(\)\[\]\{\}]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip(' -–—|,')
+    return text[:200]
+
+
+async def fetch_recommendations(history_titles: list[str], exclude_urls: set[str],
+                                requester: str = 'AutoPlay') -> list[Track]:
+    """Ambil kandidat lagu rekomendasi berbasis riwayat lagu sebelumnya.
+
+    Menyaring URL yang sudah pernah diputar (exclude_urls) supaya AutoPlay tidak
+    mengulang lagu yang sama, dan mengembalikan kandidat terurut sesuai
+    relevansi pencarian.
+    """
+    queries = build_recommendation_queries(history_titles)
+    seen: set[str] = set(exclude_urls or set())
+    candidates: list[Track] = []
+    for query in queries:
+        try:
+            async with EXTRACT_SEM:
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(_fetch_metadata, query), timeout=60)
+        except Exception as exc:
+            log.warning('Rekomendasi gagal untuk kueri %r: %s', query, exc)
+            continue
+        if not data:
+            continue
+        try:
+            found = _tracks_from_metadata(data, requester, query)
+        except ValueError:
+            continue
+        for track in found:
+            if track.url in seen:
+                continue
+            seen.add(track.url)
+            candidates.append(track)
+        if candidates:
+            # Kueri seed pertama sudah menghasilkan kandidat: cukup, hemat kuota.
+            break
+    return candidates
 
 
 class BufferedAudioSource(discord.AudioSource):
@@ -1867,7 +1945,7 @@ class MusicBot(discord.Client):
                 '`/antrian` — lihat daftar antrian lagu\n'
                 '`/shuffle` — acak antrian\n'
                 '`/loop <off|track|queue>` — atur mode pengulangan\n'
-                '`/autoplay` — putar rekomendasi otomatis saat antrian habis'
+                '`/autoplay` — rekomendasi otomatis berbasis lagu sebelumnya saat antrian habis'
             ),
             inline=False,
         )
@@ -2021,16 +2099,23 @@ class MusicBot(discord.Client):
             # --- fase 2: autoplay resolve di luar lock (M9) ---
             if next_track is None and state.autoplay and state.current:
                 try:
-                    query = f"ytsearch1:{state.current.title} related song"
-                    auto_tracks = await extract_tracks(query, "AutoPlay")
-                    if auto_tracks:
-                        picked = auto_tracks[0]
-                        if state.current and picked.url == state.current.url:
-                            break
-                        next_track = picked
-                        log.info("AutoPlay selected: %s", next_track.title)
+                    async with state.lock:
+                        seed_titles = [t.title for t in list(state.history)[-5:]]
+                        if state.current:
+                            seed_titles.append(state.current.title)
+                        played_urls = {t.url for t in list(state.history)[-20:]}
+                        if state.current:
+                            played_urls.add(state.current.url)
+                    candidates = await fetch_recommendations(seed_titles, played_urls)
+                    next_track = next((c for c in candidates
+                                       if c.url not in played_urls), None)
+                    if next_track is None:
+                        log.info('AutoPlay: tidak ada rekomendasi baru, pemutaran berhenti.')
+                        break
+                    log.info('AutoPlay memilih rekomendasi berbasis %d lagu sebelumnya: %s',
+                             len(seed_titles), next_track.title)
                 except Exception as exc:
-                    log.warning("AutoPlay failed: %s", exc)
+                    log.warning('AutoPlay failed: %s', exc)
                     break
                 if not next_track:
                     break
