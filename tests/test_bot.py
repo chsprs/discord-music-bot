@@ -338,6 +338,42 @@ class MusicTests(unittest.TestCase):
             self.assertEqual(len(state.queue), 1)
             self.assertIsNone(state.current)
 
+    def test_quit_voice_clears_cache_when_clear_queue_true(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 99997
+        guild.voice_client = None
+        state = QueueState()
+        bot.states[99997] = state
+
+        with patch('bot.clear_cache') as mock_clear:
+            asyncio.run(bot.quit_voice(guild, clear_queue=True))
+            mock_clear.assert_called_once()
+
+    def test_quit_voice_does_not_clear_cache_when_clear_queue_false(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 99996
+        guild.voice_client = None
+        state = QueueState()
+        bot.states[99996] = state
+
+        with patch('bot.clear_cache') as mock_clear:
+            asyncio.run(bot.quit_voice(guild, clear_queue=False))
+            mock_clear.assert_not_called()
+
+    def test_quit_voice_clear_cache_handles_exception_gracefully(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 99995
+        guild.voice_client = None
+        state = QueueState()
+        bot.states[99995] = state
+
+        with patch('bot.clear_cache', side_effect=RuntimeError('disk failure')):
+            # Should not raise
+            asyncio.run(bot.quit_voice(guild, clear_queue=True))
+
     def test_cmd_quit_invokes_quit_voice(self):
         bot = MusicBot()
         interaction = MagicMock()
@@ -685,6 +721,66 @@ class MusicTests(unittest.TestCase):
         self.assertIs(state.current, track)
         self.assertEqual(announced, [track])
         self.assertIsNotNone(mock_ann)
+
+    def test_advance_queue_loop_replays_single_track_when_queue_empty(self):
+        """Mode loop 'queue' mengulang state.current saat antrian kosong (1 lagu)."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88005
+        guild.name = 'QueueLoopGuild'
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        state = QueueState()
+        track = Track('single_loop', 'https://example.com/single', 'user')
+        state.current = track
+        state.loop_mode = 'queue'
+        bot.states[88005] = state
+
+        announced = []
+        with patch('bot.extract', return_value={'url': 'https://cdn/audio'}):
+            with patch('bot.source_for', return_value=MagicMock()):
+                with patch.object(bot, 'refresh', new=AsyncMock()):
+                    with patch.object(bot, '_announce_now_playing', new=AsyncMock(
+                            side_effect=lambda g, t: announced.append(t))):
+                        asyncio.run(bot.advance(guild))
+        vc.play.assert_called_once()
+        self.assertIs(state.current, track)
+        self.assertEqual(len(state.queue), 0)
+        self.assertEqual(announced, [track])
+
+    def test_advance_queue_loop_with_multiple_tracks_rotates(self):
+        """Mode loop 'queue' memutar track berikutnya dan mengembalikan current ke queue."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88006
+        guild.name = 'QueueLoopMultiGuild'
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        state = QueueState()
+        track1 = Track('track1', 'https://example.com/1', 'user')
+        track2 = Track('track2', 'https://example.com/2', 'user')
+        state.current = track1
+        state.queue.append(track2)
+        state.loop_mode = 'queue'
+        bot.states[88006] = state
+
+        with patch('bot.extract', return_value={'url': 'https://cdn/audio'}):
+            with patch('bot.source_for', return_value=MagicMock()):
+                with patch.object(bot, 'refresh', new=AsyncMock()):
+                    asyncio.run(bot.advance(guild))
+        vc.play.assert_called_once()
+        self.assertIs(state.current, track2)
+        self.assertEqual(list(state.queue), [track1])
 
     def test_advance_schedules_idle_when_nothing_playing(self):
         """Setelah gagal putar, current harus cleared agar idle-disconnect jalan."""

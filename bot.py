@@ -1268,6 +1268,7 @@ class MusicPanel(discord.ui.View):
         state = self.bot.states[interaction.guild.id]
         cycle = {'off': 'track', 'track': 'queue', 'queue': 'off'}
         state.loop_mode = cycle.get(state.loop_mode, 'off')
+        self.bot._save_persistent_queue()
         mode_text = {'track': 'Ulang Lagu Ini (Track)', 'queue': 'Ulang Seluruh Antrian (Queue)', 'off': 'Mati (Off)'}
         await interaction.followup.send(f'Mode Loop: **{mode_text[state.loop_mode]}**', ephemeral=True)
         await self.bot.refresh(state)
@@ -1288,6 +1289,7 @@ class MusicPanel(discord.ui.View):
             return
         state = self.bot.states[interaction.guild.id]
         state.autoplay = not state.autoplay
+        self.bot._save_persistent_queue()
         status = 'Aktif' if state.autoplay else 'Nonaktif'
         await interaction.followup.send(f'AutoPlay sekarang: **{status}**', ephemeral=True)
         await self.bot.refresh(state)
@@ -1367,6 +1369,9 @@ class MusicBot(discord.Client):
                     g_entry = {
                         'current': curr,
                         'queue': q,
+                        'volume': getattr(st, 'volume', get_default_volume()),
+                        'loop_mode': getattr(st, 'loop_mode', 'off'),
+                        'autoplay': getattr(st, 'autoplay', False),
                     }
                     msg = getattr(st, 'message', None)
                     msg_id = getattr(msg, 'id', msg if isinstance(msg, int) else None)
@@ -1445,6 +1450,22 @@ class MusicBot(discord.Client):
             text_channel_id = g_data.get('text_channel_id')
             if text_channel_id is not None and getattr(state, 'text_channel_id', None) is None:
                 state.text_channel_id = text_channel_id
+            if 'volume' in g_data:
+                try:
+                    vol = float(g_data['volume'])
+                    if not (vol != vol):
+                        state.volume = round(max(0.0, min(vol, 2.0)), 2)
+                        has_restored = True
+                except (ValueError, TypeError):
+                    pass
+            if 'loop_mode' in g_data:
+                loop_mode = str(g_data['loop_mode']).lower()
+                if loop_mode in {'off', 'track', 'queue'}:
+                    state.loop_mode = loop_mode
+                    has_restored = True
+            if 'autoplay' in g_data:
+                state.autoplay = bool(g_data['autoplay'])
+                has_restored = True
             if has_restored:
                 restored_guilds += 1
         if restored_guilds > 0:
@@ -1886,6 +1907,7 @@ class MusicBot(discord.Client):
                 cycle = {'off': 'track', 'track': 'queue', 'queue': 'off'}
                 state.loop_mode = cycle.get(state.loop_mode, 'off')
             loop_mode = state.loop_mode
+        self._save_persistent_queue()
         mode_text = {'track': 'Ulang Lagu Ini (Track)', 'queue': 'Ulang Seluruh Antrian (Queue)', 'off': 'Mati (Off)'}
         await interaction.followup.send(f'Mode Loop: **{mode_text[loop_mode]}**', ephemeral=True)
         await self.refresh(state)
@@ -1898,6 +1920,7 @@ class MusicBot(discord.Client):
         async with state.lock:
             state.autoplay = not state.autoplay
             autoplay_on = state.autoplay
+        self._save_persistent_queue()
         status = 'Aktif' if autoplay_on else 'Nonaktif'
         await interaction.followup.send(f'AutoPlay sekarang: **{status}**', ephemeral=True)
         await self.refresh(state)
@@ -1957,6 +1980,11 @@ class MusicBot(discord.Client):
             await self.refresh(state)
         self._save_persistent_queue()
         dump_runtime_state(self)
+        if clear_queue:
+            try:
+                await asyncio.to_thread(clear_cache)
+            except Exception as exc:
+                log.debug('Gagal membersihkan cache: %s', exc)
 
     async def cmd_stop(self, interaction: discord.Interaction):
         if not _check_guild_only(interaction):
@@ -2040,6 +2068,7 @@ class MusicBot(discord.Client):
         async with state.lock:
             state.volume = round(max(0.0, min(target_vol, 2.0)), 2)
             vol = state.volume
+        self._save_persistent_queue()
         vc = interaction.guild.voice_client
         if vc and getattr(vc, 'source', None):
             source = vc.source
@@ -2229,6 +2258,8 @@ class MusicBot(discord.Client):
                     next_track = state.current
                 elif state.queue:
                     next_track = state.queue[0]
+                elif state.loop_mode == 'queue' and state.current:
+                    next_track = state.current
                 elif state.autoplay and state.current:
                     next_track = None  # resolve di luar lock (M9)
                 if not next_track and not (state.autoplay and state.current):
@@ -2355,13 +2386,13 @@ class MusicBot(discord.Client):
                             pass
                     raise
                 # --- fase 4: commit sukses di dalam lock (C1/C2/C3) ---
-                # played harus selalu terdefinisi: mode loop 'track' mengulang
-                # track yang sama tanpa menyentuh queue/history, tetapi tetap
-                # butuh objek track untuk pengumuman now-playing.
+                # played harus selalu terdefinisi: mode loop 'track' atau 'queue'
+                # (saat antrian kosong) mengulang track yang sama tanpa menyentuh
+                # queue/history, tetapi tetap butuh objek track untuk pengumuman now-playing.
                 played = next_track
                 async with state.lock:
                     state._skip_armed = False
-                    if state.loop_mode == 'track' and state.current is next_track:
+                    if (state.loop_mode == 'track' or (state.loop_mode == 'queue' and not state.queue)) and state.current is next_track:
                         pass
                     else:
                         if state.queue and state.queue[0] is next_track:
