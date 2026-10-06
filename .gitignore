@@ -7,3 +7,4 @@ last_update.log
 # Cookies YouTube berisi sesi login: jangan pernah masuk git.
 cookies.txt
 *.cookies.txt
+.worktrees/
