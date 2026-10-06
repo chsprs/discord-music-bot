@@ -33,7 +33,26 @@ fi
 # Pastikan Node.js terpasang (untuk JS runtime yt-dlp)
 if ! command -v node &>/dev/null; then
     echo "Node.js tidak ditemukan, menginstal Node.js LTS..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    # L7: jangan pipe langsung `curl | bash` — kalau unduhan terpotong/MITM,
+    # bash mengeksekusi teks separuh tanpa peringatan. Unduh dulu ke berkas,
+    # verifikasi bentuknya (shebang + berisi setup NodeSource), baru jalankan.
+    NODESOURCE_SETUP="$(mktemp /tmp/nodesource-setup.XXXXXX.sh)"
+    trap 'rm -f "$NODESOURCE_SETUP"' EXIT
+    if ! curl -fsSL https://deb.nodesource.com/setup_20.x -o "$NODESOURCE_SETUP"; then
+        echo "Error: gagal mengunduh skrip NodeSource." >&2
+        exit 1
+    fi
+    if [[ ! -s "$NODESOURCE_SETUP" ]] || ! head -n1 "$NODESOURCE_SETUP" | grep -q '^#!'; then
+        echo "Error: skrip NodeSource tidak valid (bukan skrip shell)." >&2
+        exit 1
+    fi
+    if ! grep -q 'nodesource' "$NODESOURCE_SETUP"; then
+        echo "Error: skrip NodeSource tidak memuat penanda 'nodesource' yang diharapkan." >&2
+        exit 1
+    fi
+    bash "$NODESOURCE_SETUP"
+    rm -f "$NODESOURCE_SETUP"
+    trap - EXIT
     apt-get install -y nodejs
 fi
 

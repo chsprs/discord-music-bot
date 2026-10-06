@@ -785,8 +785,14 @@ class Handler(BaseHTTPRequestHandler):
 
         candidate = fields.get('form_token', '')
         now = time.monotonic()
-        with _lock:
-            expiry = _form_tokens.get(candidate, 0) if candidate else 0
+        # F5: konsumsi nonce secara ATOMIK (pop = check + remove dalam satu lock).
+        # Versi lama membaca `has_valid_nonce` lalu pop di akuisisi terpisah; dua
+        # POST konkuren dengan nonce sama bisa sama-sama lolos sebelum sempat
+        # di-pop. Sekarang hanya pemanggil pertama yang mendapat nonce valid.
+        has_valid_nonce = False
+        if candidate:
+            with _lock:
+                expiry = _form_tokens.pop(candidate, 0)
             has_valid_nonce = bool(expiry > now)
 
         # 1. Sec-Fetch-Site: cross-site ditolak tanpa syarat (S5). Nonce bukan
@@ -804,13 +810,9 @@ class Handler(BaseHTTPRequestHandler):
             if netloc and netloc == host:
                 return True
 
-        # 3. Valid page nonce accepted (covers Origin: null, missing Origin, in-app WebViews)
+        # 3. Valid page nonce accepted (covers Origin: null, missing Origin, in-app WebViews).
+        #    Nonce sudah dikonsumsi atomik di atas (L4/F5), jadi cukup pakai hasilnya.
         if has_valid_nonce:
-            # L4: konsumsi nonce (sekali pakai) agar satu token halaman tidak bisa
-            # diputar ulang sampai kedaluwarsa. Origin/Sec-Fetch-Site tetap jadi
-            # pertahanan utama.
-            with _lock:
-                _form_tokens.pop(candidate, None)
             return True
 
         # 4. Fallback: Referer matching host
@@ -1234,12 +1236,25 @@ def _default_allowed_hosts(host: str, port: int) -> set[str]:
     return hosts
 
 
+def _parse_port(raw: str | None) -> int:
+    """F4: parsing PANEL_PORT defensif (filosofi H2) — buruk -> default + warning.
+
+    Tidak SystemExit: unit panel memakai Restart=on-failure, jadi keluar-mati
+    akan memicu crash-loop tiap 5 detik. Fallback ke default lebih aman.
+    """
+    try:
+        port = int(raw) if raw is not None else 9130
+        if not (1 <= port <= 65535):
+            raise ValueError(port)
+        return port
+    except (TypeError, ValueError):
+        print(f"PANEL_PORT={raw!r} tidak valid, memakai default 9130.", flush=True)
+        return 9130
+
+
 def main():
     host = os.environ.get('PANEL_HOST', '0.0.0.0')
-    try:
-        port = int(os.environ.get('PANEL_PORT', '9130'))
-    except ValueError:
-        raise SystemExit('PANEL_PORT harus berupa angka.')
+    port = _parse_port(os.environ.get('PANEL_PORT', '9130'))
     if not ALLOWED_HOSTS:
         ALLOWED_HOSTS.update(_default_allowed_hosts(host, port))
 

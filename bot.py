@@ -95,6 +95,7 @@ class QueueState:
     text_channel_id: int | None = None
     _skip_armed: bool = False  # skip/back manual: after() basi, advance manual yang jalan
     _skip_pending: bool = False  # skip ditekan saat advance() sedang ekstraksi (M4)
+    _advancing: int = 0  # jumlah advance() yang benar-benar di fase ekstraksi/putar (dipakai skip & guard)
     consecutive_playback_errors: int = 0
     idle_task: asyncio.Task | None = None
     empty_task: asyncio.Task | None = None
@@ -158,21 +159,39 @@ class ExtractionBusy(ValueError):
     """
 
 
-def _extract_threads_busy() -> bool:
+def _reserve_extract_slot() -> bool:
+    """F3: reservasi slot secara atomik (check+increment dalam satu lock).
+
+    Versi lama melakukan check-then-act: dua coroutine bisa sama-sama lolos
+    pengecekan `_EXTRACT_THREADS >= MAX_EXTRACT_THREADS` sebelum salah satunya
+    sempat menaikkan counter, sehingga batas keras bisa terlampaui sesaat.
+    Sekarang pengecekan dan penambahan tidak bisa disela.
+    """
+    global _EXTRACT_THREADS
     with _EXTRACT_THREADS_LOCK:
-        return _EXTRACT_THREADS >= MAX_EXTRACT_THREADS
+        if _EXTRACT_THREADS >= MAX_EXTRACT_THREADS:
+            return False
+        _EXTRACT_THREADS += 1
+        return True
+
+
+def _release_extract_slot() -> None:
+    global _EXTRACT_THREADS
+    with _EXTRACT_THREADS_LOCK:
+        _EXTRACT_THREADS -= 1
 
 
 def _tracked_extract(func, *args, **kwargs):
-    """Jalankan func dengan penghitung thread hidup (naik/turun di dalam thread)."""
-    global _EXTRACT_THREADS
-    with _EXTRACT_THREADS_LOCK:
-        _EXTRACT_THREADS += 1
+    """Jalankan func di thread; slot sudah direservasi pemanggil, lepas di finally.
+
+    Slot dilepas DI DALAM thread (bukan oleh coroutine) supaya thread yt-dlp yang
+    menggantung tetap terhitung walau `wait_for` sudah timeout dan coroutine-nya
+    dibatalkan.
+    """
     try:
         return func(*args, **kwargs)
     finally:
-        with _EXTRACT_THREADS_LOCK:
-            _EXTRACT_THREADS -= 1
+        _release_extract_slot()
 
 
 async def run_extract(func, *args, timeout: float = 60, **kwargs):
@@ -181,13 +200,16 @@ async def run_extract(func, *args, timeout: float = 60, **kwargs):
     Menggantikan pola `async with EXTRACT_SEM: await asyncio.wait_for(
     asyncio.to_thread(...))` di semua jalur ekstraksi.
     """
-    if _extract_threads_busy():
-        with _EXTRACT_THREADS_LOCK:
-            alive = _EXTRACT_THREADS
-        log.warning('Ekstraksi ditolak: %d thread yt-dlp masih hidup (batas %d).',
-                    alive, MAX_EXTRACT_THREADS)
-        raise ExtractionBusy('Server sedang sibuk menyiapkan lagu. Coba lagi sebentar lagi.')
     async with EXTRACT_SEM:
+        # Reservasi slot SETELAH semaphore didapat: bila akuisisi semaphore
+        # dibatalkan, tidak ada slot yang bocor. Setelah ini thread pasti jalan
+        # (to_thread selalu mengeksekusi), jadi finally-nya yang melepas slot.
+        if not _reserve_extract_slot():
+            with _EXTRACT_THREADS_LOCK:
+                alive = _EXTRACT_THREADS
+            log.warning('Ekstraksi ditolak: %d thread yt-dlp masih hidup (batas %d).',
+                        alive, MAX_EXTRACT_THREADS)
+            raise ExtractionBusy('Server sedang sibuk menyiapkan lagu. Coba lagi sebentar lagi.')
         return await asyncio.wait_for(
             asyncio.to_thread(_tracked_extract, func, *args, **kwargs), timeout=timeout)
 
@@ -1345,7 +1367,7 @@ class MusicPanel(discord.ui.View):
             await self.bot.advance(interaction.guild)
             self.bot._save_persistent_queue()
             text = 'Dilewati.'
-        elif state._advance_lock.locked():
+        elif state._advancing > 0:
             # M4: belum ada audio yang berputar tetapi advance() sedang
             # mengekstraksi. Rekam permintaan skip; advance() yang sedang jalan
             # akan membuang track itu alih-alih memutarnya.
@@ -1990,7 +2012,7 @@ class MusicBot(discord.Client):
         # M4: advance() sedang ekstraksi dan belum ada audio yang berputar ->
         # rekam skip; advance() yang jalan akan membuang track head.
         vc = interaction.guild.voice_client
-        if state._advance_lock.locked() and not (vc and (vc.is_playing() or vc.is_paused())):
+        if state._advancing > 0 and not (vc and (vc.is_playing() or vc.is_paused())):
             async with state.lock:
                 state._skip_pending = True
             return await interaction.followup.send('Lagu dilewati.', ephemeral=True)
@@ -2407,7 +2429,23 @@ class MusicBot(discord.Client):
                 state.idle_task = None
                 if vc.is_playing() or vc.is_paused():
                     return
+        # M4: tandai bahwa advance() benar-benar berjalan (fase ekstraksi/putar).
+        # Handler Skip memakai flag ini untuk merekam _skip_pending. Memakai
+        # _advance_lock.locked() SALAH: lock hanya dipegang di guard di atas,
+        # sudah dilepas sebelum loop -> flag M4 dulu tak pernah aktif (dead code).
+        # Counter (bukan bool): /play saat ekstraksi bisa memicu advance() kedua
+        # yang berjalan bersamaan; bool akan di-reset oleh yang selesai duluan.
+        async with state.lock:
+            state._advancing += 1
+        try:
+            await self._advance_loop(guild, state, vc)
+        finally:
+            async with state.lock:
+                state._advancing = max(0, state._advancing - 1)
 
+    async def _advance_loop(self, guild: discord.Guild, state: QueueState, vc) -> None:
+        """Inti advance(): pilih, ekstraksi, putar. Selalu dipanggil dari advance()."""
+        gen0 = state.generation  # F2: deteksi /stop atau reconnect di tengah jalan
         loop = asyncio.get_running_loop()
         consecutive_errors = 0
         while True:
@@ -2460,6 +2498,14 @@ class MusicBot(discord.Client):
             # --- fase 3: extract stream di luar lock (C4) + batas thread (H3) ---
             try:
                 data = await run_extract(extract, next_track.url, timeout=60)
+                # F2: /stop atau reconnect selama ekstraksi membump generation dan
+                # mengganti voice client. Lanjut memutar = memakai vc lama yang
+                # sudah putus (ClientException) dan lagu baru tak pernah diputar.
+                # Batalkan advance basi ini; advance baru dari /play yang jalan.
+                if state.generation != gen0 or guild.voice_client is not vc:
+                    log.info('advance() basi (generation/voice berubah) saat ekstraksi %s; dibatalkan.',
+                             next_track.title)
+                    return
                 # M4: user menekan Skip selama ekstraksi -> jangan putar track ini;
                 # buang head queue (bila berasal dari queue) lalu pilih kandidat
                 # berikutnya. Jangan sentuh history/current: track ini belum
@@ -2605,6 +2651,10 @@ class MusicBot(discord.Client):
                 consecutive_errors += 1
                 log.warning('Tidak bisa memutar (%d/3): %s (penyebab: %s)', consecutive_errors, next_track.title, exc)
                 async with state.lock:
+                    # F1: konsumsi _skip_pending apa pun. Bila tidak, skip yang
+                    # menargetkan track gagal ini tetap "menggantung" dan ikut
+                    # membuang track BERIKUTNYA (satu skip = dua lagu hilang).
+                    state._skip_pending = False
                     if consecutive_errors >= MAX_TRACK_RETRIES:
                         break
                     # Gagal: jangan sentuh history/queue (C3); biarkan track di head untuk retry manual.
@@ -2727,7 +2777,6 @@ class MusicBot(discord.Client):
             pass
 
     async def on_voice_state_update(self, member, before, after):
-        dump_runtime_state(self)
         guild = getattr(member, 'guild', None)
         if not guild:
             return
@@ -2735,6 +2784,18 @@ class MusicBot(discord.Client):
         state = self.states.setdefault(guild.id, QueueState())
         bot_user_id = getattr(getattr(self, 'user', None), 'id', None)
         is_bot = (bot_user_id is not None and member.id == bot_user_id)
+
+        # L7: optimisasi aman (bukan debounce). Bila member BUKAN bot dan
+        # channel-nya tidak berubah, event ini hanya toggle mute/deaf/stream —
+        # jumlah pendengar manusia di channel bot IDENTIK, sehingga keputusan
+        # AFK/auto-pause/auto-resume pasti sama. Lewati pekerjaan mahal
+        # (dump_runtime_state = tulis file tiap event, refresh UI) agar eMMC STB
+        # tidak aus oleh event mute/deaf yang berisik. Event join/leave/pindah
+        # selalu punya channel berbeda, jadi tidak pernah dilewati.
+        if not is_bot and before.channel is not None and before.channel == after.channel:
+            return
+
+        dump_runtime_state(self)
 
         # 1. Edge case: bot itu sendiri dikeluarkan atau terputus dari voice
         if is_bot and before.channel is not None and after.channel is None:

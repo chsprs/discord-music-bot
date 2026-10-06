@@ -239,3 +239,39 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+INSTALL = os.path.join(ROOT, 'install.sh')
+
+
+class InstallScriptHardeningTests(unittest.TestCase):
+    """L7: jangan pipe `curl | bash` mentah. L6: salin tools/ & docs/."""
+
+    def setUp(self):
+        with open(INSTALL, encoding='utf-8') as handle:
+            self.src = handle.read()
+
+    def test_syntax_is_valid(self):
+        proc = subprocess.run(['bash', '-n', INSTALL], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_no_raw_curl_pipe_to_bash(self):
+        # `curl ... | bash` mengeksekusi teks separuh bila unduhan terpotong/MITM.
+        # Abaikan baris komentar (yang boleh menyebut pola ini sebagai dokumentasi).
+        code = '\n'.join(line for line in self.src.splitlines()
+                         if not line.lstrip().startswith('#'))
+        self.assertNotRegex(
+            code, r'curl[^\n|]*\|\s*bash',
+            'install.sh tidak boleh pipe curl langsung ke bash (unduh ke berkas dulu)')
+
+    def test_nodesource_downloaded_to_file_then_verified(self):
+        self.assertIn('setup_20.x', self.src)
+        self.assertRegex(self.src, r'curl[^\n]*-o\s+"?\$NODESOURCE_SETUP',
+                         'skrip NodeSource harus diunduh ke berkas, bukan dieksekusi langsung')
+        # Verifikasi bentuk minimal sebelum dieksekusi.
+        self.assertRegex(self.src, r'head -n1[^\n]*\^#!|grep[^\n]*\^#!',
+                         'skrip NodeSource harus diverifikasi berupa skrip shell (shebang)')
+
+    def test_copies_tools_and_docs(self):
+        self.assertRegex(self.src, r'for d in tools docs',
+                         'install.sh harus menyalin tools/ dan docs/ (L6)')

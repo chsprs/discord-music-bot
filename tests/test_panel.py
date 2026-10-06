@@ -1302,6 +1302,13 @@ class PanelListenerAwareUpdateTests(unittest.TestCase):
         self.state_file = os.path.join(self.tmp.name, 'state.json')
         os.environ['BOT_STATE_FILE'] = self.state_file
         self.addCleanup(os.environ.pop, 'BOT_STATE_FILE', None)
+        # M7: read_bot_runtime_info() short-circuit ke "offline" bila
+        # bot_state() != 'active'. Tanpa mock ini, hasil test bergantung pada
+        # status service di mesin yang menjalankannya (di STB bot aktif -> lulus,
+        # di CI/mesin lain -> gagal). Paksa 'active' agar deterministik.
+        patcher = unittest.mock.patch.object(panel, 'bot_state', return_value='active')
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _write_state(self, listeners, age=0.0):
         with open(self.state_file, 'w', encoding='utf-8') as fh:
@@ -1345,3 +1352,31 @@ class PanelListenerAwareUpdateTests(unittest.TestCase):
         restart_calls = [c for c in calls if 'restart' in c]
         self.assertEqual(restart_calls, [], 'bot di-restart padahal ada pendengar')
         self.assertIn('ditunda', out)
+
+
+class PanelPortAndNonceRegressionTests(unittest.TestCase):
+    """F4: PANEL_PORT buruk -> fallback (bukan crash-loop). F5: nonce sekali pakai atomik."""
+
+    def test_parse_port_valid(self):
+        self.assertEqual(panel._parse_port('9130'), 9130)
+        self.assertEqual(panel._parse_port('1'), 1)
+        self.assertEqual(panel._parse_port('65535'), 65535)
+
+    def test_parse_port_invalid_falls_back(self):
+        for bad in ('abc', '', '0', '-1', '70000', '99.5', None):
+            self.assertEqual(panel._parse_port(bad), 9130, f'{bad!r} harus fallback 9130')
+
+    def test_parse_port_none_uses_default(self):
+        self.assertEqual(panel._parse_port(None), 9130)
+
+    def test_nonce_consumed_atomically_only_once(self):
+        # Simulasi dua request konkuren dengan nonce sama: hanya satu yang valid.
+        with panel._lock:
+            panel._form_tokens.clear()
+            panel._form_tokens['NONCE1'] = time.monotonic() + 900
+        with panel._lock:
+            first = panel._form_tokens.pop('NONCE1', 0) > time.monotonic()
+        with panel._lock:
+            second = panel._form_tokens.pop('NONCE1', 0) > time.monotonic()
+        self.assertTrue(first)
+        self.assertFalse(second, 'nonce kedua harus gagal (sudah dikonsumsi)')

@@ -3430,3 +3430,171 @@ class JsRuntimeDetectionTests(unittest.TestCase):
              patch('bot.os.path.exists', return_value=True), \
              patch('bot.os.access', return_value=True):
             self.assertEqual(bot_module._detect_js_runtime(), {})
+
+
+class AdvanceSkipRegressionTests(unittest.TestCase):
+    """F1/F2: _skip_pending tidak boleh bocor ke track berikutnya; advance basi
+    (generation/voice berubah) tidak boleh memutar di voice client lama."""
+
+    def _bot_with_queue(self, gid, *titles):
+        b = MusicBot()
+        guild = MagicMock(id=gid, name='G')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+        st = QueueState()
+        for i, t in enumerate(titles, 1):
+            st.queue.append(Track(t, f'https://e/{i}', 'u'))
+        b.states[guild.id] = st
+        return b, guild, vc, st
+
+    def test_advancing_flag_true_during_extract(self):
+        # M4 dulu mati karena memakai _advance_lock.locked() (lock sudah lepas).
+        b, guild, vc, st = self._bot_with_queue(201, 'A')
+        seen = {}
+
+        async def ex(func, *a, **k):
+            seen['during'] = st._advancing
+            await asyncio.sleep(0.02)
+            return {'url': 'x'}
+
+        with patch('bot.run_extract', new=AsyncMock(side_effect=ex)), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(b, 'refresh', new=AsyncMock()), \
+             patch.object(b, '_save_persistent_queue'), patch.object(b, '_announce'):
+            asyncio.run(b.advance(guild))
+        self.assertTrue(seen['during'], '_advancing harus True selama ekstraksi')
+        self.assertFalse(st._advancing, '_advancing harus direset setelah advance')
+
+    def test_skip_pending_cleared_when_extract_fails(self):
+        # F1: skip yang menargetkan track GAGAL tidak boleh ikut membuang track
+        # berikutnya (satu skip = dua lagu hilang).
+        b, guild, vc, st = self._bot_with_queue(202, 'A', 'B')
+
+        async def ex(func, *a, **k):
+            st._skip_pending = True
+            raise RuntimeError('yt-dlp timeout')
+
+        with patch('bot.run_extract', new=AsyncMock(side_effect=ex)), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(b, 'refresh', new=AsyncMock()), \
+             patch.object(b, '_save_persistent_queue'), patch.object(b, '_announce'):
+            asyncio.run(b.advance(guild))
+        self.assertFalse(st._skip_pending, '_skip_pending harus dikonsumsi saat gagal')
+
+    def test_stale_advance_aborted_after_stop_and_replay(self):
+        # F2: /stop lalu /play saat ekstraksi -> advance basi harus berhenti,
+        # lagu baru tetap diputar di voice client baru.
+        b = MusicBot()
+        guild = MagicMock(id=203, name='G')
+        vcs = []
+
+        def make_vc():
+            vc = MagicMock()
+            vc.is_connected.return_value = True
+            vc.is_playing.return_value = False
+            vc.is_paused.return_value = False
+            vc.channel.bitrate = 96000
+            vcs.append(vc)
+            return vc
+
+        vc1 = make_vc()
+        guild.voice_client = vc1
+        st = QueueState()
+        st.queue.append(Track('A', 'https://e/1', 'u'))
+        b.states[guild.id] = st
+        captured = {}
+
+        async def ex(func, *a, **k):
+            await asyncio.sleep(0.15)
+            return {'url': 'x'}
+
+        async def _run():
+            with patch('bot.run_extract', new=AsyncMock(side_effect=ex)), \
+                 patch('bot.source_for', return_value=MagicMock()), \
+                 patch.object(b, 'refresh', new=AsyncMock()), \
+                 patch.object(b, '_save_persistent_queue'), patch.object(b, '_announce'):
+                adv = asyncio.create_task(b.advance(guild))
+                await asyncio.sleep(0.05)
+                await b.quit_voice(guild, clear_queue=True)   # /stop
+                vc2 = make_vc()
+                captured['vc2'] = vc2
+                guild.voice_client = vc2
+                st.queue.append(Track('B', 'https://e/2', 'u'))
+                adv2 = asyncio.create_task(b.advance(guild))  # /play B
+                await asyncio.gather(adv, adv2, return_exceptions=True)
+        asyncio.run(_run())
+        self.assertFalse(vc1.play.called, 'advance basi tidak boleh main di vc lama')
+        self.assertTrue(captured['vc2'].play.called, 'lagu baru harus diputar di vc baru')
+
+
+class ExtractSlotAtomicityTests(unittest.TestCase):
+    """F3: reservasi slot harus atomik (check+increment tak bisa disela)."""
+
+    def tearDown(self):
+        bot_module._EXTRACT_THREADS = 0
+
+    def test_reserve_respects_ceiling(self):
+        bot_module._EXTRACT_THREADS = 0
+        for _ in range(bot_module.MAX_EXTRACT_THREADS):
+            self.assertTrue(bot_module._reserve_extract_slot())
+        self.assertFalse(bot_module._reserve_extract_slot())
+        self.assertEqual(bot_module._EXTRACT_THREADS, bot_module.MAX_EXTRACT_THREADS)
+
+    def test_reserve_and_release_roundtrip(self):
+        bot_module._EXTRACT_THREADS = 0
+        self.assertTrue(bot_module._reserve_extract_slot())
+        self.assertEqual(bot_module._EXTRACT_THREADS, 1)
+        bot_module._release_extract_slot()
+        self.assertEqual(bot_module._EXTRACT_THREADS, 0)
+
+    def test_run_extract_releases_slot_after_success(self):
+        bot_module._EXTRACT_THREADS = 0
+
+        async def _run():
+            return await bot_module.run_extract(lambda: 42, timeout=5)
+        self.assertEqual(asyncio.run(_run()), 42)
+        self.assertEqual(bot_module._EXTRACT_THREADS, 0, 'slot harus dilepas setelah selesai')
+
+
+class VoiceStateShortCircuitTests(unittest.TestCase):
+    """L7: event mute/deaf (channel tidak berubah, bukan bot) dilewati tanpa I/O."""
+
+    def _bot(self):
+        b = MusicBot()
+        b._connection.user = MagicMock(id=999)
+        return b
+
+    def test_mute_toggle_short_circuits(self):
+        # Human toggle mute di channel yang sama -> dump_runtime_state TIDAK dipanggil.
+        bot = self._bot()
+        guild = MagicMock(id=310, name='G')
+        channel = MagicMock()
+        member = MagicMock(id=123, bot=False, guild=guild)
+        before = MagicMock(channel=channel)
+        after = MagicMock(channel=channel)  # channel sama -> hanya toggle mute/deaf
+        with patch('bot.dump_runtime_state') as mock_dump:
+            asyncio.run(bot.on_voice_state_update(member, before, after))
+            mock_dump.assert_not_called()
+
+    def test_channel_change_still_processes(self):
+        # Human pindah channel -> tetap diproses (dump_runtime_state dipanggil).
+        bot = self._bot()
+        guild = MagicMock(id=311, name='G')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.channel = MagicMock()
+        vc.channel.members = []
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+        member = MagicMock(id=123, bot=False, guild=guild)
+        before = MagicMock(channel=MagicMock())
+        after = MagicMock(channel=MagicMock())
+        with patch('bot.dump_runtime_state') as mock_dump, \
+             patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(bot.on_voice_state_update(member, before, after))
+            self.assertTrue(mock_dump.called, 'pindah channel harus tetap diproses')
