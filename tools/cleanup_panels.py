@@ -124,7 +124,7 @@ async def run(args: argparse.Namespace) -> int:
                 exit_code = 1
                 continue
             for channel in channels:
-                if not isinstance(channel, discord.TextChannel):
+                if not isinstance(channel, discord.abc.Messageable):
                     continue
                 if wanted is not None and channel.id not in wanted:
                     continue
