@@ -1925,7 +1925,7 @@ class AFKGuardTests(unittest.TestCase):
         after = MagicMock(channel=None)
 
         async def run_test():
-            with patch('asyncio.get_running_loop') as mock_loop:
+            with patch('asyncio.get_running_loop') as mock_loop, patch.object(bot, 'refresh', new=AsyncMock()):
                 await bot.on_voice_state_update(member, before, after)
                 mock_loop.return_value.create_task.assert_not_called()
                 self.assertIs(state.afk_task, mock_task)
@@ -2172,6 +2172,78 @@ class AFKGuardTests(unittest.TestCase):
             self.assertEqual(get_afk_timeout(), 180.0)
         with patch.dict(os.environ, {'AFK_TIMEOUT_SECONDS': '-10'}):
             self.assertEqual(get_afk_timeout(), 180.0)
+
+    def test_afk_auto_pause_refreshes_ui_and_dumps_state(self):
+        """AFK Guard auto-pause memanggil self.refresh(state) dan dump_runtime_state(self)."""
+        bot = MusicBot()
+        bot_user = MagicMock(id=999)
+        bot._connection.user = bot_user
+        guild = MagicMock(id=112233, name='GuildAFK')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        channel = MagicMock()
+        bot_member = MagicMock(bot=True, id=999)
+        channel.members = [bot_member]
+        vc.channel = channel
+        guild.voice_client = vc
+
+        member = MagicMock(id=123, bot=False, guild=guild)
+        before = MagicMock(channel=channel)
+        after = MagicMock(channel=None)
+
+        async def run_test():
+            with patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh, \
+                 patch('bot.dump_runtime_state') as mock_dump:
+                await bot.on_voice_state_update(member, before, after)
+                state = bot.states[guild.id]
+                self.assertTrue(state.afk_paused)
+                vc.pause.assert_called_once()
+                mock_refresh.assert_awaited_once_with(state)
+                self.assertEqual(mock_dump.call_count, 2)
+                if state.afk_task:
+                    state.afk_task.cancel()
+
+        asyncio.run(run_test())
+
+    def test_afk_auto_resume_refreshes_ui_and_dumps_state(self):
+        """AFK Guard auto-resume memanggil self.refresh(state) dan dump_runtime_state(self)."""
+        bot = MusicBot()
+        bot_user = MagicMock(id=999)
+        bot._connection.user = bot_user
+        guild = MagicMock(id=112233, name='GuildAFK')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = True
+        channel = MagicMock()
+        bot_member = MagicMock(bot=True, id=999)
+        human_member = MagicMock(bot=False, id=123, guild=guild)
+        channel.members = [bot_member, human_member]
+        vc.channel = channel
+        guild.voice_client = vc
+
+        state = QueueState()
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        state.afk_task = state.empty_task = mock_task
+        state.afk_paused = True
+        bot.states[guild.id] = state
+
+        before = MagicMock(channel=None)
+        after = MagicMock(channel=channel)
+
+        async def run_test():
+            with patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh, \
+                 patch('bot.dump_runtime_state') as mock_dump:
+                await bot.on_voice_state_update(human_member, before, after)
+                self.assertFalse(state.afk_paused)
+                vc.resume.assert_called_once()
+                mock_refresh.assert_awaited_once_with(state)
+                self.assertEqual(mock_dump.call_count, 2)
+
+        asyncio.run(run_test())
 
 
 class PersistentQueueTests(unittest.TestCase):
