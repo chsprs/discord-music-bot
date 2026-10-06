@@ -134,6 +134,8 @@ def checked_query(query: str) -> str:
     query = query.strip()
     if not query or len(query) > 500:
         raise ValueError('Judul atau URL lagu harus 1–500 karakter.')
+    if query.lower().startswith(('youtube.com/', 'www.youtube.com/', 'm.youtube.com/', 'music.youtube.com/', 'youtu.be/')):
+        query = 'https://' + query
     if query.startswith(('http://', 'https://')):
         parsed = urlparse(query)
         hostname = (parsed.hostname or '').lower()

@@ -142,6 +142,17 @@ class MusicTests(unittest.TestCase):
         self.assertEqual(checked_query('OST: Attack on Titan'), 'ytsearch1:OST: Attack on Titan')
         self.assertEqual(checked_query('http://youtube.com/watch?v=123'), 'https://youtube.com/watch?v=123')
 
+    def test_checked_query_normalizes_schemeless_youtube_urls(self):
+        from bot import checked_query
+        self.assertEqual(checked_query('youtube.com/watch?v=123'), 'https://youtube.com/watch?v=123')
+        self.assertEqual(checked_query('www.youtube.com/watch?v=123'), 'https://www.youtube.com/watch?v=123')
+        self.assertEqual(checked_query('m.youtube.com/watch?v=123'), 'https://m.youtube.com/watch?v=123')
+        self.assertEqual(checked_query('music.youtube.com/watch?v=123'), 'https://music.youtube.com/watch?v=123')
+        self.assertEqual(checked_query('youtu.be/123'), 'https://youtu.be/123')
+        self.assertEqual(checked_query('YOUTUBE.COM/watch?v=123'), 'https://YOUTUBE.COM/watch?v=123')
+        self.assertEqual(checked_query('youtu.be/dQw4w9WgXcQ?t=10'), 'https://youtu.be/dQw4w9WgXcQ?t=10')
+        self.assertEqual(checked_query('youtube.commercially available'), 'ytsearch1:youtube.commercially available')
+
     def test_search_missing_result(self):
         with patch('bot.yt_dlp.YoutubeDL') as downloader:
             downloader.return_value.__enter__.return_value.extract_info.return_value = {'entries': []}
