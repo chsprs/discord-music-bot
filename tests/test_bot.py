@@ -13,7 +13,8 @@ from bot import (MusicBot, MusicPanel, Track, QueueState, GuildState, get_afk_ti
                  DEFAULT_VOLUME, get_default_volume,
                  build_recommendation_queries, _clean_seed_title, fetch_recommendations,
                  extract_track, extract_tracks, source_for, _cookies_file, _with_cookies, SearchModal,
-                 extract_video_id, build_mix_url, fetch_youtube_mix, MIX_RESULT_LIMIT)
+                 extract_video_id, build_mix_url, fetch_youtube_mix, MIX_RESULT_LIMIT,
+                 _get_msg_id)
 
 
 class MusicTests(unittest.TestCase):
@@ -2789,6 +2790,85 @@ class VoiceExitPanelCleanupTests(unittest.TestCase):
              patch.object(bot, '_sync_guild', new=AsyncMock()):
             asyncio.run(bot.setup_hook())
             mock_reg.assert_called_once()
+
+    def test_get_msg_id_helper(self):
+        self.assertEqual(_get_msg_id(12345), 12345)
+        self.assertEqual(_get_msg_id("12345"), 12345)
+        mock_msg = MagicMock(id=67890)
+        self.assertEqual(_get_msg_id(mock_msg), 67890)
+        self.assertIsNone(_get_msg_id(None))
+        self.assertIsNone(_get_msg_id(False))
+        self.assertIsNone(_get_msg_id(True))
+        self.assertIsNone(_get_msg_id("invalid"))
+
+    def test_guard_accepts_restored_int_panel_message_id_and_updates_state(self):
+        bot = MusicBot()
+        view = MusicPanel(bot)
+        interaction = MagicMock()
+        interaction.guild.id = 126
+        vc = MagicMock()
+        vc.channel.id = 1
+        interaction.guild.voice_client = vc
+        interaction.user.voice.channel.id = 1
+
+        msg = MagicMock(id=999888)
+        interaction.message = msg
+        state = QueueState()
+        state.message = 999888
+        bot.states[126] = state
+
+        res = asyncio.run(view.guard(interaction))
+        self.assertTrue(res)
+        self.assertIs(state.message, msg)
+
+    def test_guard_rejects_stale_panel_when_state_message_is_int(self):
+        bot = MusicBot()
+        view = MusicPanel(bot)
+        interaction = MagicMock()
+        interaction.guild.id = 126
+        vc = MagicMock()
+        vc.channel.id = 1
+        interaction.guild.voice_client = vc
+        interaction.user.voice.channel.id = 1
+
+        stale_msg = MagicMock(id=111)
+        stale_msg.delete = AsyncMock()
+        interaction.message = stale_msg
+        interaction.response.is_done.return_value = True
+        interaction.followup.send = AsyncMock()
+
+        state = QueueState()
+        state.message = 222
+        bot.states[126] = state
+
+        res = asyncio.run(view.guard(interaction))
+        self.assertFalse(res)
+        stale_msg.delete.assert_called_once()
+        self.assertEqual(state.message, 222)
+
+    def test_refresh_skips_edit_when_state_message_is_int(self):
+        async def _run():
+            bot = MusicBot()
+            state = QueueState()
+            state.message = 12345678
+            await bot.refresh(state)
+            if state.refresh_task:
+                await state.refresh_task
+            self.assertEqual(state.message, 12345678)
+        asyncio.run(_run())
+
+    def test_refresh_edits_message_when_state_message_has_edit(self):
+        async def _run():
+            bot = MusicBot()
+            state = QueueState()
+            mock_msg = MagicMock()
+            mock_msg.edit = AsyncMock()
+            state.message = mock_msg
+            await bot.refresh(state)
+            if state.refresh_task:
+                await state.refresh_task
+            mock_msg.edit.assert_awaited_once()
+        asyncio.run(_run())
 
 
 if __name__ == '__main__':
