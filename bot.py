@@ -2619,6 +2619,8 @@ class MusicBot(discord.Client):
                     state.afk_paused = True
                 except Exception:
                     pass
+                await self.refresh(state)
+                dump_runtime_state(self)
 
             # Mulai timer AFK jika belum berjalan
             async with state.lock:
@@ -2646,6 +2648,8 @@ class MusicBot(discord.Client):
                     except Exception:
                         pass
                 state.afk_paused = False
+                await self.refresh(state)
+                dump_runtime_state(self)
 
     async def _afk_disconnect(self, guild: discord.Guild, generation: int, timeout: float | None = None):
         if timeout is None:
