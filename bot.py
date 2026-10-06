@@ -1217,10 +1217,22 @@ class MusicPanel(discord.ui.View):
         state._last_skip_time = now
         if vc and (vc.is_playing() or vc.is_paused()):
             await self.bot._stop_player(interaction.guild)
+            async with state.lock:
+                if state.current:
+                    state.history.append(state.current)
+                    if len(state.history) > 20:
+                        state.history.popleft()
+                    state.current = None
             await self.bot.advance(interaction.guild)
             self.bot._save_persistent_queue()
             text = 'Dilewati.'
         elif state.queue:
+            async with state.lock:
+                if state.current:
+                    state.history.append(state.current)
+                    if len(state.history) > 20:
+                        state.history.popleft()
+                    state.current = None
             await self.bot.advance(interaction.guild)
             self.bot._save_persistent_queue()
             text = 'Memutar lagu berikutnya dari antrian.'
@@ -1846,6 +1858,12 @@ class MusicBot(discord.Client):
             return await interaction.followup.send('Mohon tunggu sebentar sebelum lewati lagu lagi.', ephemeral=True)
         state._last_skip_time = now
         await self._stop_player(interaction.guild)
+        async with state.lock:
+            if state.current:
+                state.history.append(state.current)
+                if len(state.history) > 20:
+                    state.history.popleft()
+                state.current = None
         await self.advance(interaction.guild)
         self._save_persistent_queue()
         await interaction.followup.send('Lagu dilewati.', ephemeral=True)
@@ -2261,13 +2279,13 @@ class MusicBot(discord.Client):
                     next_track = state.queue[0]
                 elif state.loop_mode == 'queue' and state.current:
                     next_track = state.current
-                elif state.autoplay and state.current:
+                elif state.autoplay and (state.current or state.history):
                     next_track = None  # resolve di luar lock (M9)
-                if not next_track and not (state.autoplay and state.current):
+                if not next_track and not (state.autoplay and (state.current or state.history)):
                     break
 
             # --- fase 2: autoplay resolve di luar lock (M9) ---
-            if next_track is None and state.autoplay and state.current:
+            if next_track is None and state.autoplay and (state.current or state.history):
                 try:
                     async with state.lock:
                         seed_titles = [t.title for t in list(state.history)[-5:]]

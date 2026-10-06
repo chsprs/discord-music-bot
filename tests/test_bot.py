@@ -2744,5 +2744,212 @@ class VoiceExitPanelCleanupTests(unittest.TestCase):
             mock_reg.assert_called_once()
 
 
+class SkipTrackLoopTests(unittest.TestCase):
+    """Pengujian tombol Skip dan cmd_skip saat loop_mode == 'track' (t_da061734)."""
+
+    def test_cmd_skip_in_track_loop_mode_advances_and_preserves_track_loop(self):
+        """Saat loop_mode == 'track', cmd_skip memindahkan track ke history dan memutar track antrian berikutnya."""
+        bot = MusicBot()
+        guild = MagicMock(id=99101, name='TrackLoopGuild')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        def fake_stop():
+            vc.is_playing.return_value = False
+        vc.stop.side_effect = fake_stop
+
+        state = QueueState()
+        t1 = Track('Song 1', 'https://example.com/1', 'u')
+        t2 = Track('Song 2', 'https://example.com/2', 'u')
+        state.current = t1
+        state.queue.append(t2)
+        state.loop_mode = 'track'
+        bot.states[guild.id] = state
+
+        interaction = MagicMock(guild=guild)
+        interaction.response.send_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch('bot._check_guild_only', return_value=True), \
+             patch('bot._check_same_voice', return_value=(True, '')), \
+             patch('bot.extract', return_value={'url': 'https://cdn/audio'}), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(bot, 'refresh', new=AsyncMock()), \
+             patch.object(bot, '_save_persistent_queue'):
+            asyncio.run(bot.cmd_skip(interaction))
+
+        self.assertEqual(state.current, t2)
+        self.assertEqual(list(state.history), [t1])
+        self.assertEqual(state.loop_mode, 'track')
+        self.assertEqual(len(state.queue), 0)
+        interaction.followup.send.assert_awaited_once_with('Lagu dilewati.', ephemeral=True)
+
+    def test_button_skip_in_track_loop_mode_advances_and_preserves_track_loop(self):
+        """Saat loop_mode == 'track', tombol Skip MusicPanel memindahkan track ke history dan memutar track berikutnya."""
+        bot = MusicBot()
+        guild = MagicMock(id=99102, name='TrackLoopPanelGuild')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        vc.channel.id = 111
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        def fake_stop():
+            vc.is_playing.return_value = False
+        vc.stop.side_effect = fake_stop
+
+        state = QueueState()
+        t1 = Track('Panel Song 1', 'https://example.com/p1', 'u')
+        t2 = Track('Panel Song 2', 'https://example.com/p2', 'u')
+        state.current = t1
+        state.queue.append(t2)
+        state.loop_mode = 'track'
+        bot.states[guild.id] = state
+
+        panel = MusicPanel(bot)
+        interaction = MagicMock(guild=guild)
+        interaction.user.voice.channel.id = 111
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch.object(panel, 'guard', new=AsyncMock(return_value=True)), \
+             patch('bot.extract', return_value={'url': 'https://cdn/audio'}), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(bot, 'refresh', new=AsyncMock()), \
+             patch.object(bot, '_save_persistent_queue'):
+            asyncio.run(panel.skip.callback(interaction))
+
+        self.assertEqual(state.current, t2)
+        self.assertEqual(list(state.history), [t1])
+        self.assertEqual(state.loop_mode, 'track')
+        self.assertEqual(len(state.queue), 0)
+        interaction.followup.send.assert_awaited_once_with('Dilewati.', ephemeral=True)
+
+    def test_cmd_skip_in_track_loop_mode_with_autoplay_plays_recommendation(self):
+        """Saat loop_mode == 'track' dan antrian kosong dengan AutoPlay aktif, skip mengambil rekomendasi baru."""
+        bot = MusicBot()
+        guild = MagicMock(id=99103, name='TrackLoopAutoPlayGuild')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        def fake_stop():
+            vc.is_playing.return_value = False
+        vc.stop.side_effect = fake_stop
+
+        state = QueueState()
+        t1 = Track('Original Song', 'https://youtube.com/watch?v=cur00000001', 'u')
+        rec = Track('Rec Song', 'https://youtube.com/watch?v=rec00000001', 'AutoPlay')
+        state.current = t1
+        state.autoplay = True
+        state.loop_mode = 'track'
+        bot.states[guild.id] = state
+
+        interaction = MagicMock(guild=guild)
+        interaction.response.send_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch('bot._check_guild_only', return_value=True), \
+             patch('bot._check_same_voice', return_value=(True, '')), \
+             patch('bot.fetch_recommendations', new=AsyncMock(return_value=[rec])), \
+             patch('bot.extract', return_value={'url': 'https://cdn/audio'}), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(bot, 'refresh', new=AsyncMock()), \
+             patch.object(bot, '_save_persistent_queue'):
+            asyncio.run(bot.cmd_skip(interaction))
+
+        self.assertEqual(state.current, rec)
+        self.assertEqual(list(state.history), [t1])
+        self.assertEqual(state.loop_mode, 'track')
+
+    def test_button_skip_in_track_loop_mode_with_autoplay_plays_recommendation(self):
+        """Tombol skip saat loop_mode == 'track' dan antrian kosong dengan AutoPlay mengambil rekomendasi baru."""
+        bot = MusicBot()
+        guild = MagicMock(id=99104, name='TrackLoopPanelAutoPlayGuild')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        vc.channel.id = 222
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        def fake_stop():
+            vc.is_playing.return_value = False
+        vc.stop.side_effect = fake_stop
+
+        state = QueueState()
+        t1 = Track('Original Panel Song', 'https://youtube.com/watch?v=cur00000002', 'u')
+        rec = Track('Panel Rec Song', 'https://youtube.com/watch?v=rec00000002', 'AutoPlay')
+        state.current = t1
+        state.autoplay = True
+        state.loop_mode = 'track'
+        bot.states[guild.id] = state
+
+        panel = MusicPanel(bot)
+        interaction = MagicMock(guild=guild)
+        interaction.user.voice.channel.id = 222
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch.object(panel, 'guard', new=AsyncMock(return_value=True)), \
+             patch('bot.fetch_recommendations', new=AsyncMock(return_value=[rec])), \
+             patch('bot.extract', return_value={'url': 'https://cdn/audio'}), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(bot, 'refresh', new=AsyncMock()), \
+             patch.object(bot, '_save_persistent_queue'):
+            asyncio.run(panel.skip.callback(interaction))
+
+        self.assertEqual(state.current, rec)
+        self.assertEqual(list(state.history), [t1])
+        self.assertEqual(state.loop_mode, 'track')
+
+    def test_skip_caps_history_at_twenty(self):
+        """Skip membatasi riwayat maksimal 20 lagu dan membuang riwayat tertua."""
+        bot = MusicBot()
+        guild = MagicMock(id=99105)
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        def fake_stop():
+            vc.is_playing.return_value = False
+        vc.stop.side_effect = fake_stop
+
+        state = QueueState()
+        for i in range(20):
+            state.history.append(Track(f'Old {i}', f'https://example.com/old/{i}', 'u'))
+        current_track = Track('Current Track', 'https://example.com/curr', 'u')
+        state.current = current_track
+        bot.states[guild.id] = state
+
+        interaction = MagicMock(guild=guild)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch('bot._check_guild_only', return_value=True), \
+             patch('bot._check_same_voice', return_value=(True, '')), \
+             patch.object(bot, 'advance', new=AsyncMock()), \
+             patch.object(bot, '_save_persistent_queue'):
+            asyncio.run(bot.cmd_skip(interaction))
+
+        self.assertEqual(len(state.history), 20)
+        self.assertEqual(state.history[0].title, 'Old 1')
+        self.assertEqual(state.history[-1].title, 'Current Track')
+        self.assertIsNone(state.current)
+
+
 if __name__ == '__main__':
     unittest.main()
