@@ -525,7 +525,7 @@ async def fetch_recommendations(history_titles: list[str], exclude_urls: set[str
     seen: set[str] = set(exclude_urls or set())
 
     # --- Prioritas 1: YouTube Mix dari seed URL (terbaru dulu) ---
-    for seed_url in list(seed_urls or []):
+    for seed_url in reversed(seed_urls or []):
         video_id = extract_video_id(seed_url)
         if not video_id:
             continue

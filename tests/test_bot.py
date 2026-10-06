@@ -1496,6 +1496,42 @@ class YouTubeMixTests(unittest.TestCase):
         self.assertEqual([t.title for t in recs], ['Baru'])
         self.assertTrue(all(t.requester == 'AutoPlay' for t in recs))
 
+    def test_fetch_recommendations_prioritizes_latest_seed_url(self):
+        """Urutan seed_urls dibalik agar lagu paling baru diproses pertama kali."""
+        old_url = 'https://youtube.com/watch?v=old00000001'
+        new_url = 'https://youtube.com/watch?v=new00000002'
+        rec_new = Track('Lagu Baru', 'https://youtube.com/watch?v=rec00000002', 'AutoPlay')
+
+        with patch('bot.fetch_youtube_mix', new=AsyncMock(return_value=[rec_new])) as mock_mix:
+            recs = asyncio.run(fetch_recommendations(
+                ['Old Song', 'New Song'], set(), seed_urls=[old_url, new_url]))
+
+        self.assertEqual(recs, [rec_new])
+        mock_mix.assert_awaited_once()
+        self.assertEqual(mock_mix.await_args.args[0], 'new00000002')
+
+    def test_fetch_recommendations_falls_back_to_older_seed_url_when_latest_empty(self):
+        """Jika seed URL terbaru tidak menghasilkan mix, fallback ke seed URL sebelumnya."""
+        old_url = 'https://youtube.com/watch?v=old00000001'
+        new_url = 'https://youtube.com/watch?v=new00000002'
+        rec_old = Track('Lagu Lama', 'https://youtube.com/watch?v=rec00000001', 'AutoPlay')
+
+        async def mock_mix_side_effect(vid, seen, req):
+            if vid == 'new00000002':
+                return []
+            if vid == 'old00000001':
+                return [rec_old]
+            return []
+
+        with patch('bot.fetch_youtube_mix', new=AsyncMock(side_effect=mock_mix_side_effect)) as mock_mix:
+            recs = asyncio.run(fetch_recommendations(
+                ['Old Song', 'New Song'], set(), seed_urls=[old_url, new_url]))
+
+        self.assertEqual(recs, [rec_old])
+        self.assertEqual(mock_mix.await_count, 2)
+        called_vids = [call.args[0] for call in mock_mix.await_args_list]
+        self.assertEqual(called_vids, ['new00000002', 'old00000001'])
+
 
 class AudioPipelineHardeningTests(unittest.TestCase):
     """Pengujian temuan audit audio pipeline (t_c1458af6)."""
