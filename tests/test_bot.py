@@ -2434,18 +2434,43 @@ class PersistentQueueTests(unittest.TestCase):
             self.assertEqual(bot.states[2222].loop_mode, 'track')
 
     def test_button_loop_triggers_save_persistent_queue(self):
-        """Tombol loop pada MusicPanel memicu pemanggilan _save_persistent_queue."""
+        """Tombol loop pada MusicPanel memodifikasi state di dalam state.lock dan memanggil _save_persistent_queue."""
         bot = MusicBot()
-        bot.states[3333] = QueueState()
+        state = QueueState()
+
+        class LockSpy:
+            def __init__(self, real):
+                self._real = real
+                self.acquired = False
+            async def __aenter__(self):
+                self.acquired = True
+                return await self._real.__aenter__()
+            async def __aexit__(self, *args):
+                return await self._real.__aexit__(*args)
+            def locked(self):
+                return self._real.locked()
+
+        spy = LockSpy(state.lock)
+        state.lock = spy
+        bot.states[3333] = state
         panel = MusicPanel(bot)
         interaction = MagicMock()
         interaction.guild.id = 3333
         interaction.response.defer = AsyncMock()
-        interaction.followup.send = AsyncMock()
+
+        observed = {}
+
+        async def mock_send(*args, **kwargs):
+            observed['locked_during_send'] = state.lock.locked()
+
+        interaction.followup.send = AsyncMock(side_effect=mock_send)
+
         with patch.object(panel, 'guard', new=AsyncMock(return_value=True)), \
              patch.object(bot, '_save_persistent_queue') as mock_save, \
              patch.object(bot, 'refresh', new=AsyncMock()):
             asyncio.run(panel.loop.callback(interaction))
+            self.assertTrue(spy.acquired, 'state.lock tidak di-acquire saat loop_mode diubah')
+            self.assertFalse(observed.get('locked_during_send', True), 'state.lock masih dipegang saat followup.send')
             mock_save.assert_called_once()
             self.assertEqual(bot.states[3333].loop_mode, 'track')
 
@@ -2462,20 +2487,83 @@ class PersistentQueueTests(unittest.TestCase):
             self.assertTrue(bot.states[4444].autoplay)
 
     def test_button_autoplay_triggers_save_persistent_queue(self):
-        """Tombol autoplay pada MusicPanel memicu pemanggilan _save_persistent_queue."""
+        """Tombol autoplay pada MusicPanel memodifikasi state di dalam state.lock dan memanggil _save_persistent_queue."""
         bot = MusicBot()
-        bot.states[5555] = QueueState()
+        state = QueueState()
+
+        class LockSpy:
+            def __init__(self, real):
+                self._real = real
+                self.acquired = False
+            async def __aenter__(self):
+                self.acquired = True
+                return await self._real.__aenter__()
+            async def __aexit__(self, *args):
+                return await self._real.__aexit__(*args)
+            def locked(self):
+                return self._real.locked()
+
+        spy = LockSpy(state.lock)
+        state.lock = spy
+        bot.states[5555] = state
         panel = MusicPanel(bot)
         interaction = MagicMock()
         interaction.guild.id = 5555
         interaction.response.defer = AsyncMock()
-        interaction.followup.send = AsyncMock()
+
+        observed = {}
+
+        async def mock_send(*args, **kwargs):
+            observed['locked_during_send'] = state.lock.locked()
+
+        interaction.followup.send = AsyncMock(side_effect=mock_send)
+
         with patch.object(panel, 'guard', new=AsyncMock(return_value=True)), \
              patch.object(bot, '_save_persistent_queue') as mock_save, \
              patch.object(bot, 'refresh', new=AsyncMock()):
             asyncio.run(panel.autoplay.callback(interaction))
+            self.assertTrue(spy.acquired, 'state.lock tidak di-acquire saat autoplay diubah')
+            self.assertFalse(observed.get('locked_during_send', True), 'state.lock masih dipegang saat followup.send')
             mock_save.assert_called_once()
             self.assertTrue(bot.states[5555].autoplay)
+
+    def test_button_down_triggers_change_volume_and_save(self):
+        """Tombol down pada MusicPanel menurunkan volume dan memicu persistensi."""
+        bot = MusicBot()
+        state = QueueState()
+        state.volume = 0.8
+        bot.states[6666] = state
+        panel = MusicPanel(bot)
+        interaction = MagicMock()
+        interaction.guild.id = 6666
+        interaction.response.defer = AsyncMock()
+        interaction.response.is_done.return_value = True
+        interaction.followup.send = AsyncMock()
+        with patch.object(panel, 'guard', new=AsyncMock(return_value=True)), \
+             patch.object(bot, '_save_persistent_queue') as mock_save, \
+             patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(panel.down.callback(interaction))
+            mock_save.assert_called_once()
+            self.assertEqual(state.volume, 0.7)
+
+    def test_button_up_triggers_change_volume_and_save(self):
+        """Tombol up pada MusicPanel menaikkan volume dan memicu persistensi."""
+        bot = MusicBot()
+        state = QueueState()
+        state.volume = 0.5
+        bot.states[7777] = state
+        panel = MusicPanel(bot)
+        interaction = MagicMock()
+        interaction.guild.id = 7777
+        interaction.response.defer = AsyncMock()
+        interaction.response.is_done.return_value = True
+        interaction.followup.send = AsyncMock()
+        with patch.object(panel, 'guard', new=AsyncMock(return_value=True)), \
+             patch.object(bot, '_save_persistent_queue') as mock_save, \
+             patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(panel.up.callback(interaction))
+            mock_save.assert_called_once()
+            self.assertEqual(state.volume, 0.6)
 
 
 class VoiceExitPanelCleanupTests(unittest.TestCase):
