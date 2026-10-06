@@ -7,6 +7,7 @@ import queue
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -18,6 +19,28 @@ import discord
 import yt_dlp
 
 log = logging.getLogger(__name__)
+
+
+def _int_env(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
+    """Baca env var integer dengan aman.
+
+    Satu typo di .env (mis. 'AFK_TIMEOUT_SECONDS=180s') tidak boleh membuat bot
+    gagal start saat import: nilai tidak valid -> default + warning (H2). Nilai
+    valid tapi di luar rentang dijepit ke [lo, hi] (L5) agar MIX_RESULT_LIMIT=0
+    tidak membuat yt-dlp mengembalikan nol lagu dan AFK_TIMEOUT_SECONDS=1 tidak
+    memutus bot seketika.
+    """
+    raw = os.environ.get(name, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log.warning('Nilai env %s=%r tidak valid, memakai default %s', name, raw, default)
+        return default
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
 
 
 def format_duration(seconds: int | float | None) -> str:
@@ -71,6 +94,7 @@ class QueueState:
     now_message: discord.Message | None = None
     text_channel_id: int | None = None
     _skip_armed: bool = False  # skip/back manual: after() basi, advance manual yang jalan
+    _skip_pending: bool = False  # skip ditekan saat advance() sedang ekstraksi (M4)
     consecutive_playback_errors: int = 0
     idle_task: asyncio.Task | None = None
     empty_task: asyncio.Task | None = None
@@ -95,7 +119,7 @@ MAX_QUEUE = 500
 MAX_ERROR_STREAK = 50
 STALL_EOF_SECONDS = 4.0
 MAX_TRACK_RETRIES = 3
-AFK_TIMEOUT_SECONDS = int(os.getenv('AFK_TIMEOUT_SECONDS', '180'))
+AFK_TIMEOUT_SECONDS = _int_env('AFK_TIMEOUT_SECONDS', 180, lo=1)
 
 
 def get_afk_timeout() -> float:
@@ -108,6 +132,64 @@ def get_afk_timeout() -> float:
         except (ValueError, TypeError):
             pass
     return float(AFK_TIMEOUT_SECONDS)
+
+
+# --- H3: batas thread yt-dlp yang benar-benar hidup ------------------------
+# EXTRACT_SEM membatasi KONKURENSI coroutine. Pembatalan asyncio.wait_for pada
+# `async with EXTRACT_SEM` memang mengembalikan slot semaphore (terverifikasi:
+# sem._value kembali ke 2 setelah timeout) — jadi klaim "semaphore bocor" tidak
+# berlaku untuk pola `async with`. MASALAH NYATA: thread yt-dlp yang menggantung
+# tidak bisa dibatalkan; ia terus berjalan dan memakai memori. Karena slot
+# semaphore sudah dilepas, pemanggil berikutnya bisa memulai thread BARU,
+# sehingga saat YouTube 429 beruntun jumlah thread yt-dlp hidup membengkak
+# (puluhan MB per thread di STB RAM kecil -> risiko OOM).
+# MAX_EXTRACT_THREADS adalah batas keras thread nyata; dihitung di DALAM thread
+# (try/finally) sehingga thread zombie pun tetap terhitung.
+MAX_EXTRACT_THREADS = 4
+_EXTRACT_THREADS = 0
+_EXTRACT_THREADS_LOCK = threading.Lock()
+
+
+class ExtractionBusy(ValueError):
+    """Thread ekstraksi hidup sudah mencapai batas (H3).
+
+    Subclass ValueError agar jalur /play yang sudah menangkap ValueError
+    menampilkan pesan ramah ke pengguna tanpa perubahan di pemanggil.
+    """
+
+
+def _extract_threads_busy() -> bool:
+    with _EXTRACT_THREADS_LOCK:
+        return _EXTRACT_THREADS >= MAX_EXTRACT_THREADS
+
+
+def _tracked_extract(func, *args, **kwargs):
+    """Jalankan func dengan penghitung thread hidup (naik/turun di dalam thread)."""
+    global _EXTRACT_THREADS
+    with _EXTRACT_THREADS_LOCK:
+        _EXTRACT_THREADS += 1
+    try:
+        return func(*args, **kwargs)
+    finally:
+        with _EXTRACT_THREADS_LOCK:
+            _EXTRACT_THREADS -= 1
+
+
+async def run_extract(func, *args, timeout: float = 60, **kwargs):
+    """Jalankan func di thread dengan timeout + batas thread zombie (H3).
+
+    Menggantikan pola `async with EXTRACT_SEM: await asyncio.wait_for(
+    asyncio.to_thread(...))` di semua jalur ekstraksi.
+    """
+    if _extract_threads_busy():
+        with _EXTRACT_THREADS_LOCK:
+            alive = _EXTRACT_THREADS
+        log.warning('Ekstraksi ditolak: %d thread yt-dlp masih hidup (batas %d).',
+                    alive, MAX_EXTRACT_THREADS)
+        raise ExtractionBusy('Server sedang sibuk menyiapkan lagu. Coba lagi sebentar lagi.')
+    async with EXTRACT_SEM:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_tracked_extract, func, *args, **kwargs), timeout=timeout)
 
 
 def _cookies_file() -> str | None:
@@ -147,6 +229,20 @@ def checked_query(query: str) -> str:
     return f'ytsearch1:{query}'
 
 
+def _js_runtime_works(path: str) -> bool:
+    """Cek kandidat JS runtime benar-benar bisa dijalankan (L7).
+
+    `os.path.exists` saja tidak cukup: node rusak / tidak executable di
+    /usr/local/bin pernah membayangi node PATH yang sehat sehingga yt-dlp gagal
+    menyelesaikan challenge player. Probe `--version` dengan timeout pendek.
+    """
+    try:
+        proc = subprocess.run([path, '--version'], capture_output=True, text=True, timeout=5)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def _detect_js_runtime() -> dict:
     candidates = [
         ('node', '/usr/local/bin/node'),
@@ -155,8 +251,12 @@ def _detect_js_runtime() -> dict:
         ('deno', shutil.which('deno')),
         ('bun', shutil.which('bun')),
     ]
+    seen: set[str] = set()
     for name, path in candidates:
-        if path and os.path.exists(path):
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.exists(path) and os.access(path, os.X_OK) and _js_runtime_works(path):
             return {name: {'path': path}}
     return {}
 
@@ -188,7 +288,7 @@ STREAM_OPTIONS = {
 }
 
 # YouTube Mix (radio `list=RD<id>`): berapa entri playlist yang diekstrak.
-MIX_RESULT_LIMIT = int(os.environ.get('MIX_RESULT_LIMIT', '15'))
+MIX_RESULT_LIMIT = _int_env('MIX_RESULT_LIMIT', 15, lo=1, hi=50)
 
 # Salinan METADATA_OPTIONS + playlistend (tanpa noplaylist) agar yt-dlp mau
 # mengikuti playlist Mix. extract_flat='in_playlist' sudah dibawa dari
@@ -346,17 +446,22 @@ def clear_cache() -> None:
     except Exception as exc:
         log.debug('Gagal menghapus cache yt-dlp: %s', exc)
 
+    cache_root = os.environ.get('XDG_CACHE_HOME') or '/run/discord-music'
     cache_dirs = [
-        os.path.join(os.environ.get('XDG_CACHE_HOME', '/run/discord-music'), 'yt-dlp'),
+        os.path.join(cache_root, 'yt-dlp'),
         os.path.expanduser('~/.cache/yt-dlp'),
         '/tmp/yt-dlp',
     ]
     for c_dir in cache_dirs:
-        if os.path.isdir(c_dir):
-            try:
-                shutil.rmtree(c_dir, ignore_errors=True)
-            except Exception:
-                pass
+        # Tolak path non-absolut: XDG_CACHE_HOME yang di-set tapi kosong pernah
+        # menghasilkan 'yt-dlp' relatif CWD sehingga rmtree menghapus direktori
+        # kerja bot (M5).
+        if not os.path.isabs(c_dir) or not os.path.isdir(c_dir):
+            continue
+        try:
+            shutil.rmtree(c_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 
@@ -404,8 +509,7 @@ async def extract_tracks(query: str, requester: str) -> list[Track]:
     max_attempts = 2
     for attempt in range(max_attempts):
         try:
-            async with EXTRACT_SEM:
-                data = await asyncio.wait_for(asyncio.to_thread(_fetch_metadata, target), timeout=60)
+            data = await run_extract(_fetch_metadata, target, timeout=60)
             break
         except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
             msg = str(exc)
@@ -546,9 +650,7 @@ async def fetch_recommendations(history_titles: list[str], exclude_urls: set[str
     candidates = []
     for query in queries:
         try:
-            async with EXTRACT_SEM:
-                data = await asyncio.wait_for(
-                    asyncio.to_thread(_fetch_metadata, query), timeout=60)
+            data = await run_extract(_fetch_metadata, query, timeout=60)
         except Exception as exc:
             log.warning('Rekomendasi gagal untuk kueri %r: %s', query, exc)
             continue
@@ -658,10 +760,7 @@ async def fetch_youtube_mix(video_id: str, exclude_urls: set[str] | None = None,
     effective_limit = MIX_RESULT_LIMIT if limit is None else limit
     url = build_mix_url(video_id)
     try:
-        async with EXTRACT_SEM:
-            data = await asyncio.wait_for(
-                asyncio.to_thread(_fetch_mix_metadata, url, effective_limit),
-                timeout=60)
+        data = await run_extract(_fetch_mix_metadata, url, effective_limit, timeout=60)
     except Exception as exc:
         log.warning('YouTube Mix gagal untuk videoId %s: %s', video_id, exc)
         return []
@@ -1245,6 +1344,13 @@ class MusicPanel(discord.ui.View):
                     state.current = None
             await self.bot.advance(interaction.guild)
             self.bot._save_persistent_queue()
+            text = 'Dilewati.'
+        elif state._advance_lock.locked():
+            # M4: belum ada audio yang berputar tetapi advance() sedang
+            # mengekstraksi. Rekam permintaan skip; advance() yang sedang jalan
+            # akan membuang track itu alih-alih memutarnya.
+            async with state.lock:
+                state._skip_pending = True
             text = 'Dilewati.'
         elif state.queue:
             async with state.lock:
@@ -1881,6 +1987,13 @@ class MusicBot(discord.Client):
         if now - getattr(state, '_last_skip_time', 0.0) < 0.5:
             return await interaction.followup.send('Mohon tunggu sebentar sebelum lewati lagu lagi.', ephemeral=True)
         state._last_skip_time = now
+        # M4: advance() sedang ekstraksi dan belum ada audio yang berputar ->
+        # rekam skip; advance() yang jalan akan membuang track head.
+        vc = interaction.guild.voice_client
+        if state._advance_lock.locked() and not (vc and (vc.is_playing() or vc.is_paused())):
+            async with state.lock:
+                state._skip_pending = True
+            return await interaction.followup.send('Lagu dilewati.', ephemeral=True)
         await self._stop_player(interaction.guild)
         async with state.lock:
             if state.current:
@@ -2257,12 +2370,22 @@ class MusicBot(discord.Client):
             return
         async def _do():
             await asyncio.sleep(0.5)
-            if state.message and hasattr(state.message, 'edit'):
-                try:
-                    async with state.lock:
-                        embed = self.embed(state)
-                    await state.message.edit(embed=embed)
-                except discord.HTTPException:
+            msg = state.message
+            if not (msg and hasattr(msg, 'edit')):
+                return
+            try:
+                async with state.lock:
+                    embed = self.embed(state)
+                await msg.edit(embed=embed)
+            except discord.HTTPException:
+                if state.message is msg:
+                    state.message = None
+            except Exception:
+                # state.message bisa di-null-kan coroutine lain di sela await;
+                # jangan biarkan AttributeError jadi "task exception never
+                # retrieved" (L1).
+                log.debug('Refresh panel gagal', exc_info=True)
+                if state.message is msg:
                     state.message = None
         try:
             state.refresh_task = asyncio.get_running_loop().create_task(_do())
@@ -2334,10 +2457,27 @@ class MusicBot(discord.Client):
                 if not next_track:
                     break
 
-            # --- fase 3: extract stream di luar lock (C4) + semaphore/timeout (M3) ---
+            # --- fase 3: extract stream di luar lock (C4) + batas thread (H3) ---
             try:
-                async with EXTRACT_SEM:
-                    data = await asyncio.wait_for(asyncio.to_thread(extract, next_track.url), timeout=60)
+                data = await run_extract(extract, next_track.url, timeout=60)
+                # M4: user menekan Skip selama ekstraksi -> jangan putar track ini;
+                # buang head queue (bila berasal dari queue) lalu pilih kandidat
+                # berikutnya. Jangan sentuh history/current: track ini belum
+                # pernah diputar.
+                skip_now = False
+                async with state.lock:
+                    if state._skip_pending:
+                        state._skip_pending = False
+                        skip_now = True
+                        if state.queue and state.queue[0] is next_track:
+                            state.queue.popleft()
+                        elif state.loop_mode == 'track' and state.current is next_track:
+                            # Loop track: skip manual harus keluar dari track yang
+                            # sama, bukan mengulangnya lagi.
+                            state.current = None
+                if skip_now:
+                    log.info('Skip saat ekstraksi: %s dilewati.', next_track.title)
+                    continue
                 if isinstance(data, dict) and (data.get('is_live') or data.get('live_status') == 'is_live'):
                     log.warning('Live stream dilewati: %s', next_track.title)
                     async with state.lock:
@@ -2420,7 +2560,16 @@ class MusicBot(discord.Client):
                                 log.error('Queue advance failed: %s', exc)
                         fut.add_done_callback(_cb)
 
-                    vc.play(source, after=after, application='audio', bitrate=bitrate_kbps, signal_type='music')
+                    try:
+                        vc.play(source, after=after, application='audio', bitrate=bitrate_kbps, signal_type='music')
+                    except discord.ClientException:
+                        # L2: TOCTOU — player lain menang balapan di sela await.
+                        # Jangan salahkan track ini (bukan kegagalan stream).
+                        try:
+                            source.cleanup()
+                        except Exception:
+                            pass
+                        return
                 except Exception:
                     if source is not None:
                         try:
@@ -2435,6 +2584,7 @@ class MusicBot(discord.Client):
                 played = next_track
                 async with state.lock:
                     state._skip_armed = False
+                    state._skip_pending = False
                     if (state.loop_mode == 'track' or (state.loop_mode == 'queue' and not state.queue)) and state.current is next_track:
                         pass
                     else:
@@ -2473,6 +2623,7 @@ class MusicBot(discord.Client):
             # idle-disconnect tidak akan pernah terjadwal (bot tertahan di voice).
             if not (vc.is_playing() or vc.is_paused()):
                 state._skip_armed = False
+                state._skip_pending = False
                 if state.current is not None:
                     state.history.append(state.current)
                     if len(state.history) > 20:

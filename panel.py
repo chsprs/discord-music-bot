@@ -88,6 +88,11 @@ class ConfigStore:
                         continue
                     key = self._key_of(line)
                     value = line.partition('=')[2].strip()
+                    # Buang SATU lapis kutip yang cocok, seperti parsing
+                    # EnvironmentFile systemd: DISCORD_TOKEN="abc" dari hasil
+                    # edit manual tidak boleh menyimpan karakter kutip (M6).
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                        value = value[1:-1]
                     # Assignment terakhir menang, sama seperti EnvironmentFile=.
                     if key == 'DISCORD_TOKEN':
                         data['token'] = value
@@ -291,6 +296,44 @@ def read_bot_logs(lines: int = 35) -> str:
         return f'(Gagal membaca log: {exc})'
 
 
+# Cache tail log: setiap GET / memanggil read_bot_logs yang mem-fork journalctl
+# (timeout 4 dtk). Di STB lambat itu membuat panel lag dan burst refresh bisa
+# menumpuk subprocess (M3). read_bot_logs() mentah tetap ada untuk pemanggilan
+# langsung/test; page render memakai versi ber-cache ini.
+LOG_CACHE_TTL = 15.0
+_log_cache: dict[str, tuple[float, str]] = {}
+_log_cache_lock = threading.Lock()
+
+
+def read_bot_logs_cached(lines: int = 35, fresh: bool = False) -> str:
+    """read_bot_logs dengan cache TTL (M3). `fresh=True` melewati cache."""
+    key = str(lines)
+    started = time.monotonic()
+    if not fresh:
+        with _log_cache_lock:
+            hit = _log_cache.get(key)
+            if hit is not None and started - hit[0] < LOG_CACHE_TTL:
+                return hit[1]
+    value = read_bot_logs(lines)
+    finished = time.monotonic()
+    with _log_cache_lock:
+        _log_cache[key] = (finished, value)
+    return value
+
+
+def listeners_active() -> bool:
+    """Apakah ada pendengar manusia aktif? Cerminan listeners_active() di update.sh.
+
+    Dipakai jalur fallback pembaruan pip agar bot TIDAK di-restart di tengah lagu
+    (M1). State basi (>60 dtk) dianggap tidak ada pendengar. Tidak pernah raise.
+    """
+    try:
+        info = read_bot_runtime_info()
+        return int(info.get('total_listeners') or 0) > 0
+    except Exception:
+        return False
+
+
 def run_update() -> tuple[bool, str]:
     global _last_update_output, _update_running
     with _update_lock:
@@ -326,8 +369,13 @@ def _run_update_inner() -> tuple[bool, str]:
         out = (proc.stdout + '\n' + proc.stderr).strip()
         ok = (proc.returncode == 0)
         if ok and cmd != [update_script] and bot_state() == 'active':
-            subprocess.run(['systemctl', 'restart', SERVICE], timeout=15)
-            out += '\nService discord-music.service berhasil dimulai ulang.'
+            # M1: jangan potong musik orang — jalur fallback ini dulu me-restart
+            # tanpa cek pendengar, berbeda dari update.sh.
+            if listeners_active():
+                out += '\nAda pendengar aktif -> restart ditunda agar musik tidak terputus.'
+            else:
+                subprocess.run(['systemctl', 'restart', SERVICE], timeout=15)
+                out += '\nService discord-music.service berhasil dimulai ulang.'
         if os.path.exists(UPDATE_LOG_PATH):
             try:
                 with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
@@ -758,6 +806,11 @@ class Handler(BaseHTTPRequestHandler):
 
         # 3. Valid page nonce accepted (covers Origin: null, missing Origin, in-app WebViews)
         if has_valid_nonce:
+            # L4: konsumsi nonce (sekali pakai) agar satu token halaman tidak bisa
+            # diputar ulang sampai kedaluwarsa. Origin/Sec-Fetch-Site tetap jadi
+            # pertahanan utama.
+            with _lock:
+                _form_tokens.pop(candidate, None)
             return True
 
         # 4. Fallback: Referer matching host
@@ -847,8 +900,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/logs':
             if not self._authenticated():
                 return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            fresh = query.get('fresh', [''])[0] in ('1', 'true', 'yes')
             return self._json(HTTPStatus.OK, {
-                'bot_logs': read_bot_logs(50),
+                'bot_logs': read_bot_logs_cached(50, fresh=fresh),
                 'update_log': read_last_update_log(),
                 'ytdlp_version': ytdlp_version(),
             })
@@ -1008,7 +1063,7 @@ class Handler(BaseHTTPRequestHandler):
                 .replace('{ytdlp_version}', html.escape(ytdlp_version()))
                 .replace('{timer_state}', html.escape(timer_state()))
                 .replace('{update_log_section}', update_log_section)
-                .replace('{bot_logs}', html.escape(read_bot_logs(35))))
+                .replace('{bot_logs}', html.escape(read_bot_logs_cached(35))))
         self._send(status, page)
 
     # ---- actions -------------------------------------------------

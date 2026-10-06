@@ -55,6 +55,13 @@ if [[ "$SCRIPT_DIR" != "$INSTALL_DIR" ]]; then
     if [[ -d "$SCRIPT_DIR/tests" ]]; then
         cp -r "$SCRIPT_DIR/tests" "$INSTALL_DIR"/
     fi
+    # tools/ (mis. cleanup_panels.py) dan docs/ ikut dipasang: docstring tools
+    # menyuruh menjalankannya dari /opt/discord-music-bot (L6).
+    for d in tools docs; do
+        if [[ -d "$SCRIPT_DIR/$d" ]]; then
+            cp -r "$SCRIPT_DIR/$d" "$INSTALL_DIR"/
+        fi
+    done
 fi
 
 cd "$INSTALL_DIR"

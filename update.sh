@@ -17,6 +17,15 @@ fi
 
 log() { echo "[$TIMESTAMP] $*" >> "$LOG_FILE"; }
 
+# Batasi pertumbuhan last_update.log (M2): pip menulis output penuh tiap minggu
+# dan panel merender ekornya di tiap halaman. Simpan 300 baris terakhir. Dipanggil
+# lewat trap EXIT agar berlaku di SEMUA jalur keluar (termasuk "restart ditunda").
+trim_log() {
+    [ -f "$LOG_FILE" ] || return 0
+    tail -n 300 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE" || true
+}
+trap trim_log EXIT
+
 # ---------------------------------------------------------------- versi
 # Versi terpasang sekarang. Pakai importlib.metadata (versi kanonik PyPI,
 # mis. '2026.8.19') bukan yt_dlp.version.__version__ ('2026.08.19'), supaya pin

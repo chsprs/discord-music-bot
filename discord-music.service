@@ -13,6 +13,9 @@ Restart=on-failure
 RestartSec=10
 MemoryMax=400M
 TasksMax=64
+# Berkas runtime (state.json/queue_state.json) memuat nama guild, judul lagu,
+# dan nama pendengar — jangan world-readable (L3).
+UMask=0027
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

@@ -112,6 +112,26 @@ class BotUnitHardeningTests(unittest.TestCase):
         """Bot hanya perlu tulis ke RuntimeDirectory (state exporter)."""
         self.assertIn('RuntimeDirectory=discord-music', self.unit)
 
+    def test_bot_umask_is_restrictive(self):
+        """L3: state.json memuat nama guild/lagu/pendengar — jangan world-readable."""
+        self.assertIn('UMask=', self.unit,
+                      'bot harus menetapkan UMask agar berkas runtime tidak world-readable')
+        directive = self._directive('UMask')
+        self.assertIsNotNone(directive)
+        # UMask=0027 -> bit group/other tidak boleh longgar (nilai harus <= 0027).
+        self.assertLessEqual(int(directive, 8), 0o027,
+                             f'UMask {directive} terlalu longgar untuk berkas runtime bot')
+
+    def _directive(self, key: str):
+        for line in self.unit.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('#') or '=' not in stripped:
+                continue
+            name, _, value = stripped.partition('=')
+            if name.strip() == key:
+                return value.strip()
+        return None
+
 
 if __name__ == '__main__':
     unittest.main()

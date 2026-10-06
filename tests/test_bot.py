@@ -3240,3 +3240,193 @@ class SkipTrackLoopTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EnvIntConfigTests(unittest.TestCase):
+    """H2/L5: env int tidak valid tidak boleh membuat bot gagal import; dijepit rentang."""
+
+    def test_invalid_value_falls_back_to_default(self):
+        for bad in ('bogus', '180s', 'lima', '', '3.5', 'None'):
+            with patch.dict(os.environ, {'AFK_TIMEOUT_SECONDS': bad}):
+                self.assertEqual(
+                    bot_module._int_env('AFK_TIMEOUT_SECONDS', 180, lo=1), 180,
+                    f'nilai {bad!r} harus jatuh ke default')
+
+    def test_valid_value_is_used(self):
+        with patch.dict(os.environ, {'MIX_RESULT_LIMIT': '7'}):
+            self.assertEqual(bot_module._int_env('MIX_RESULT_LIMIT', 15, lo=1, hi=50), 7)
+
+    def test_range_is_clamped(self):
+        with patch.dict(os.environ, {'AFK_TIMEOUT_SECONDS': '-5'}):
+            self.assertEqual(bot_module._int_env('AFK_TIMEOUT_SECONDS', 180, lo=1), 1)
+        with patch.dict(os.environ, {'MIX_RESULT_LIMIT': '999'}):
+            self.assertEqual(bot_module._int_env('MIX_RESULT_LIMIT', 15, lo=1, hi=50), 50)
+        with patch.dict(os.environ, {'MIX_RESULT_LIMIT': '0'}):
+            self.assertEqual(bot_module._int_env('MIX_RESULT_LIMIT', 15, lo=1, hi=50), 1)
+
+    def test_module_constants_are_sane(self):
+        self.assertIsInstance(MIX_RESULT_LIMIT, int)
+        self.assertGreaterEqual(MIX_RESULT_LIMIT, 1)
+        self.assertLessEqual(MIX_RESULT_LIMIT, 50)
+        self.assertIsInstance(bot_module.AFK_TIMEOUT_SECONDS, int)
+        self.assertGreaterEqual(bot_module.AFK_TIMEOUT_SECONDS, 1)
+
+
+class ClearCacheSafetyTests(unittest.TestCase):
+    """M5: clear_cache tidak boleh rmtree direktori relatif ke CWD."""
+
+    def test_relative_ytdlp_dir_is_not_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = os.path.join(tmp, 'yt-dlp')
+            os.makedirs(victim)
+            with open(os.path.join(victim, 'keep.txt'), 'w', encoding='utf-8') as fh:
+                fh.write('x')
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                with patch.dict(os.environ, {'XDG_CACHE_HOME': ''}):
+                    with patch('bot.yt_dlp.YoutubeDL'):
+                        bot_module.clear_cache()
+            finally:
+                os.chdir(old_cwd)
+            self.assertTrue(os.path.isdir(victim),
+                            'direktori yt-dlp relatif CWD tidak boleh dihapus (M5)')
+            self.assertTrue(os.path.exists(os.path.join(victim, 'keep.txt')))
+
+
+class RefreshRobustnessTests(unittest.TestCase):
+    """L1: task refresh tidak boleh mati dengan AttributeError tak tertangkap."""
+
+    def test_refresh_survives_message_becoming_none_after_sleep(self):
+        async def _run():
+            bot = MusicBot()
+            state = QueueState()
+            state.message = MagicMock()
+            state.message.edit = AsyncMock()
+            bot.states[1] = state
+
+            real_sleep = asyncio.sleep
+
+            async def _sleep(_):
+                # Tirukan coroutine lain yang men-null-kan panel di sela await.
+                state.message = None
+                await real_sleep(0)
+
+            with patch('bot.asyncio.sleep', new=_sleep):
+                await bot.refresh(state)
+                if state.refresh_task:
+                    await state.refresh_task
+                    self.assertIsNone(state.refresh_task.exception())
+        asyncio.run(_run())
+
+    def test_refresh_handles_http_exception_and_clears_message(self):
+        async def _run():
+            bot = MusicBot()
+            state = QueueState()
+            msg = MagicMock()
+            msg.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), 'boom'))
+            state.message = msg
+            with patch('bot.asyncio.sleep', new=AsyncMock()):
+                await bot.refresh(state)
+                if state.refresh_task:
+                    await state.refresh_task
+            self.assertIsNone(state.message)
+        asyncio.run(_run())
+
+
+class ExtractionThreadCeilingTests(unittest.TestCase):
+    """H3: thread yt-dlp zombie dibatasi agar tidak menumpuk saat YouTube macet."""
+
+    def tearDown(self):
+        bot_module._EXTRACT_THREADS = 0
+
+    def test_run_extract_returns_fast_result(self):
+        async def _run():
+            return await bot_module.run_extract(lambda a, b: a + b, 2, 3, timeout=5)
+        self.assertEqual(asyncio.run(_run()), 5)
+
+    def test_run_extract_times_out_on_hung_thread(self):
+        async def _run():
+            with self.assertRaises((asyncio.TimeoutError, TimeoutError)):
+                await bot_module.run_extract(lambda: __import__('time').sleep(5), timeout=0.2)
+        asyncio.run(_run())
+
+    def test_run_extract_rejects_when_thread_ceiling_reached(self):
+        async def _run():
+            with patch.object(bot_module, '_EXTRACT_THREADS', bot_module.MAX_EXTRACT_THREADS):
+                with self.assertRaises(bot_module.ExtractionBusy):
+                    await bot_module.run_extract(lambda: 1, timeout=5)
+        asyncio.run(_run())
+
+    def test_extraction_busy_is_value_error(self):
+        # Subclass ValueError agar jalur /play menampilkan pesan ramah tanpa ubah pemanggil.
+        self.assertTrue(issubclass(bot_module.ExtractionBusy, ValueError))
+
+
+class SkipPendingTests(unittest.TestCase):
+    """M4: skip saat advance() sedang ekstraksi harus dihormati, bukan ditelan."""
+
+    def test_queue_state_has_skip_pending_default_false(self):
+        self.assertFalse(QueueState()._skip_pending)
+
+    def test_advance_drops_head_track_when_skip_pending(self):
+        bot = MusicBot()
+        guild = MagicMock(id=55501, name='SkipGuild')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        t1 = Track('Satu', 'https://example.com/1', 'u')
+        t2 = Track('Dua', 'https://example.com/2', 'u')
+        state = QueueState()
+        state.queue.extend((t1, t2))
+        state._skip_pending = True
+        bot.states[guild.id] = state
+
+        played = []
+
+        async def fake_extract(func, *args, **kwargs):
+            # Saat ekstraksi track pertama, tandai skip (tirukan user menekan Skip).
+            return {'url': 'https://cdn/audio'}
+
+        with patch('bot.run_extract', new=AsyncMock(side_effect=fake_extract)), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(bot, 'refresh', new=AsyncMock()), \
+             patch.object(bot, '_save_persistent_queue'), \
+             patch.object(bot, '_announce', side_effect=lambda g, t: played.append(t)):
+            asyncio.run(bot.advance(guild))
+
+        # t1 dilewati (dibuang dari head) dan t2 yang diputar.
+        self.assertEqual(played, [t2])
+        self.assertFalse(state._skip_pending, '_skip_pending harus dikonsumsi')
+        self.assertNotIn(t1, state.queue)
+        self.assertEqual(state.current, t2)
+
+
+class JsRuntimeDetectionTests(unittest.TestCase):
+    """L7: kandidat JS runtime rusak tidak boleh membayangi yang sehat."""
+
+    def test_broken_candidate_is_skipped(self):
+        def fake_run(cmd, **kwargs):
+            proc = MagicMock()
+            proc.returncode = 0 if cmd[0] == '/usr/bin/node' else 1
+            return proc
+
+        with patch('bot.subprocess.run', side_effect=fake_run), \
+             patch('bot.shutil.which', side_effect=lambda n: None), \
+             patch('bot.os.path.exists', return_value=True), \
+             patch('bot.os.access', return_value=True):
+            runtime = bot_module._detect_js_runtime()
+        self.assertEqual(runtime, {'node': {'path': '/usr/bin/node'}})
+
+    def test_no_working_runtime_returns_empty(self):
+        proc = MagicMock()
+        proc.returncode = 1
+        with patch('bot.subprocess.run', return_value=proc), \
+             patch('bot.shutil.which', return_value=None), \
+             patch('bot.os.path.exists', return_value=True), \
+             patch('bot.os.access', return_value=True):
+            self.assertEqual(bot_module._detect_js_runtime(), {})

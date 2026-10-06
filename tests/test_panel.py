@@ -48,6 +48,11 @@ class PanelTests(unittest.TestCase):
         self.cfg = panel.ConfigStore(self.env)
         panel.STORE = self.cfg
         panel.PASSWORD = 'rahasia-uji'
+        # M7: cegah kebocoran state antar-test (flash/pesan sesi/token/cache log).
+        panel._flash_msg = ''
+        panel._sessions.clear()
+        panel._form_tokens.clear()
+        panel._log_cache.clear()
         self.server = panel.build_server('127.0.0.1', 0)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -730,6 +735,11 @@ class PasswordlessTests(unittest.TestCase):
         self.env = os.path.join(self.tmp.name, '.env')
         panel.STORE = panel.ConfigStore(self.env)
         panel.PASSWORD = ''
+        # M7: flash/sesi/token dari test sebelumnya tidak boleh bocor ke sini.
+        panel._flash_msg = ''
+        panel._sessions.clear()
+        panel._form_tokens.clear()
+        panel._log_cache.clear()
         self.server = panel.build_server('127.0.0.1', 0)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -1189,3 +1199,149 @@ class SecurityAuditValidationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PanelBugReportFixesTests(unittest.TestCase):
+    """Regression untuk temuan laporan bug: M1, M3, M6, L4."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = os.path.join(self.tmp.name, '.env')
+        self.cfg = panel.ConfigStore(self.env)
+        panel.STORE = self.cfg
+        panel.PASSWORD = 'rahasia-fix'
+        panel._form_tokens.clear()
+        panel._log_cache.clear()
+        panel._sessions.clear()
+        panel._flash_msg = ''
+        self.valid_token = 'MTAwMDAwMDAwMDAwMDAwMDAw.G12345.abcdefghijklmnopqrstuvwxyz0123456789'
+        self.valid_guild = '123456789012345678'
+        self.server = panel.build_server('127.0.0.1', 0)
+        self.port = self.server.server_address[1]
+        self.cookie = f'{panel.COOKIE}={panel._mint_session()}'
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(panel._log_cache.clear)
+
+    def req(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        hdrs = dict(headers or {})
+        if 'Cookie' not in hdrs:
+            hdrs['Cookie'] = self.cookie
+        if body is not None:
+            hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
+        conn.request(method, path, body=body, headers=hdrs)
+        res = conn.getresponse()
+        payload = res.read().decode('utf-8', 'replace')
+        conn.close()
+        return res.status, payload
+
+    def _form_token(self):
+        _, page = self.req('GET', '/')
+        match = re.search(r'name="form_token" value="([^"]+)"', page)
+        self.assertIsNotNone(match, 'form_token tidak muncul di panel')
+        return match.group(1)
+
+    # --- M6: ConfigStore.read membuang kutip ---
+    def test_read_strips_matching_quotes(self):
+        with open(self.env, 'w', encoding='utf-8') as fh:
+            fh.write('DISCORD_TOKEN="abc.def.ghi"\nDISCORD_GUILD_ID=\'123\'\n')
+        data = panel.ConfigStore(self.env).read()
+        self.assertEqual(data['token'], 'abc.def.ghi')
+        self.assertEqual(data['guild'], '123')
+
+    def test_read_keeps_unquoted_and_unbalanced(self):
+        with open(self.env, 'w', encoding='utf-8') as fh:
+            fh.write('DISCORD_TOKEN=plain.token\nDISCORD_GUILD_ID="123\n')
+        data = panel.ConfigStore(self.env).read()
+        self.assertEqual(data['token'], 'plain.token')
+        self.assertEqual(data['guild'], '"123', 'kutip tak berpasangan tidak dibuang')
+
+    # --- M3: cache log ---
+    def test_read_bot_logs_cached_uses_cache(self):
+        panel._log_cache['35'] = (time.monotonic(), 'SENTINEL')
+        with unittest.mock.patch('panel.read_bot_logs', side_effect=AssertionError('dipanggil')):
+            self.assertEqual(panel.read_bot_logs_cached(35), 'SENTINEL')
+
+    def test_read_bot_logs_cached_refreshes_when_stale(self):
+        panel._log_cache['35'] = (time.monotonic() - panel.LOG_CACHE_TTL - 1, 'OLD')
+        with unittest.mock.patch('panel.read_bot_logs', return_value='NEW') as m:
+            self.assertEqual(panel.read_bot_logs_cached(35), 'NEW')
+            m.assert_called_once()
+
+    def test_read_bot_logs_cached_fresh_bypasses_cache(self):
+        panel._log_cache['35'] = (time.monotonic(), 'OLD')
+        with unittest.mock.patch('panel.read_bot_logs', return_value='NEW'):
+            self.assertEqual(panel.read_bot_logs_cached(35, fresh=True), 'NEW')
+
+    # --- L4: form token sekali pakai ---
+    def test_form_token_is_single_use(self):
+        token = self._form_token()
+        # Origin: null memaksa validasi lewat jalur nonce (step 3), bukan jalur
+        # Origin-cocok (step 2) — jadi token benar-benar yang mengotorisasi.
+        headers = {'Origin': 'null'}
+        status, _ = self.req('POST', '/save',
+                             f'token={self.valid_token}&guild={self.valid_guild}&form_token={token}',
+                             headers=headers)
+        self.assertEqual(status, 303)
+        # Token yang sama dipakai ulang harus ditolak (sudah dikonsumsi).
+        status2, _ = self.req('POST', '/save',
+                              f'token={self.valid_token}&guild={self.valid_guild}&form_token={token}',
+                              headers=headers)
+        self.assertEqual(status2, 403)
+
+
+class PanelListenerAwareUpdateTests(unittest.TestCase):
+    """M1: jalur fallback pembaruan tidak boleh me-restart bot saat ada pendengar."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_file = os.path.join(self.tmp.name, 'state.json')
+        os.environ['BOT_STATE_FILE'] = self.state_file
+        self.addCleanup(os.environ.pop, 'BOT_STATE_FILE', None)
+
+    def _write_state(self, listeners, age=0.0):
+        with open(self.state_file, 'w', encoding='utf-8') as fh:
+            json.dump({'total_listeners': listeners, 'updated_at': time.time() - age}, fh)
+
+    def test_listeners_active_true_when_listeners_present(self):
+        self._write_state(2)
+        self.assertTrue(panel.listeners_active())
+
+    def test_listeners_active_false_when_zero(self):
+        self._write_state(0)
+        self.assertFalse(panel.listeners_active())
+
+    def test_listeners_active_false_when_state_stale(self):
+        self._write_state(5, age=300)
+        self.assertFalse(panel.listeners_active())
+
+    def test_listeners_active_false_when_no_file(self):
+        self.assertFalse(panel.listeners_active())
+
+    def test_fallback_update_defers_restart_when_listeners_active(self):
+        self._write_state(3)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            proc = unittest.mock.MagicMock()
+            proc.returncode = 0
+            proc.stdout = ''
+            proc.stderr = ''
+            return proc
+
+        with unittest.mock.patch.object(panel, 'UPDATE_RUNNER', None), \
+             unittest.mock.patch.object(panel, 'bot_state', return_value='active'), \
+             unittest.mock.patch.object(panel, 'listeners_active', return_value=True), \
+             unittest.mock.patch('panel.os.path.exists', return_value=False), \
+             unittest.mock.patch('panel.os.access', return_value=False), \
+             unittest.mock.patch('panel.subprocess.run', side_effect=fake_run):
+            ok, out = panel._run_update_inner()
+
+        restart_calls = [c for c in calls if 'restart' in c]
+        self.assertEqual(restart_calls, [], 'bot di-restart padahal ada pendengar')
+        self.assertIn('ditunda', out)
