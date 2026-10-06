@@ -3598,3 +3598,55 @@ class VoiceStateShortCircuitTests(unittest.TestCase):
              patch.object(bot, 'refresh', new=AsyncMock()):
             asyncio.run(bot.on_voice_state_update(member, before, after))
             self.assertTrue(mock_dump.called, 'pindah channel harus tetap diproses')
+
+
+class AFKQuitVoiceSelfCancellationRegressionTests(unittest.TestCase):
+    """Regresi: quit_voice() membatalkan afk_task/idle_task yang memanggilnya sendiri.
+    
+    Saat task meng-cancel dirinya sendiri, await berikutnya (_safe_delete_msg) langsung
+    melempar CancelledError sebelum mencapai vc.disconnect(), membuat bot tersangkut di voice.
+    """
+
+    def test_quit_voice_from_afk_task_does_not_cancel_self(self):
+        bot = MusicBot()
+        guild = MagicMock(id=501, name='G')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.disconnect = AsyncMock()
+        guild.voice_client = vc
+
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        async def worker():
+            state.afk_task = asyncio.current_task()
+            await bot.quit_voice(guild, clear_queue=False)
+
+        with patch('bot.dump_runtime_state'), patch.object(bot, '_safe_delete_msg', new=AsyncMock()):
+            asyncio.run(worker())
+
+        vc.disconnect.assert_awaited_once()
+
+    def test_quit_voice_from_idle_task_does_not_cancel_self(self):
+        bot = MusicBot()
+        guild = MagicMock(id=502, name='G')
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.disconnect = AsyncMock()
+        guild.voice_client = vc
+
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        async def worker():
+            state.idle_task = asyncio.current_task()
+            await bot.quit_voice(guild, clear_queue=False)
+
+        with patch('bot.dump_runtime_state'), patch.object(bot, '_safe_delete_msg', new=AsyncMock()):
+            asyncio.run(worker())
+
+        vc.disconnect.assert_awaited_once()

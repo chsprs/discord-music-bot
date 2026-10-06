@@ -2107,6 +2107,7 @@ class MusicBot(discord.Client):
         state = self.states.get(guild.id)
         old_now_message = None
         old_message = None
+        current = asyncio.current_task()
         if state:
             async with state.lock:
                 state.generation += 1
@@ -2114,8 +2115,11 @@ class MusicBot(discord.Client):
                     state.queue.clear()
                     state.history.clear()
                 state.current = None
+                # Jangan cancel task yang sedang menjalankan quit_voice (mis. afk_task atau idle_task).
+                # Bila task meng-cancel dirinya sendiri, await berikutnya langsung melempar CancelledError
+                # sehingga vc.disconnect() tidak pernah terpanggil dan bot tersangkut di voice.
                 for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task):
-                    if task and not task.done():
+                    if task and not task.done() and task is not current:
                         task.cancel()
                 state.idle_task = state.empty_task = state.afk_task = state.refresh_task = None
                 state.afk_paused = False
@@ -2126,7 +2130,7 @@ class MusicBot(discord.Client):
                 if delete_panel:
                     old_message = state.message
                     state.message = None
-            if announce_task and not announce_task.done():
+            if announce_task and not announce_task.done() and announce_task is not current:
                 announce_task.cancel()
             if old_now_message is not None:
                 await self._safe_delete_msg(old_now_message, guild=guild)
@@ -2151,7 +2155,7 @@ class MusicBot(discord.Client):
             except Exception:
                 pass
             try:
-                await vc.disconnect(force=True)
+                await asyncio.wait_for(vc.disconnect(force=True), timeout=10.0)
             except Exception:
                 pass
         if state and not delete_panel:
