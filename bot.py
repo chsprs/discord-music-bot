@@ -1300,10 +1300,12 @@ class MusicPanel(discord.ui.View):
             return
         state = self.bot.states[interaction.guild.id]
         cycle = {'off': 'track', 'track': 'queue', 'queue': 'off'}
-        state.loop_mode = cycle.get(state.loop_mode, 'off')
+        async with state.lock:
+            state.loop_mode = cycle.get(state.loop_mode, 'off')
+            loop_mode = state.loop_mode
         self.bot._save_persistent_queue()
         mode_text = {'track': 'Ulang Lagu Ini (Track)', 'queue': 'Ulang Seluruh Antrian (Queue)', 'off': 'Mati (Off)'}
-        await interaction.followup.send(f'Mode Loop: **{mode_text[state.loop_mode]}**', ephemeral=True)
+        await interaction.followup.send(f'Mode Loop: **{mode_text[loop_mode]}**', ephemeral=True)
         await self.bot.refresh(state)
 
     @discord.ui.button(label='Stop', emoji='⏹️', style=discord.ButtonStyle.secondary, custom_id='music:stop', row=1)
@@ -1321,9 +1323,11 @@ class MusicPanel(discord.ui.View):
         if not await self.guard(interaction):
             return
         state = self.bot.states[interaction.guild.id]
-        state.autoplay = not state.autoplay
+        async with state.lock:
+            state.autoplay = not state.autoplay
+            autoplay_on = state.autoplay
         self.bot._save_persistent_queue()
-        status = 'Aktif' if state.autoplay else 'Nonaktif'
+        status = 'Aktif' if autoplay_on else 'Nonaktif'
         await interaction.followup.send(f'AutoPlay sekarang: **{status}**', ephemeral=True)
         await self.bot.refresh(state)
 
