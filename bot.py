@@ -1022,6 +1022,24 @@ class PlaylistView(discord.ui.View):
 AddSongView = PlaylistView
 
 
+def _get_msg_id(msg) -> int | None:
+    """Ekstrak ID pesan baik dari Message object maupun int/str."""
+    if msg is None or isinstance(msg, bool):
+        return None
+    if isinstance(msg, int):
+        return msg
+    msg_id = getattr(msg, 'id', None)
+    if msg_id is not None:
+        try:
+            return int(msg_id)
+        except (ValueError, TypeError):
+            return msg_id
+    try:
+        return int(msg)
+    except (ValueError, TypeError):
+        return None
+
+
 class MusicPanel(discord.ui.View):
     def __init__(self, bot: 'MusicBot'):
         super().__init__(timeout=None)
@@ -1094,7 +1112,7 @@ class MusicPanel(discord.ui.View):
             return False
 
         state = self.bot.states.setdefault(interaction.guild.id, QueueState())
-        if interaction.message and state.message and getattr(state.message, 'id', None) != getattr(interaction.message, 'id', None):
+        if interaction.message and state.message and _get_msg_id(state.message) != _get_msg_id(interaction.message):
             try:
                 await interaction.message.delete()
             except Exception:
@@ -2215,7 +2233,7 @@ class MusicBot(discord.Client):
             return
         async def _do():
             await asyncio.sleep(0.5)
-            if state.message:
+            if state.message and hasattr(state.message, 'edit'):
                 try:
                     async with state.lock:
                         embed = self.embed(state)
