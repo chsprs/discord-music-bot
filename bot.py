@@ -950,7 +950,11 @@ def patch_audio_player():
 
             if not client.is_connected():
                 connected = client.wait_until_connected(client.timeout)
-                if self._end.is_set() or not connected:
+                if self._end.is_set():
+                    return
+                if not connected:
+                    if self._current_error is None:
+                        self._current_error = discord.ClientException('Voice connection lost.')
                     return
                 self._speak(discord.player.SpeakingState.voice)
                 self.loops = 0
@@ -2612,7 +2616,10 @@ class MusicBot(discord.Client):
 
                     try:
                         vc.play(source, after=after, application='audio', bitrate=bitrate_kbps, signal_type='music')
-                    except discord.ClientException:
+                    except discord.ClientException as exc:
+                        if 'Not connected to voice' in str(exc):
+                            log.error('vc.play gagal: %s', exc)
+                            asyncio.create_task(self.quit_voice(guild, clear_queue=False))
                         # L2: TOCTOU — player lain menang balapan di sela await.
                         # Jangan salahkan track ini (bukan kegagalan stream).
                         try:
