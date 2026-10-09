@@ -1,0 +1,12 @@
+# Dependensi langsung discord-music-bot.
+#
+# File ini adalah SUMBER untuk requirements.txt yang hash-locked.
+# Jangan edit requirements.txt manual — regenerate lewat:
+#
+#   pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+#
+# yt-dlp sengaja tidak di-pin di sini supaya tiap pip-compile mengambil
+# rilis terbaru (itulah cara me-bump yt-dlp). discord.py di-pin karena
+# API-nya sensitif terhadap perubahan mayor.
+discord.py[voice]==2.7.1
+yt-dlp[default]

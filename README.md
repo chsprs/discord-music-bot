@@ -1,9 +1,9 @@
 # 🎵 Discord Music Bot (Lightweight, Ad-Free & Studio Quality)
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
-[![discord.py](https://img.shields.io/badge/discord.py-v2.4%2B-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
-[![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-313%2F313%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![discord.py](https://img.shields.io/badge/discord.py-v2.7-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
+[![yt-dlp](https://img.shields.io/badge/yt--dlp-pinned-red)](https://github.com/yt-dlp/yt-dlp)
+[![Tests](https://img.shields.io/badge/Tests-310%2F310%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -62,10 +62,33 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
   - **Pemantau Server & Pengguna Aktif:** Menampilkan daftar server Discord yang dimasuki bot, channel voice yang sedang tersambung, judul lagu & antrean yang sedang berputar, serta jumlah & nama pengguna yang sedang mendengarkan secara realtime.
   - **Tombol Pembaruan Manual:** Perbarui `yt-dlp` seketika lewat tombol web lengkap dengan riwayat log keluaran terminal.
   - **Pemantau Log Realtime:** Kotak log aktivitas bot (`journalctl`) yang dapat disegarkan langsung dari antarmuka web.
-- **Auto-Update Berkala & Zero-Warning JS Runtime:**
-  - **Systemd Timer Mingguan:** Menjalankan pembaruan otomatis `yt-dlp` setiap Minggu pukul 04:00 WIB agar cipher extractor YouTube selalu mutakhir. Pembaruan memakai `pip install --upgrade` dan menuliskan versi baru kembali ke `requirements.txt`.
-  - **Restart Aman Saat Ada Pendengar:** Bila masih ada yang mendengarkan musik, restart bot ditunda agar pemutaran tidak terputus; versi yt-dlp baru otomatis dipakai pada restart berikutnya.
-  - **Integrasi JS Engine:** Terhubung ke Node.js runtime untuk menyelesaikan challenge player API YouTube (EJS) tanpa pesan warning deprecation.
+- **Auto-Update Mingguan yang Aman:**
+  - **Systemd Timer Mingguan:** Setiap Minggu pukul 04:00 WIB, `discord-music-update.service` berjalan sebagai user khusus non-root `discord-music-updater` (bukan root).
+  - **Hash-locked install:** Pembaruan memakai `pip install --require-hashes -r requirements.txt`. Setiap paket diverifikasi SHA-256 sebelum dipasang; paket yang hash-nya tidak cocok ditolak. `requirements.txt` di-generate dari `requirements.in` lewat `pip-compile --generate-hashes`.
+  - **Restart hanya bila versi berubah:** Bot di-restart hanya jika versi yt-dlp terpasang benar-benar berubah. Bila tidak ada perubahan, updater keluar tanpa restart.
+  - **Restart Aman Saat Ada Pendengar:** Bila masih ada yang mendengarkan musik (dibaca dari `listeners.json` yang world-readable), restart ditunda agar pemutaran tidak terputus; versi yt-dlp baru dipakai pada restart berikutnya.
+  - **Integrasi JS Engine:** Terhubung ke Node.js runtime untuk menyelesaikan challenge player API YouTube (EJS) tanpa pesan warning deprecation. Skrip setup NodeSource diverifikasi SHA-256 statis sebelum dieksekusi `install.sh`.
+
+## 🔄 Memperbarui yt-dlp (Untuk Maintainer)
+
+Timer mingguan tidak menaikkan versi sendiri — ia hanya memasang versi yang ter-pin di `requirements.txt`. Untuk bump yt-dlp ke rilis terbaru:
+
+```bash
+# Di mesin dev (butuh pip-tools):
+pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+git add requirements.txt
+git commit -m "chore: bump yt-dlp"
+git push
+```
+
+```bash
+# Di STB/server:
+cd /opt/discord-music-bot
+git pull
+sudo -u discord-music-updater ./update.sh   # atau tunggu timer mingguan / tekan tombol update di panel
+```
+
+`update.sh` memverifikasi semua hash, memasang versi baru, dan me-restart bot bila tidak ada pendengar aktif.
 - **Cookies Opsional (video age-restricted):** Taruh `cookies.txt` di direktori bot (atau set `YTDLP_COOKIES` di `.env`) untuk memutar video yang butuh login. Berkas dibaca ulang tiap ekstraksi, jadi tidak perlu restart. `cookies.txt` berisi sesi login — sudah masuk `.gitignore`, perlakukan seperti password.
 - **Auto-Sync & Auto-Start:**
   - Sinkronisasi slash command otomatis ke seluruh server Discord saat bot dinyalakan atau diundang ke server baru (`on_guild_join`).
@@ -123,12 +146,13 @@ sudo ./install.sh
 ```
 
 Skrip installer otomatis:
-1. Memeriksa dan menginstal paket sistem yang dibutuhkan (`python3`, `python3-venv`, `ffmpeg`, `nodejs`).
-2. Menyiapkan Python virtual environment dan menginstal dependensi (`discord.py`, `yt-dlp`).
-3. Memasang service systemd `discord-music.service` dan `discord-music-panel.service`.
-4. Mengaktifkan auto-start saat boot sistem.
-5. Menjalankan verifikasi unit test mandiri (**313/313 passing**).
-6. Menyalakan Web Control Panel di port `9130`.
+1. Memeriksa dan menginstal paket sistem yang dibutuhkan (`python3`, `python3-venv`, `ffmpeg`, `nodejs`; skrip setup NodeSource diverifikasi SHA-256 sebelum dijalankan).
+2. Menyiapkan Python virtual environment dan menginstal dependensi hash-locked dari `requirements.txt`.
+3. Membuat user sistem non-root `discord-music-updater`, mengatur ownership `venv`/log, dan memasang aturan sudoers terbatas (`systemctl restart/is-active discord-music.service` saja).
+4. Memasang service systemd `discord-music.service`, `discord-music-panel.service`, dan `discord-music-update.service` + timer.
+5. Mengaktifkan auto-start saat boot sistem.
+6. Menjalankan verifikasi unit test mandiri (**310/310 passing**).
+7. Menyalakan Web Control Panel di port `9130`.
 
 ---
 
@@ -143,7 +167,7 @@ Skrip installer otomatis:
 4. Masuk ke Voice Channel di Discord, lalu ketik `/musik` atau `/play <judul/url>`.
 
 > [!WARNING]
-> **Keamanan panel.** Panel ini mengendalikan `systemctl` dan `yt-dlp` sebagai root.
+> **Keamanan panel.** Panel web berjalan sebagai root dan memicu aksi update lewat user terbatas `discord-music-updater` (`sudo -u`, tanpa password hanya untuk perintah pip yang ter-pin).
 > Password awal dibuat otomatis oleh `install.sh` dan disimpan di
 > `/opt/discord-music-panel.env`.
 >
@@ -203,12 +227,14 @@ Saat membuat aplikasi bot di [Discord Developer Portal](https://discord.com/deve
 /opt/discord-music-bot/
 ├── bot.py                        # Core bot Discord (audio pipeline, queue, commands, UI View)
 ├── panel.py                      # Web Control Panel LAN mandiri (stdlib HTTP, CSRF-safe, log viewer)
-├── update.sh                     # Skrip pembaruan otomatis yt-dlp & restart bot
-├── requirements.txt              # Dependensi Python pip (discord.py, yt-dlp)
+├── update.sh                     # Skrip pembaruan yt-dlp hash-locked & restart bot (jalan sbg discord-music-updater)
+├── requirements.txt              # Dependensi Python hash-locked (jangan edit manual; regenerate dari .in)
+├── requirements.in               # Dependensi langsung; sumber untuk regenerate requirements.txt
 ├── install.sh                    # Skrip instalasi otomatis satu baris
+├── LICENSE                       # Lisensi MIT
 ├── discord-music.service         # Service systemd bot musik
 ├── discord-music-panel.service   # Service systemd web dashboard
-├── discord-music-update.service  # Service oneshot pembaruan yt-dlp
+├── discord-music-update.service  # Service oneshot pembaruan yt-dlp (User=discord-music-updater)
 ├── discord-music-update.timer    # Timer mingguan auto-update
 ├── .env.example                  # Templat variabel lingkungan
 ├── .gitignore
@@ -230,13 +256,12 @@ Jalankan rangkaian unit test lengkap:
 
 ```bash
 cd /opt/discord-music-bot
-PYTHONPATH="" PYTHONHOME="" ./venv/bin/python -m unittest discover -s tests -v
+./venv/bin/python -m pytest tests/ -q
 ```
 
 Hasil uji:
 ```
-Ran 313 tests in 77.4s
-OK
+310 passed in ~70s
 ```
 
 ---
