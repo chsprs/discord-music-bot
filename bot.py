@@ -210,8 +210,12 @@ async def run_extract(func, *args, timeout: float = 60, **kwargs):
             log.warning('Ekstraksi ditolak: %d thread yt-dlp masih hidup (batas %d).',
                         alive, MAX_EXTRACT_THREADS)
             raise ExtractionBusy('Server sedang sibuk menyiapkan lagu. Coba lagi sebentar lagi.')
-        return await asyncio.wait_for(
-            asyncio.to_thread(_tracked_extract, func, *args, **kwargs), timeout=timeout)
+        try:
+            task = asyncio.to_thread(_tracked_extract, func, *args, **kwargs)
+        except Exception:
+            _release_extract_slot()
+            raise
+        return await asyncio.wait_for(task, timeout=timeout)
 
 
 def _cookies_file() -> str | None:
@@ -2426,7 +2430,9 @@ class MusicBot(discord.Client):
         """Pilih track berikutnya dan putar. Lock hanya untuk mutasi deque (C4)."""
         state = self.states[guild.id]
         vc = guild.voice_client
-        if not vc or not vc.is_connected():
+        if not vc or not getattr(vc, 'is_connected', lambda: False)():
+            log.warning('advance() dibatalkan: voice client tidak terhubung.')
+            asyncio.create_task(self.quit_voice(guild, clear_queue=False))
             return
         if state._advance_lock.locked():
             return
@@ -2513,6 +2519,7 @@ class MusicBot(discord.Client):
                 if state.generation != gen0 or guild.voice_client is not vc:
                     log.info('advance() basi (generation/voice berubah) saat ekstraksi %s; dibatalkan.',
                              next_track.title)
+                    state._skip_pending = False
                     return
                 # M4: user menekan Skip selama ekstraksi -> jangan putar track ini;
                 # buang head queue (bila berasal dari queue) lalu pilih kandidat
