@@ -362,7 +362,8 @@ def _run_update_inner() -> tuple[bool, str]:
         pip_bin = os.path.join(os.path.dirname(sys.executable), 'pip3')
         if not os.path.exists(pip_bin):
             pip_bin = shutil.which('pip3') or '/opt/discord-music-bot/venv/bin/pip'
-        cmd = [pip_bin, 'install', '-U', 'yt-dlp']
+        req_file = '/opt/discord-music-bot/requirements.txt'
+        cmd = ['sudo', '-u', 'discord-music-updater', pip_bin, 'install', '--require-hashes', '-r', req_file]
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)

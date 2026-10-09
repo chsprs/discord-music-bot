@@ -22,7 +22,9 @@ log() { echo "[$TIMESTAMP] $*" >> "$LOG_FILE"; }
 # lewat trap EXIT agar berlaku di SEMUA jalur keluar (termasuk "restart ditunda").
 trim_log() {
     [ -f "$LOG_FILE" ] || return 0
-    tail -n 300 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE" || true
+    TMP_LOG=$(mktemp)
+    tail -n 300 "$LOG_FILE" > "$TMP_LOG" 2>/dev/null && cat "$TMP_LOG" > "$LOG_FILE" || true
+    rm -f "$TMP_LOG"
 }
 trap trim_log EXIT
 
@@ -63,11 +65,10 @@ fi
 
 BEFORE="$(version_now)"
 
-# --upgrade WAJIB: tanpa ini pip memasang versi yang sudah terpasang (pin),
-# sehingga "pembaruan" tidak pernah menaikkan apa pun dan cipher extractor
-# YouTube tidak pernah dimutakhirkan.
-if ! "$VENV_PIP" install --upgrade --upgrade-strategy eager 'yt-dlp[default]' >> "$LOG_FILE" 2>&1; then
-    log "Status: Gagal saat pip install."
+# --require-hashes WAJIB: memvalidasi integritas package sebelum instalasi.
+# Jangan pernah menggunakan -U yt-dlp secara unpinned untuk mencegah supply chain attack.
+if ! "$VENV_PIP" install --require-hashes -r "$PIN" >> "$LOG_FILE" 2>&1; then
+    log "Status: Gagal saat pip install --require-hashes."
     exit 1
 fi
 
@@ -78,17 +79,8 @@ else
     log "yt-dlp sudah versi terbaru (${AFTER:-tidak diketahui})."
 fi
 
-# Sinkronkan pin di requirements.txt supaya instalasi ulang tetap reprodusibel.
-if [ -n "$AFTER" ] && [ -f "$PIN" ]; then
-    if grep -qE '^yt-dlp\[default\]==' "$PIN"; then
-        sed -i "s|^yt-dlp\[default\]==.*|yt-dlp[default]==$AFTER|" "$PIN"
-    elif grep -qE '^yt-dlp' "$PIN"; then
-        sed -i "s|^yt-dlp.*|yt-dlp[default]==$AFTER|" "$PIN"
-    else
-        printf 'yt-dlp[default]==%s\n' "$AFTER" >> "$PIN"
-    fi
-    log "requirements.txt disinkronkan ke $AFTER."
-fi
+# Sinkronisasi ke requirements.txt ditiadakan (Security Audit Run-1).
+# Pinning dan hash wajib diperbarui secara manual atau lewat CI yang aman.
 
 # Hapus cache yt-dlp agar extractor baru tidak memakai cache lama yang rusak.
 for cache in "${XDG_CACHE_HOME:-/run/discord-music}/yt-dlp" "${HOME:-/root}/.cache/yt-dlp" /tmp/yt-dlp; do
@@ -96,7 +88,7 @@ for cache in "${XDG_CACHE_HOME:-/run/discord-music}/yt-dlp" "${HOME:-/root}/.cac
 done
 
 # ---------------------------------------------------------------- restart
-if ! systemctl is-active --quiet discord-music.service; then
+if ! sudo systemctl is-active --quiet discord-music.service; then
     log "Bot tidak aktif, tidak perlu restart."
     log "Status: Sukses."
     exit 0
@@ -110,6 +102,6 @@ if listeners_active; then
     exit 0
 fi
 
-systemctl restart discord-music.service
+sudo systemctl restart discord-music.service
 log "Service discord-music.service dimulai ulang."
 log "Status: Sukses."

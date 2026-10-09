@@ -42,6 +42,12 @@ if ! command -v node &>/dev/null; then
         echo "Error: gagal mengunduh skrip NodeSource." >&2
         exit 1
     fi
+    # Verifikasi SHA-256 (Security Audit Run-1)
+    EXPECTED_HASH="2c4c6683a17b6f4128898a7b521e3c8bb725a99ffaf1b5e32ac97c6fa7d381be"
+    if ! echo "$EXPECTED_HASH  $NODESOURCE_SETUP" | sha256sum -c -; then
+        echo "Error: Hash skrip NodeSource tidak cocok!" >&2
+        exit 1
+    fi
     if [[ ! -s "$NODESOURCE_SETUP" ]] || ! head -n1 "$NODESOURCE_SETUP" | grep -q '^#!'; then
         echo "Error: skrip NodeSource tidak valid (bukan skrip shell)." >&2
         exit 1
