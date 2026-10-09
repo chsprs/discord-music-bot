@@ -40,23 +40,14 @@ class UpdateScriptStaticTests(unittest.TestCase):
         proc = subprocess.run(['bash', '-n', SCRIPT], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
-    def test_pip_install_uses_upgrade(self):
-        """Tanpa --upgrade, pip memasang pin yang sama -> tidak pernah naik."""
+    def test_pip_install_uses_require_hashes(self):
+        """Pembaruan harus memakai --require-hashes untuk hardening supply chain."""
         installs = re.findall(r'pip["\s]*install[^\n|;]*', self.src)
         installs += re.findall(r'VENV_PIP"?\)?\s+install[^\n]*', self.src)
         joined = ' '.join(installs)
         self.assertTrue(installs, 'tidak menemukan pemanggilan pip install di update.sh')
-        self.assertIn('--upgrade', joined,
-                      'pip install di update.sh harus memakai --upgrade, '
-                      'kalau tidak yt-dlp tidak pernah diperbarui')
-
-    def test_pip_target_is_unpinned(self):
-        """Target pip tidak boleh `yt-dlp[default]==<versi>` (pin = no-op)."""
-        match = re.search(r'pip[^\n]*install[^\n]*', self.src)
-        self.assertIsNotNone(match)
-        line = match.group(0)
-        self.assertNotRegex(line, r'yt-dlp(\[default\])?==',
-                            'target pip di update.sh tidak boleh di-pin dengan ==')
+        self.assertIn('--require-hashes', joined,
+                      'pip install di update.sh harus memakai --require-hashes')
 
     def test_restart_is_guarded_by_listener_check(self):
         """Restart harus lewat pengecekan penonton, bukan langsung."""
@@ -69,12 +60,6 @@ class UpdateScriptStaticTests(unittest.TestCase):
                             'tidak ada penjaga listeners_active sebelum restart')
         self.assertLess(guard_idx, restart_idx,
                         'pengecekan listeners_active harus mendahului restart')
-
-    def test_requirements_pin_is_synced(self):
-        """Versi baru harus ditulis kembali ke requirements.txt."""
-        self.assertIn('requirements.txt', self.src)
-        self.assertRegex(self.src, r'sed -i.*yt-dlp',
-                         'versi baru harus disinkronkan ke requirements.txt')
 
     def test_cache_is_cleared_after_update(self):
         """Cache lama harus dibuang agar extractor baru tidak pakai data basi."""
@@ -150,6 +135,10 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
             handle.write('#!/bin/bash\necho "$@" >> "$BOT_DIR/systemctl_calls.txt"\n'
                          'if [[ "$1" == "is-active" ]]; then exit 0; fi\nexit 0\n')
         os.chmod(sc, 0o755)
+        sudo = os.path.join(fake_bin, 'sudo')
+        with open(sudo, 'w', encoding='utf-8') as handle:
+            handle.write('#!/bin/bash\nif [[ "$1" == "systemctl" ]]; then shift; exec systemctl "$@"; fi\nexec "$@"\n')
+        os.chmod(sudo, 0o755)
         env['PATH'] = fake_bin + os.pathsep + env.get('PATH', '')
         return subprocess.run(['bash', SCRIPT], capture_output=True, text=True, env=env, timeout=60)
 
@@ -160,15 +149,15 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
             proc = self._run(bot_dir, {}, unset_env=['HOME', 'XDG_CACHE_HOME'])
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
-    def test_upgrade_flag_reaches_pip(self):
+    def test_require_hashes_flag_reaches_pip(self):
         with tempfile.TemporaryDirectory() as tmp:
             bot_dir = self._make_fake_venv(tmp, listeners=0)
             proc = self._run(bot_dir, {})
             self.assertEqual(proc.returncode, 0, proc.stderr)
             calls = read_text(os.path.join(bot_dir, 'pip_calls.txt'))
-            self.assertIn('--upgrade', calls,
-                          'pip dipanggil tanpa --upgrade: yt-dlp tidak akan pernah naik')
-            self.assertIn('yt-dlp', calls)
+            self.assertIn('--require-hashes', calls,
+                          'pip dipanggil tanpa --require-hashes: supply chain rentan')
+            self.assertIn('requirements.txt', calls)
 
     def test_restart_deferred_when_listeners_present(self):
         """Ada pendengar -> bot TIDAK boleh di-restart."""
@@ -226,15 +215,6 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
             calls = read_text(os.path.join(bot_dir, 'systemctl_calls.txt'))
             self.assertIn('restart', calls)
 
-    def test_requirements_pin_updated(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            bot_dir = self._make_fake_venv(tmp, listeners=0)
-            self._run(bot_dir, {})
-            pins = read_text(os.path.join(bot_dir, 'requirements.txt'))
-            self.assertIn('yt-dlp[default]==2026.9.9', pins,
-                          'requirements.txt tidak disinkronkan ke versi baru')
-            self.assertIn('discord.py[voice]==2.7.1', pins,
-                          'baris dependensi lain tidak boleh hilang')
 
 
 if __name__ == '__main__':

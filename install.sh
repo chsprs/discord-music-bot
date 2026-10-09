@@ -91,13 +91,25 @@ fi
 
 cd "$INSTALL_DIR"
 
-# 3. Virtual Environment Python
-echo "[3/6] Menyiapkan Python virtual environment..."
+# 3. Virtual Environment Python & User Setup
+echo "[3/6] Menyiapkan Python virtual environment dan user updater..."
+
+if ! id "discord-music-updater" &>/dev/null; then
+    useradd -r -s /usr/sbin/nologin discord-music-updater
+fi
+
 if [[ ! -d "venv" ]]; then
     python3 -m venv venv
 fi
 venv/bin/pip install --upgrade pip
 venv/bin/pip install -r requirements.txt
+
+touch last_update.log .update.lock
+chown -R discord-music-updater:discord-music-updater venv last_update.log .update.lock
+
+# Sudoers untuk updater agar bisa restart bot
+echo "discord-music-updater ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart discord-music.service, /usr/bin/systemctl is-active --quiet discord-music.service" > /etc/sudoers.d/discord-music-updater
+chmod 0440 /etc/sudoers.d/discord-music-updater
 
 # 4. Berkas Konfigurasi
 echo "[4/6] Menyiapkan konfigurasi..."
