@@ -99,14 +99,21 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
         os.makedirs(os.path.join(bot_dir, 'venv', 'bin'), exist_ok=True)
         pip = os.path.join(bot_dir, 'venv', 'bin', 'pip')
         with open(pip, 'w', encoding='utf-8') as handle:
-            handle.write('#!/bin/bash\necho "$@" >> "$BOT_DIR/pip_calls.txt"\nexit 0\n')
+            handle.write('#!/bin/bash\necho "$@" >> "$BOT_DIR/pip_calls.txt"\ntouch "$BOT_DIR/pip_ran"\nexit 0\n')
         os.chmod(pip, 0o755)
         real_py = os.path.realpath(sys.executable)
         py = os.path.join(bot_dir, 'venv', 'bin', 'python')
         with open(py, 'w', encoding='utf-8') as handle:
             handle.write(
                 '#!/bin/bash\n'
-                'if [[ "$1" == "-c" ]]; then echo "2026.9.9"; exit 0; fi\n'
+                'if [[ "$1" == "-c" ]]; then\n'
+                '    if [ -f "$BOT_DIR/pip_ran" ]; then\n'
+                '        echo "2026.9.9"\n'
+                '    else\n'
+                '        echo "2026.9.8"\n'
+                '    fi\n'
+                '    exit 0\n'
+                'fi\n'
                 f'exec {real_py} "$@"\n'
             )
         os.chmod(py, 0o755)
@@ -118,12 +125,12 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
             'total_listeners': listeners,
             'active_voice_count': 1 if listeners else 0,
         }
-        with open(os.path.join(bot_dir, 'state.json'), 'w', encoding='utf-8') as handle:
+        with open(os.path.join(bot_dir, 'listeners.json'), 'w', encoding='utf-8') as handle:
             json.dump(state, handle)
         return bot_dir
 
     def _run(self, bot_dir: str, extra_env: dict, unset_env: list | None = None) -> subprocess.CompletedProcess:
-        env = dict(os.environ, BOT_DIR=bot_dir, BOT_STATE_FILE=os.path.join(bot_dir, 'state.json'))
+        env = dict(os.environ, BOT_DIR=bot_dir, BOT_STATE_FILE=os.path.join(bot_dir, 'listeners.json'))
         env.update(extra_env)
         for key in (unset_env or []):
             env.pop(key, None)
@@ -197,7 +204,7 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
         """Tanpa state.json (exporter belum jalan), restart boleh lanjut."""
         with tempfile.TemporaryDirectory() as tmp:
             bot_dir = self._make_fake_venv(tmp, listeners=0)
-            os.remove(os.path.join(bot_dir, 'state.json'))
+            os.remove(os.path.join(bot_dir, 'listeners.json'))
             proc = self._run(bot_dir, {})
             self.assertEqual(proc.returncode, 0, proc.stderr)
             calls = read_text(os.path.join(bot_dir, 'systemctl_calls.txt'))
@@ -208,7 +215,7 @@ class UpdateScriptBehaviourTests(unittest.TestCase):
         """state.json rusak tidak boleh membuat update gagal permanen."""
         with tempfile.TemporaryDirectory() as tmp:
             bot_dir = self._make_fake_venv(tmp, listeners=0)
-            with open(os.path.join(bot_dir, 'state.json'), 'w', encoding='utf-8') as handle:
+            with open(os.path.join(bot_dir, 'listeners.json'), 'w', encoding='utf-8') as handle:
                 handle.write('{bukan json')
             proc = self._run(bot_dir, {})
             self.assertEqual(proc.returncode, 0, proc.stderr)

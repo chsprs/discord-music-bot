@@ -375,8 +375,12 @@ def _run_update_inner() -> tuple[bool, str]:
             if listeners_active():
                 out += '\nAda pendengar aktif -> restart ditunda agar musik tidak terputus.'
             else:
-                subprocess.run(['systemctl', 'restart', SERVICE], timeout=15)
-                out += '\nService discord-music.service berhasil dimulai ulang.'
+                restart_proc = subprocess.run(['systemctl', 'restart', SERVICE], timeout=15)
+                if restart_proc.returncode == 0:
+                    out += '\nService discord-music.service berhasil dimulai ulang.'
+                else:
+                    out += f'\nGagal merestart service, return code: {restart_proc.returncode}'
+                    ok = False
         if os.path.exists(UPDATE_LOG_PATH):
             try:
                 with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:

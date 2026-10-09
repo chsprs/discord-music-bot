@@ -63,6 +63,8 @@ class Track:
     duration: int = 0
     duration_str: str = "Unknown"
     author: str = "Unknown"
+    stream_url: str | None = None
+    stream_ts: float | None = None
 
 
 DEFAULT_VOLUME = 0.5
@@ -400,7 +402,15 @@ def dump_runtime_state(bot) -> None:
             'guilds': guilds_data,
         }
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp_path = path + '.tmp'
+        listeners_path = os.path.join(os.path.dirname(path), "listeners.json")
+        listeners_payload = {"total_listeners": total_listeners, "updated_at": time.time()}
+        l_tmp_path = listeners_path + ".tmp"
+        with open(l_tmp_path, "w", encoding="utf-8") as f:
+            json.dump(listeners_payload, f)
+        os.chmod(l_tmp_path, 0o644)
+        os.replace(l_tmp_path, listeners_path)
+
+        tmp_path = path + ".tmp"
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(payload, f)
         os.replace(tmp_path, path)
@@ -577,13 +587,18 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
             # ponytail: saring video private/deleted/unavailable agar tidak mengisi antrean dengan track mati
             if not title or title in ('[Private video]', '[Deleted video]', '[Unavailable video]'):
                 continue
-            url = entry.get('url') or entry.get('webpage_url')
-            if not url or not url.startswith('http'):
-                vid_id = entry.get('id') or url
-                url = f'https://www.youtube.com/watch?v={vid_id}'
+            stable_url = entry.get('webpage_url') or entry.get('url')
+            if not stable_url or not stable_url.startswith('http'):
+                vid_id = entry.get('id') or stable_url
+                stable_url = f'https://www.youtube.com/watch?v={vid_id}'
+            stream_url = None
+            stream_ts = 0.0
+            if entry.get('url') and entry.get('url') != stable_url:
+                stream_url = entry.get('url')
+                stream_ts = time.time()
             dur = entry.get('duration') or 0
             author = entry.get('uploader') or entry.get('channel') or entry.get('artist') or 'Unknown'
-            tracks.append(Track(title, url, requester, duration=dur, duration_str=format_duration(dur), author=author))
+            tracks.append(Track(title, stable_url, requester, duration=dur, duration_str=format_duration(dur), author=author, stream_url=stream_url, stream_ts=stream_ts))
             if len(tracks) >= 100:
                 break
         if not tracks and live_skipped > 0:
@@ -592,10 +607,15 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
         title = (data.get('title') or '').strip()
         if not title or title in ('[Private video]', '[Deleted video]', '[Unavailable video]'):
             raise ValueError('Lagu tidak tersedia (video privat atau telah dihapus).')
-        url = data.get('webpage_url') or data.get('url') or target
+        stable_url = data.get('webpage_url') or target
+        stream_url = None
+        stream_ts = 0.0
+        if data.get('url') and data.get('url') != stable_url:
+            stream_url = data.get('url')
+            stream_ts = time.time()
         dur = data.get('duration') or 0
         author = data.get('uploader') or data.get('channel') or data.get('artist') or 'Unknown'
-        tracks.append(Track(title, url, requester, duration=dur, duration_str=format_duration(dur), author=author))
+        tracks.append(Track(title, stable_url, requester, duration=dur, duration_str=format_duration(dur), author=author, stream_url=stream_url, stream_ts=stream_ts))
 
     if not tracks:
         raise ValueError('Lagu tidak ditemukan atau stream tidak tersedia.')
@@ -1313,7 +1333,7 @@ class MusicPanel(discord.ui.View):
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self.bot._stop_player(interaction.guild)
         await self.bot.advance(interaction.guild)
-        self.bot._save_persistent_queue()
+        # removed # removed self.bot._save_persistent_queue()
         await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
 
     @discord.ui.button(label='Pause', emoji='⏸️', style=discord.ButtonStyle.secondary, custom_id='music:pause', row=0)
@@ -1373,7 +1393,7 @@ class MusicPanel(discord.ui.View):
                         state.history.popleft()
                     state.current = None
             await self.bot.advance(interaction.guild)
-            self.bot._save_persistent_queue()
+            # removed # removed # removed self.bot._save_persistent_queue()
             text = 'Dilewati.'
         elif state._advancing > 0:
             # M4: belum ada audio yang berputar tetapi advance() sedang
@@ -1390,7 +1410,7 @@ class MusicPanel(discord.ui.View):
                         state.history.popleft()
                     state.current = None
             await self.bot.advance(interaction.guild)
-            self.bot._save_persistent_queue()
+            # removed self.bot._save_persistent_queue()
             text = 'Memutar lagu berikutnya dari antrian.'
         else:
             text = 'Tidak ada lagu aktif.'
@@ -1563,7 +1583,7 @@ class MusicBot(discord.Client):
                 return
 
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp_path = path + '.tmp'
+            tmp_path = path + ".tmp"
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f)
             os.replace(tmp_path, path)
@@ -1757,7 +1777,7 @@ class MusicBot(discord.Client):
                     dump_runtime_state(self)
                 except Exception as exc:
                     log.debug('Gagal menulis state runtime: %s', exc)
-                await asyncio.sleep(5)
+                await asyncio.sleep(30)
         except (asyncio.CancelledError, RuntimeError):
             pass
 
@@ -2032,7 +2052,7 @@ class MusicBot(discord.Client):
                     state.history.popleft()
                 state.current = None
         await self.advance(interaction.guild)
-        self._save_persistent_queue()
+        # removed # removed self._save_persistent_queue()
         await interaction.followup.send('Lagu dilewati.', ephemeral=True)
 
     async def cmd_back(self, interaction: discord.Interaction):
@@ -2057,7 +2077,7 @@ class MusicBot(discord.Client):
                 state.current = None
         await self._stop_player(interaction.guild)
         await self.advance(interaction.guild)
-        self._save_persistent_queue()
+        # removed # removed self._save_persistent_queue()
         await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
 
     async def cmd_shuffle(self, interaction: discord.Interaction):
@@ -2511,7 +2531,10 @@ class MusicBot(discord.Client):
 
             # --- fase 3: extract stream di luar lock (C4) + batas thread (H3) ---
             try:
-                data = await run_extract(extract, next_track.url, timeout=60)
+                if next_track.stream_url and next_track.stream_ts and (time.time() - next_track.stream_ts) < 1800:
+                    data = {'url': next_track.stream_url, 'title': next_track.title}
+                else:
+                    data = await run_extract(extract, next_track.url, timeout=60)
                 # F2: /stop atau reconnect selama ekstraksi membump generation dan
                 # mengganti voice client. Lanjut memutar = memakai vc lama yang
                 # sudah putus (ClientException) dan lagu baru tak pernah diputar.

@@ -7,6 +7,7 @@ VENV_PY="$DIR/venv/bin/python"
 LOG_FILE="$DIR/last_update.log"
 PIN="$DIR/requirements.txt"
 STATE_FILE="${BOT_STATE_FILE:-/run/discord-music/state.json}"
+LISTENERS_FILE="${STATE_FILE%/*}/listeners.json"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
 exec 9>"$DIR/.update.lock"
@@ -41,8 +42,8 @@ version_now() {
 # Apakah ada penonton aktif? Baca state exporter bot (tmpfs, diperbarui ~5 dtk).
 # Kalau ada, restart bot akan memutus musik orang -> tunda.
 listeners_active() {
-    [ -f "$STATE_FILE" ] || return 1
-    "$VENV_PY" - "$STATE_FILE" <<'PY' 2>/dev/null
+    [ -f "$LISTENERS_FILE" ] || return 1
+    "$VENV_PY" - "$LISTENERS_FILE" <<'PY' 2>/dev/null
 import json, sys, time
 try:
     with open(sys.argv[1], encoding='utf-8') as fh:
@@ -77,6 +78,7 @@ if [ -n "$AFTER" ] && [ "$AFTER" != "$BEFORE" ]; then
     log "yt-dlp diperbarui: ${BEFORE:-?} -> $AFTER"
 else
     log "yt-dlp sudah versi terbaru (${AFTER:-tidak diketahui})."
+    exit 0
 fi
 
 # Sinkronisasi ke requirements.txt ditiadakan (Security Audit Run-1).
