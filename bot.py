@@ -396,6 +396,7 @@ def dump_runtime_state(bot) -> None:
         payload = {
             'updated_at': time.time(),
             'bot_user': str(getattr(bot, 'user', '')),
+            'bot_id': str(bot.user.id) if getattr(bot, 'user', None) else '',
             'total_guilds': len(guilds_data),
             'active_voice_count': active_voice_count,
             'total_listeners': total_listeners,

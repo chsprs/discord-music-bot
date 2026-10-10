@@ -582,6 +582,7 @@ overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
 <div class="kv"><span>Service bot</span><span class="badge {state_class}">{state}</span></div>
 <div class="kv"><span>Token Discord</span><span>{token_state}</span></div>
 <div class="kv"><span>Guild ID</span><span>{guild}</span></div>
+{invite_html}
 </section>
 <section>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1050,6 +1051,12 @@ class Handler(BaseHTTPRequestHandler):
             runtime_badge_text = 'offline'
 
         guilds_html = format_guilds_html(runtime)
+        
+        bot_id = runtime.get('bot_id')
+        if bot_id and str(bot_id).isdigit():
+            invite_html = f'<div style="margin-top:14px"><a href="https://discord.com/oauth2/authorize?client_id={bot_id}&permissions=277028595712&scope=bot%20applications.commands" target="_blank" style="display:inline-block;background:#5865F2;color:#fff;border-radius:6px;padding:8px 12px;font-weight:600;text-decoration:none;font-size:13px">Undang Bot ke Server</a></div>'
+        else:
+            invite_html = ''
 
         page = (PAGE
                 .replace('{form_token}', form_token)
@@ -1057,6 +1064,7 @@ class Handler(BaseHTTPRequestHandler):
                 .replace('{state_class}', 'on' if state == 'active' else 'off')
                 .replace('{state}', html.escape(state))
                 .replace('{token_state}', 'tersimpan' if data['token'] else 'belum diatur')
+                .replace('{invite_html}', invite_html)
                 .replace('{token_placeholder}', 'kosong = pakai token lama'
                          if data['token'] else 'tempel token bot di sini')
                 .replace('{guild}', html.escape(data['guild']))
