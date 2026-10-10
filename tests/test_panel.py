@@ -763,7 +763,7 @@ class PasswordlessTests(unittest.TestCase):
     def test_page_opens_without_login(self):
         status, body = self.req('GET', '/')
         self.assertEqual(status, 200)
-        self.assertIn('Panel Bot Musik', body)
+        self.assertIn('Crspy Music', body)
         self.assertIn('mode baca-saja', body)
 
     def test_api_status_opens_without_login(self):

@@ -530,7 +530,7 @@ def reserve_login_attempt(peer: str) -> tuple[bool, int]:
 PAGE = """<!doctype html>
 <html lang="id"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Panel Bot Musik</title>
+<title>Crspy Music</title>
 <style>
 :root{--bg:#fbfbfa;--card:#fff;--line:#eaeaea;--ink:#111;--muted:#787774}
 *{box-sizing:border-box}
@@ -574,7 +574,7 @@ overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
 .listeners-row{font-size:12px;color:#2e7d32;margin-top:6px;font-weight:500}
 @media(max-width:540px){.kv{flex-direction:column;gap:2px}}
 </style></head><body><main>
-<h1>Panel Bot Musik</h1>
+<h1>Crspy Music</h1>
 <p class="sub">Kontrol lokal untuk bot Discord di STB. Hanya jaringan rumah.</p>
 {message}
 <section>
@@ -663,7 +663,7 @@ button{margin-top:14px;width:100%;background:#111;color:#fff;border:0;
 border-radius:6px;padding:11px;font:inherit;font-weight:600;cursor:pointer}
 p.err{color:#9f2f2d;font-size:13px;margin:0 0 12px}
 </style></head><body><main><section>
-<h1>Panel Bot Musik</h1>
+<h1>Crspy Music</h1>
 {error}
 <form method="post" action="/login">
 <input type="hidden" name="form_token" value="{form_token}">
