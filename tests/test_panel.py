@@ -972,7 +972,13 @@ class ShutdownTests(unittest.TestCase):
         proc = subprocess.Popen(
             [sys.executable, os.path.join(root, 'panel.py')],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        def _cleanup():
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            if proc.stdout:
+                proc.stdout.close()
+        self.addCleanup(_cleanup)
 
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -995,6 +1001,9 @@ class ShutdownTests(unittest.TestCase):
         except subprocess.TimeoutExpired:
             proc.kill()
             self.fail('SIGTERM tidak menghentikan panel dalam 15 dtk (deadlock)')
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 5.0,
                         f'panel butuh {elapsed:.1f} dtk untuk berhenti (systemd '
@@ -1427,3 +1436,15 @@ class PanelPortAndNonceRegressionTests(unittest.TestCase):
             with unittest.mock.patch('panel.UPDATE_LOG_PATH', log_file):
                 out = panel.read_last_update_log()
                 self.assertEqual(out, 'log dari disk terbaru')
+
+    def test_update_panel_password_cleans_up_fd_on_fchmod_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, 'panel.env')
+            with open(target, 'w') as f:
+                f.write('PANEL_PASSWORD=old\n')
+            with unittest.mock.patch('panel.os.fchmod', side_effect=OSError('chmod denied')), \
+                 unittest.mock.patch('panel.os.close', wraps=os.close) as mock_close:
+                panel.update_panel_password('newpass', env_path=target)
+                self.assertTrue(mock_close.called)
+            with open(target) as f:
+                self.assertIn('PANEL_PASSWORD=newpass', f.read())

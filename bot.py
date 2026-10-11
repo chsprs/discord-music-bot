@@ -105,6 +105,7 @@ class QueueState:
     afk_task: asyncio.Task | None = None
     afk_paused: bool = False
     refresh_task: asyncio.Task | None = None
+    _refresh_pending: bool = False
     announce_task: asyncio.Task | None = None
     _advance_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _last_skip_time: float = 0.0
@@ -2553,6 +2554,8 @@ class MusicBot(discord.Client):
             if next_track is None and state.autoplay and (state.current or state.history):
                 try:
                     async with state.lock:
+                        if state.queue:
+                            continue
                         seed_titles = [t.title for t in list(state.history)[-5:]]
                         seed_urls = [t.url for t in list(state.history)[-5:]]
                         if state.current:
@@ -2563,6 +2566,9 @@ class MusicBot(discord.Client):
                             played_urls.add(state.current.url)
                     candidates = await fetch_recommendations(
                         seed_titles, played_urls, seed_urls=seed_urls)
+                    async with state.lock:
+                        if state.queue:
+                            continue
                     next_track = next((c for c in candidates
                                        if c.url not in played_urls), None)
                     if next_track is None:
@@ -2571,6 +2577,9 @@ class MusicBot(discord.Client):
                     log.info('AutoPlay (Mix) memilih: %s', next_track.title)
                 except Exception as exc:
                     log.warning('AutoPlay failed: %s', exc)
+                    async with state.lock:
+                        if state.queue:
+                            continue
                     break
                 if not next_track:
                     break

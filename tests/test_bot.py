@@ -3740,3 +3740,36 @@ class AuditOptimizationRegressionTests(unittest.TestCase):
 
         asyncio.run(worker())
         self.assertGreaterEqual(mock_msg.edit.await_count, 1)
+
+    def test_autoplay_yields_to_newly_enqueued_track(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 88905
+        guild.name = 'AutoGuild'
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.autoplay = True
+        state.current = Track('Lagu Sekarang', 'https://youtube.com/watch?v=cur', 'u')
+        bot.states[guild.id] = state
+
+        user_track = Track('Lagu Pilihan User', 'https://youtube.com/watch?v=user', 'user1')
+        rec = Track('Rekomendasi Bot', 'https://youtube.com/watch?v=rec', 'AutoPlay')
+
+        async def fake_fetch(*args, **kwargs):
+            async with state.lock:
+                state.queue.append(user_track)
+            return [rec]
+
+        with patch('bot.fetch_recommendations', new=fake_fetch), \
+             patch('bot.extract', return_value={'url': 'https://cdn/audio'}), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(bot, 'refresh', new=AsyncMock()):
+            asyncio.run(bot.advance(guild))
+
+        self.assertEqual(state.current.title, 'Lagu Pilihan User')

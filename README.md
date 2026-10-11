@@ -151,7 +151,7 @@ Skrip installer otomatis:
 3. Membuat user sistem non-root `discord-music-updater`, mengatur ownership `venv`/log, dan memasang aturan sudoers terbatas (`systemctl restart/is-active discord-music.service` saja).
 4. Memasang service systemd `discord-music.service`, `discord-music-panel.service`, dan `discord-music-update.service` + timer.
 5. Mengaktifkan auto-start saat boot sistem.
-6. Menjalankan verifikasi unit test mandiri (**319/319 passing**).
+6. Menjalankan verifikasi unit test mandiri (**321/321 passing**).
 7. Menyalakan Web Control Panel di port `9130`.
 
 ---

@@ -57,15 +57,22 @@ def update_panel_password(new_password: str, env_path: Optional[str] = None) -> 
     directory = os.path.dirname(target_path) or '.'
     os.makedirs(directory, exist_ok=True)
     tmp_path = None
+    closed = False
     try:
         fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.panel.env.', suffix='.tmp')
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            closed = True
             handle.write(body)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, target_path)
     except OSError:
+        if not closed and 'fd' in locals():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
