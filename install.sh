@@ -120,7 +120,7 @@ fi
 
 PANEL_ENV="/opt/discord-music-panel.env"
 if [[ ! -f "$PANEL_ENV" ]]; then
-    PANEL_PASS="$(openssl rand -base64 24 2>/dev/null || head -c 18 /dev/urandom | base64)"
+    PANEL_PASS="${PANEL_PASSWORD:-}"
     LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     cat <<EOF > "$PANEL_ENV"
 PANEL_HOST=$PANEL_HOST
@@ -132,7 +132,7 @@ PANEL_ALLOWED_HOSTS=${LAN_IP:+$LAN_IP:$PANEL_PORT}
 EOF
     chmod 600 "$PANEL_ENV"
     echo ""
-    echo ">>> PANEL_PASSWORD awal: $PANEL_PASS (tersimpan di $PANEL_ENV, mode 0600). Ganti bila perlu."
+    echo ">>> PANEL_PASSWORD default: ${PANEL_PASS:-kosong (akses bebas di LAN)}. Dapat diatur via web panel atau ./tools/reset-password.sh."
     echo ">>> Panel bind ke $PANEL_HOST. Untuk LAN tak-terpercaya, set PANEL_HOST=127.0.0.1"
     echo "    dan akses lewat SSH tunnel: ssh -L 9130:127.0.0.1:9130 user@host"
     if [[ -n "$LAN_IP" ]]; then

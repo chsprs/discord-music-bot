@@ -26,7 +26,55 @@ SERVICE = 'discord-music.service'
 TIMER = 'discord-music-update.timer'
 CONFIG_PATH = os.environ.get('BOT_CONFIG', '/opt/discord-music-bot/.env')
 UPDATE_LOG_PATH = os.environ.get('UPDATE_LOG', '/opt/discord-music-bot/last_update.log')
+PANEL_ENV_PATH = os.environ.get('PANEL_ENV', '/opt/discord-music-panel.env')
 PASSWORD = os.environ.get('PANEL_PASSWORD', '')
+
+
+def update_panel_password(new_password: str, env_path: Optional[str] = None) -> None:
+    """Perbarui PANEL_PASSWORD di berkas panel.env dan variabel global PASSWORD."""
+    global PASSWORD
+    if '\n' in new_password or '\r' in new_password:
+        raise ValueError('Password tidak boleh mengandung baris baru.')
+    target_path = env_path or os.environ.get('PANEL_ENV', PANEL_ENV_PATH)
+    lines: list[str] = []
+    found = False
+    if os.path.exists(target_path):
+        try:
+            with open(target_path, 'r', encoding='utf-8') as handle:
+                for line in handle:
+                    stripped = line.rstrip('\r\n')
+                    if stripped.strip().startswith('PANEL_PASSWORD='):
+                        lines.append(f'PANEL_PASSWORD={new_password}')
+                        found = True
+                    else:
+                        lines.append(stripped)
+        except Exception:
+            pass
+    if not found:
+        lines.append(f'PANEL_PASSWORD={new_password}')
+    body = '\n'.join(lines).strip() + '\n'
+
+    directory = os.path.dirname(target_path) or '.'
+    os.makedirs(directory, exist_ok=True)
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.panel.env.', suffix='.tmp')
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target_path)
+    except OSError:
+        # Fallback jika direktori induk read-only (ProtectSystem=strict): tulis in-place
+        with open(target_path, 'w', encoding='utf-8') as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    PASSWORD = new_password
+    if not new_password:
+        with _lock:
+            _sessions.clear()
 COOKIE = 'music_session'
 STORE = None
 UPDATE_RUNNER: Optional[Callable[[], tuple[bool, str]]] = None
@@ -574,7 +622,10 @@ overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
 .listeners-row{font-size:12px;color:#2e7d32;margin-top:6px;font-weight:500}
 @media(max-width:540px){.kv{flex-direction:column;gap:2px}}
 </style></head><body><main>
-<h1>Crspy Music</h1>
+<div style="display:flex;justify-content:space-between;align-items:baseline">
+<h1 style="margin:0 0 4px">Crspy Music</h1>
+{logout_html}
+</div>
 <p class="sub">Kontrol lokal untuk bot Discord di STB. Hanya jaringan rumah.</p>
 {message}
 <section>
@@ -582,6 +633,7 @@ overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
 <div class="kv"><span>Service bot</span><span class="badge {state_class}">{state}</span></div>
 <div class="kv"><span>Token Discord</span><span>{token_state}</span></div>
 <div class="kv"><span>Guild ID</span><span>{guild}</span></div>
+<div class="kv"><span>Password panel</span><span>{password_state}</span></div>
 {invite_html}
 </section>
 <section>
@@ -606,6 +658,10 @@ placeholder="{token_placeholder}">
 <label for="guild" style="margin-top:14px">Guild ID (server uji, opsional)</label>
 <input id="guild" name="guild" value="{guild}" inputmode="numeric"
 placeholder="contoh 123456789012345678">
+<label for="panel_password" style="margin-top:14px">Password Panel (opsional)</label>
+<input id="panel_password" name="panel_password" type="password" autocomplete="new-password"
+placeholder="{password_placeholder}">
+{password_helper_html}
 <button type="submit">Simpan konfigurasi</button>
 <p class="note">Token disimpan lokal di <code>{config}</code> (mode 0600) dan tidak
 pernah ditampilkan kembali. Menyimpan tidak menyalakan bot.</p>
@@ -887,6 +943,11 @@ class Handler(BaseHTTPRequestHandler):
             if not PASSWORD:
                 return self._redirect('/')
             return self._login_page()
+        if path == '/logout':
+            if PASSWORD:
+                cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
+                return self._redirect('/login', {'Set-Cookie': cookie})
+            return self._redirect('/')
         if path == '/api/status':
             if not self._authenticated():
                 return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
@@ -948,8 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
             # CSRF ditegakkan untuk /login juga: tanpa ini, situs mana pun bisa
             # membakar kuota rate-limit milik IP korban (S4).
             if not PASSWORD:
-                return self._login_page('PANEL_PASSWORD belum dikonfigurasi di environment.',
-                                        HTTPStatus.FORBIDDEN)
+                return self._redirect('/')
             fields = self._body()
             if fields is None:
                 return  # 413 sudah dikirim oleh _body()
@@ -958,14 +1018,16 @@ class Handler(BaseHTTPRequestHandler):
             if not self._origin_ok(fields):
                 return self._json(HTTPStatus.FORBIDDEN, {'error': 'origin'})
             return self._login(fields)
+        if path == '/logout':
+            if PASSWORD:
+                cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
+                return self._redirect('/login', {'Set-Cookie': cookie})
+            return self._redirect('/')
         if path not in ('/save', '/start', '/restart', '/stop', '/update'):
             return self._send(HTTPStatus.NOT_FOUND, 'Tidak ditemukan')
         fields = self._body()
         if fields is None:
             return  # 413 sudah dikirim; jangan jalankan aksi
-        if not PASSWORD:
-            return self._page('Akses modifikasi ditolak: PANEL_PASSWORD belum dikonfigurasi.',
-                              HTTPStatus.FORBIDDEN)
         if not self._authenticated():
             return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
         if not self._origin_ok(fields):
@@ -1006,8 +1068,6 @@ class Handler(BaseHTTPRequestHandler):
                 if _flash_msg:
                     message = _flash_msg
                     _flash_msg = ''
-            if not message and not PASSWORD:
-                message = 'PERINGATAN: PANEL_PASSWORD belum dikonfigurasi. Panel dalam mode baca-saja; semua aksi modifikasi dinonaktifkan.'
         banner = f'<div class="msg">{html.escape(message)}</div>' if message else ''
         now = time.monotonic()
         with _lock:
@@ -1058,15 +1118,39 @@ class Handler(BaseHTTPRequestHandler):
         else:
             invite_html = ''
 
+        if PASSWORD:
+            password_state = '<span class="badge on">Aktif</span>'
+            password_placeholder = 'kosong = pertahankan password lama'
+            password_helper_html = (
+                '<label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px">'
+                '<input type="checkbox" name="clear_password" value="1" style="width:auto;margin:0"> '
+                'Hapus password (akses bebas tanpa login)'
+                '</label>'
+            )
+            logout_html = '<a href="/logout" style="font-size:12px;color:var(--muted);text-decoration:none">Keluar (Logout)</a>'
+        else:
+            password_state = '<span class="badge off">Nonaktif (Bebas LAN)</span>'
+            password_placeholder = 'kosong = tanpa password (akses bebas)'
+            password_helper_html = (
+                '<p class="note" style="margin-top:6px">'
+                'Panel saat ini bebas diakses tanpa password di jaringan lokal. Isi jika ingin mengaktifkan login.'
+                '</p>'
+            )
+            logout_html = ''
+
         page = (PAGE
                 .replace('{form_token}', form_token)
                 .replace('{message}', banner)
+                .replace('{logout_html}', logout_html)
                 .replace('{state_class}', 'on' if state == 'active' else 'off')
                 .replace('{state}', html.escape(state))
                 .replace('{token_state}', 'tersimpan' if data['token'] else 'belum diatur')
+                .replace('{password_state}', password_state)
                 .replace('{invite_html}', invite_html)
                 .replace('{token_placeholder}', 'kosong = pakai token lama'
                          if data['token'] else 'tempel token bot di sini')
+                .replace('{password_placeholder}', password_placeholder)
+                .replace('{password_helper_html}', password_helper_html)
                 .replace('{guild}', html.escape(data['guild']))
                 .replace('{config}', html.escape(CONFIG_PATH))
                 .replace('{runtime_badge_class}', runtime_badge_class)
@@ -1113,6 +1197,9 @@ class Handler(BaseHTTPRequestHandler):
         current = store().read()
         raw_token = fields.get('token', '').strip()
         guild = fields.get('guild', '').strip()
+        raw_pass = fields.get('panel_password', '').strip()
+        clear_pass = fields.get('clear_password', '').strip() in ('1', 'true', 'yes', 'on')
+        extra_headers = {}
 
         if raw_token:
             if len(raw_token) > 200 or not DISCORD_TOKEN_RE.match(raw_token):
@@ -1131,6 +1218,28 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._page('Guild ID di luar batas integer yang diizinkan.', HTTPStatus.BAD_REQUEST)
 
+        # Penanganan password panel
+        if clear_pass:
+            try:
+                update_panel_password('')
+                cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
+                extra_headers['Set-Cookie'] = cookie
+            except Exception as exc:
+                self.log_exception('save password gagal: %s', exc)
+                return self._page('Gagal menghapus password panel.', HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif raw_pass:
+            if len(raw_pass) > 128:
+                return self._page('Password panel maksimal 128 karakter.', HTTPStatus.BAD_REQUEST)
+            try:
+                update_panel_password(raw_pass)
+                token_session = _mint_session()
+                cookie = (f'{COOKIE}={token_session}; Path=/; HttpOnly; SameSite=Lax; '
+                          f'Max-Age={SESSION_TTL}')
+                extra_headers['Set-Cookie'] = cookie
+            except Exception as exc:
+                self.log_exception('save password gagal: %s', exc)
+                return self._page('Gagal menyimpan password panel.', HTTPStatus.INTERNAL_SERVER_ERROR)
+
         try:
             store().write({'token': token, 'guild': guild})
         except ValueError as exc:
@@ -1143,10 +1252,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._page('Gagal menyimpan konfigurasi: berkas tidak bisa ditulis. '
                               'Periksa izin / ruang disk.',
                               HTTPStatus.INTERNAL_SERVER_ERROR)
-        self.log_message('konfigurasi disimpan (token_set=%s guild_set=%s)',
-                         bool(token), bool(guild))
-        self._set_flash('Konfigurasi disimpan.')
-        return self._redirect('/')
+        self.log_message('konfigurasi disimpan (token_set=%s guild_set=%s pass_set=%s)',
+                         bool(token), bool(guild), bool(PASSWORD))
+        if clear_pass:
+            self._set_flash('Konfigurasi disimpan. Password panel berhasil dinonaktifkan (akses bebas LAN).')
+        elif raw_pass:
+            self._set_flash('Konfigurasi disimpan. Password panel berhasil diaktifkan.')
+        else:
+            self._set_flash('Konfigurasi disimpan.')
+        return self._redirect('/', extra_headers)
 
     def _update(self):
         ok, out = run_update()
@@ -1266,6 +1380,21 @@ def _parse_port(raw: str | None) -> int:
 
 
 def main():
+    if '--reset-password' in sys.argv:
+        update_panel_password('')
+        print('Password panel berhasil direset (dihapus). Panel sekarang bebas diakses di LAN tanpa password.')
+        return
+    if '--set-password' in sys.argv:
+        idx = sys.argv.index('--set-password')
+        if idx + 1 < len(sys.argv):
+            new_p = sys.argv[idx + 1]
+            update_panel_password(new_p)
+            print(f'Password panel berhasil diatur ke: {new_p}')
+            return
+        else:
+            print('Error: Nilai password harus disertakan setelah --set-password', file=sys.stderr)
+            sys.exit(1)
+
     host = os.environ.get('PANEL_HOST', '0.0.0.0')
     port = _parse_port(os.environ.get('PANEL_PORT', '9130'))
     if not ALLOWED_HOSTS:
@@ -1273,16 +1402,8 @@ def main():
 
     if not PASSWORD:
         print(
-            '=' * 64 + '\n'
-            'PERINGATAN: PANEL_PASSWORD kosong.\n'
-            'Panel ini TERBUKA tanpa autentikasi untuk siapa pun yang bisa\n'
-            f'menjangkau {host}:{port}. Siapa pun di jaringan itu dapat:\n'
-            '  - menimpa token bot di .env\n'
-            '  - menjalankan systemctl start/stop/restart sebagai root\n'
-            '  - memicu instalasi paket (update yt-dlp)\n'
-            'Set PANEL_PASSWORD di /opt/discord-music-panel.env, atau batasi\n'
-            'PANEL_HOST=127.0.0.1 dan akses lewat SSH tunnel.\n'
-            + '=' * 64,
+            f'INFO: PANEL_PASSWORD kosong. Panel berjalan dalam mode bebas tanpa sandi di {host}:{port}.\n'
+            'Password dapat diatur via web panel atau script tools/reset-password.sh.',
             flush=True,
         )
 

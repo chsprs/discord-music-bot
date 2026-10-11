@@ -18,8 +18,8 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 # ProtectSystem=strict menjadikan seluruh filesystem read-only; panel WAJIB bisa
-# menulis .env (simpan konfigurasi), last_update.log, dan venv (update yt-dlp).
-ReadWritePaths=/opt/discord-music-bot
+# menulis .env (simpan konfigurasi), last_update.log, venv, dan discord-music-panel.env.
+ReadWritePaths=/opt/discord-music-bot /opt/discord-music-panel.env
 
 # --- Hardening tambahan ---
 # Panel mengendalikan systemctl sebagai root; persempit permukaan serangnya.

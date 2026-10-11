@@ -151,7 +151,7 @@ Skrip installer otomatis:
 3. Membuat user sistem non-root `discord-music-updater`, mengatur ownership `venv`/log, dan memasang aturan sudoers terbatas (`systemctl restart/is-active discord-music.service` saja).
 4. Memasang service systemd `discord-music.service`, `discord-music-panel.service`, dan `discord-music-update.service` + timer.
 5. Mengaktifkan auto-start saat boot sistem.
-6. Menjalankan verifikasi unit test mandiri (**310/310 passing**).
+6. Menjalankan verifikasi unit test mandiri (**315/315 passing**).
 7. Menyalakan Web Control Panel di port `9130`.
 
 ---
@@ -163,16 +163,19 @@ Skrip installer otomatis:
    http://<IP_SERVER_STB>:9130
    ```
 2. Masukkan **Bot Token** dan **Guild ID** (Server ID Discord).
-3. Klik **Simpan konfigurasi**, lalu klik **Nyalakan bot**.
-4. Masuk ke Voice Channel di Discord, lalu ketik `/musik` atau `/play <judul/url>`.
+3. Anda dapat menambahkan atau mengosongkan **Password Panel** melalui menu Konfigurasi di web panel.
+4. Klik **Simpan konfigurasi**, lalu klik **Nyalakan bot**.
+5. Masuk ke Voice Channel di Discord, lalu ketik `/musik` atau `/play <judul/url>`.
 
-> [!WARNING]
-> **Keamanan panel.** Panel web berjalan sebagai root dan memicu aksi update lewat user terbatas `discord-music-updater` (`sudo -u`, tanpa password hanya untuk perintah pip yang ter-pin).
-> Password awal dibuat otomatis oleh `install.sh` dan disimpan di
-> `/opt/discord-music-panel.env`.
->
-> - **Jangan** biarkan `PANEL_PASSWORD` kosong bila port `9130` bisa dijangkau
->   perangkat lain. Tanpa password, panel sepenuhnya terbuka.
+> [!NOTE]
+> **Manajemen Password Panel.**
+> - Panel web berjalan di jaringan rumah (LAN) dan secara default dapat diakses tanpa password.
+> - Password dapat diatur atau dihapus kapan saja melalui form **Konfigurasi** di panel web.
+> - Jika lupa password atau ingin mereset via terminal server:
+>   ```bash
+>   ./tools/reset-password.sh           # Reset/hapus password (akses bebas di LAN)
+>   ./tools/reset-password.sh <sandi>   # Atur password baru
+>   ```
 > - Untuk LAN tak-terpercaya, set `PANEL_HOST=127.0.0.1` di
 >   `/opt/discord-music-panel.env` dan akses lewat SSH tunnel
 >   (`ssh -L 9130:127.0.0.1:9130 user@host`).

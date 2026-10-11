@@ -764,7 +764,8 @@ class PasswordlessTests(unittest.TestCase):
         status, body = self.req('GET', '/')
         self.assertEqual(status, 200)
         self.assertIn('Crspy Music', body)
-        self.assertIn('mode baca-saja', body)
+        self.assertIn('Nonaktif (Bebas LAN)', body)
+        self.assertNotIn('mode baca-saja', body)
 
     def test_api_status_opens_without_login(self):
         status, body = self.req('GET', '/api/status')
@@ -776,25 +777,26 @@ class PasswordlessTests(unittest.TestCase):
                              headers={'Origin': 'http://evil.example'})
         self.assertEqual(status, 403)
 
-    def test_same_origin_save_rejected_when_passwordless(self):
-        status, body = self.req('POST', '/save', 'token=abc&guild=7')
-        self.assertEqual(status, 403)
-        self.assertIn('Akses modifikasi ditolak', body)
-        self.assertEqual(panel.ConfigStore(self.env).read()['token'], '')
+    def test_same_origin_save_allowed_when_passwordless(self):
+        valid_tok = 'MTAwMDAwMDAwMDAwMDAwMDAw.G12345.abcdefghijklmnopqrstuvwxyz0123456789'
+        status, _ = self.req('POST', '/save', f'token={valid_tok}&guild=123456789012345678')
+        self.assertEqual(status, 303)
+        self.assertEqual(panel.ConfigStore(self.env).read()['token'], valid_tok)
 
-    def test_start_rejected_when_passwordless(self):
-        status, body = self.req('POST', '/start', '')
-        self.assertEqual(status, 403)
-        self.assertIn('Akses modifikasi ditolak', body)
+    def test_start_allowed_when_passwordless(self):
+        panel.SERVICE_RUNNER = lambda act: (True, 'ok')
+        panel.ConfigStore(self.env).write({'token': 'MTAwMDAwMDAwMDAwMDAwMDAw.G12345.abcdefghijklmnopqrstuvwxyz0123456789', 'guild': ''})
+        status, _ = self.req('POST', '/start', '')
+        self.assertEqual(status, 303)
 
-    def test_update_rejected_when_passwordless(self):
-        status, body = self.req('POST', '/update', '')
-        self.assertEqual(status, 403)
-        self.assertIn('Akses modifikasi ditolak', body)
+    def test_update_allowed_when_passwordless(self):
+        panel.UPDATE_RUNNER = lambda: (True, 'update ok')
+        status, _ = self.req('POST', '/update', '')
+        self.assertEqual(status, 303)
 
-    def test_login_post_rejected_when_passwordless(self):
+    def test_login_post_redirects_when_passwordless(self):
         status, _ = self.req('POST', '/login', 'password=apapun')
-        self.assertEqual(status, 403)
+        self.assertEqual(status, 303)
 
     def test_login_page_redirects_home_when_passwordless(self):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
@@ -805,6 +807,36 @@ class PasswordlessTests(unittest.TestCase):
         conn.close()
         self.assertEqual(res.status, 303)
         self.assertEqual(location, '/')
+
+    def test_set_and_clear_password_via_save(self):
+        panel_env = os.path.join(self.tmp.name, '.panel.env')
+        with open(panel_env, 'w') as f:
+            f.write('PANEL_PASSWORD=\n')
+        with unittest.mock.patch.dict(os.environ, {'PANEL_ENV': panel_env}):
+            # 1. Atur password via /save
+            status, _ = self.req('POST', '/save', 'panel_password=baru123')
+            self.assertEqual(status, 303)
+            self.assertEqual(panel.PASSWORD, 'baru123')
+
+            # Request baru tanpa cookie harus diarahkan ke /login
+            conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+            conn.request('GET', '/')
+            res = conn.getresponse()
+            res.read()
+            self.assertEqual(res.status, 303)
+            self.assertEqual(res.getheader('Location'), '/login')
+            conn.close()
+
+            # 2. Hapus password via /save (dengan session cookie aktif)
+            token = panel._mint_session()
+            status, _ = self.req('POST', '/save', 'clear_password=1', headers={'Cookie': f'{panel.COOKIE}={token}'})
+            self.assertEqual(status, 303)
+            self.assertEqual(panel.PASSWORD, '')
+
+            # Sekarang bisa dibuka lagi tanpa login
+            status, body = self.req('GET', '/')
+            self.assertEqual(status, 200)
+            self.assertIn('Nonaktif (Bebas LAN)', body)
 
 
 class CsrfAndNonceTests(unittest.TestCase):
@@ -1177,11 +1209,11 @@ class SecurityAuditValidationTests(unittest.TestCase):
         conn.close()
         self.assertEqual(res.status, 403)
 
-    # 5. Empty PANEL_PASSWORD privilege escalation prevention
-    def test_empty_password_blocks_modifications(self):
+    # 5. Empty PANEL_PASSWORD (bebas di LAN, tetap tolak CSRF cross-origin)
+    def test_empty_password_allows_same_origin_and_blocks_cross_origin(self):
         panel.PASSWORD = ''
         try:
-            origin = f'http://127.0.0.1:{self.port}'
+            cross_origin = 'http://evil.example'
             endpoints = [
                 ('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}'),
                 ('POST', '/start', ''),
@@ -1190,9 +1222,13 @@ class SecurityAuditValidationTests(unittest.TestCase):
                 ('POST', '/update', ''),
             ]
             for method, endpoint, body in endpoints:
-                status, resp = self.req(method, endpoint, body=body, headers={'Origin': origin})
-                self.assertEqual(status, 403, f'{method} {endpoint} harus ditolak 403 saat PASSWORD kosong')
-                self.assertIn('Akses modifikasi ditolak', resp)
+                status, _ = self.req(method, endpoint, body=body, headers={'Origin': cross_origin})
+                self.assertEqual(status, 403, f'{method} {endpoint} harus ditolak 403 untuk cross-origin saat PASSWORD kosong')
+
+            # Same-origin save diperbolehkan di mode tanpa password
+            origin = f'http://127.0.0.1:{self.port}'
+            status, _ = self.req('POST', '/save', f'token={self.valid_token}&guild={self.valid_guild}', headers={'Origin': origin})
+            self.assertEqual(status, 303)
         finally:
             panel.PASSWORD = 'audit-pass'
 
