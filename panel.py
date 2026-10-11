@@ -56,6 +56,7 @@ def update_panel_password(new_password: str, env_path: Optional[str] = None) -> 
 
     directory = os.path.dirname(target_path) or '.'
     os.makedirs(directory, exist_ok=True)
+    tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.panel.env.', suffix='.tmp')
         os.fchmod(fd, 0o600)
@@ -65,6 +66,11 @@ def update_panel_password(new_password: str, env_path: Optional[str] = None) -> 
             os.fsync(handle.fileno())
         os.replace(tmp_path, target_path)
     except OSError:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
         # Fallback jika direktori induk read-only (ProtectSystem=strict): tulis in-place
         with open(target_path, 'w', encoding='utf-8') as handle:
             handle.write(body)
@@ -203,18 +209,21 @@ class ConfigStore:
         # saling menimpa). Tulis penuh + fsync lalu rename atomik agar .env
         # tidak pernah terlihat kosong/terpotong.
         fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.env.', suffix='.tmp')
+        closed = False
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                closed = True
                 handle.write(body)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_path, self.path)
         except Exception:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            if not closed:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
                 os.remove(tmp_path)
             except OSError:
@@ -316,9 +325,6 @@ def ytdlp_version() -> str:
 
 def read_last_update_log() -> str:
     global _last_update_output
-    with _lock:
-        if _last_update_output:
-            return _last_update_output
     try:
         if os.path.exists(UPDATE_LOG_PATH):
             size = os.path.getsize(UPDATE_LOG_PATH)
@@ -326,10 +332,13 @@ def read_last_update_log() -> str:
                 if size > 65536:
                     handle.seek(max(0, size - 65536))
                     handle.readline()
-                return handle.read()[-65536:].strip()
+                content = handle.read()[-65536:].strip()
+                if content:
+                    return content
     except Exception:
         pass
-    return ''
+    with _lock:
+        return _last_update_output or ''
 
 
 def read_bot_logs(lines: int = 35) -> str:

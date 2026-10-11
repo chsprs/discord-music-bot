@@ -1,5 +1,6 @@
 """Minimal Discord music player: slash summon, buttons, modal, streaming voice."""
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -55,7 +56,7 @@ def format_duration(seconds: int | float | None) -> str:
     return f"{minutes}m {secs}s"
 
 
-@dataclass
+@dataclass(slots=True)
 class Track:
     title: str
     url: str  # stable page URL, not an expiring googlevideo URL
@@ -821,6 +822,9 @@ async def fetch_youtube_mix(video_id: str, exclude_urls: set[str] | None = None,
     return [t for t in tracks if t.url not in excluded]
 
 
+SILENCE_FRAME = b'\x00' * 3840
+
+
 class BufferedAudioSource(discord.AudioSource):
     """Menyangga audio PCM ke dalam memori untuk mencegah fluktuasi kecepatan saat terjadi jitter jaringan."""
     def __init__(self, source: discord.AudioSource, buffer_size: int = 150):
@@ -857,7 +861,8 @@ class BufferedAudioSource(discord.AudioSource):
                 if not self._enqueue(data):
                     break
                 count += 1
-                if count >= 25 and not self.ready_event.is_set():
+                threshold = min(10, self.queue.maxsize) if self.queue.maxsize > 0 else 10
+                if count >= threshold and not self.ready_event.is_set():
                     self.ready_event.set()
         except Exception as exc:
             self._current_error = exc
@@ -901,7 +906,7 @@ class BufferedAudioSource(discord.AudioSource):
             self._consecutive_hits = 0
             if self._misses >= MAX_ERROR_STREAK or now >= self._stall_deadline:
                 return b''
-            return b'\x00' * 3840
+            return SILENCE_FRAME
 
     def cleanup(self):
         if self._cleaned:
@@ -1015,17 +1020,24 @@ def source_for(data: dict, volume: float | None = None) -> discord.PCMVolumeTran
         volume = get_default_volume()
     pcm = discord.FFmpegPCMAudio(
         data['url'],
-        before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5',
-        options='-vn'
+        before_options='-nostdin -analyzeduration 0 -probesize 32k -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5',
+        options='-vn -threads 1'
     )
+    buffered = None
     try:
         buffered = BufferedAudioSource(pcm)
         return discord.PCMVolumeTransformer(buffered, volume=volume)
     except Exception:
-        try:
-            pcm.cleanup()
-        except Exception:
-            pass
+        if buffered is not None:
+            try:
+                buffered.cleanup()
+            except Exception:
+                pass
+        else:
+            try:
+                pcm.cleanup()
+            except Exception:
+                pass
         raise
 
 
@@ -1776,7 +1788,7 @@ class MusicBot(discord.Client):
             await self.wait_until_ready()
             while not self.is_closed():
                 try:
-                    dump_runtime_state(self)
+                    await asyncio.to_thread(dump_runtime_state, self)
                 except Exception as exc:
                     log.debug('Gagal menulis state runtime: %s', exc)
                 await asyncio.sleep(30)
@@ -2225,6 +2237,7 @@ class MusicBot(discord.Client):
                 await asyncio.to_thread(clear_cache)
             except Exception as exc:
                 log.debug('Gagal membersihkan cache: %s', exc)
+            gc.collect()
 
     async def cmd_stop(self, interaction: discord.Interaction):
         if not _check_guild_only(interaction):
@@ -2450,27 +2463,36 @@ class MusicBot(discord.Client):
 
     async def refresh(self, state: QueueState):
         # Coalesce refresh beruntun agar tidak spam edit Discord (M15).
+        # Trailing edge: jika dipanggil saat task masih aktif, tandai pending agar
+        # pembaruan terakhir tetap ter-render dan embed tidak basi (Bug 1.3).
+        state._refresh_pending = True
         if state.refresh_task and not state.refresh_task.done():
             return
         async def _do():
-            await asyncio.sleep(0.5)
-            msg = state.message
-            if not (msg and hasattr(msg, 'edit')):
-                return
-            try:
-                async with state.lock:
-                    embed = self.embed(state)
-                await msg.edit(embed=embed)
-            except discord.HTTPException:
-                if state.message is msg:
-                    state.message = None
-            except Exception:
-                # state.message bisa di-null-kan coroutine lain di sela await;
-                # jangan biarkan AttributeError jadi "task exception never
-                # retrieved" (L1).
-                log.debug('Refresh panel gagal', exc_info=True)
-                if state.message is msg:
-                    state.message = None
+            while True:
+                state._refresh_pending = False
+                await asyncio.sleep(0.5)
+                msg = state.message
+                if not (msg and hasattr(msg, 'edit')):
+                    return
+                try:
+                    async with state.lock:
+                        embed = self.embed(state)
+                    await msg.edit(embed=embed)
+                except discord.HTTPException:
+                    if state.message is msg:
+                        state.message = None
+                    break
+                except Exception:
+                    # state.message bisa di-null-kan coroutine lain di sela await;
+                    # jangan biarkan AttributeError jadi "task exception never
+                    # retrieved" (L1).
+                    log.debug('Refresh panel gagal', exc_info=True)
+                    if state.message is msg:
+                        state.message = None
+                    break
+                if not getattr(state, '_refresh_pending', False):
+                    break
         try:
             state.refresh_task = asyncio.get_running_loop().create_task(_do())
         except RuntimeError:
@@ -2493,19 +2515,13 @@ class MusicBot(discord.Client):
                 state.idle_task = None
                 if vc.is_playing() or vc.is_paused():
                     return
-        # M4: tandai bahwa advance() benar-benar berjalan (fase ekstraksi/putar).
-        # Handler Skip memakai flag ini untuk merekam _skip_pending. Memakai
-        # _advance_lock.locked() SALAH: lock hanya dipegang di guard di atas,
-        # sudah dilepas sebelum loop -> flag M4 dulu tak pernah aktif (dead code).
-        # Counter (bukan bool): /play saat ekstraksi bisa memicu advance() kedua
-        # yang berjalan bersamaan; bool akan di-reset oleh yang selesai duluan.
-        async with state.lock:
-            state._advancing += 1
-        try:
-            await self._advance_loop(guild, state, vc)
-        finally:
-            async with state.lock:
-                state._advancing = max(0, state._advancing - 1)
+                # M4: tandai bahwa advance() benar-benar berjalan (fase ekstraksi/putar).
+                state._advancing += 1
+            try:
+                await self._advance_loop(guild, state, vc)
+            finally:
+                async with state.lock:
+                    state._advancing = max(0, state._advancing - 1)
 
     async def _advance_loop(self, guild: discord.Guild, state: QueueState, vc) -> None:
         """Inti advance(): pilih, ekstraksi, putar. Selalu dipanggil dari advance()."""
@@ -2565,6 +2581,9 @@ class MusicBot(discord.Client):
                     data = {'url': next_track.stream_url, 'title': next_track.title}
                 else:
                     data = await run_extract(extract, next_track.url, timeout=60)
+                    if isinstance(data, dict) and data.get('url'):
+                        next_track.stream_url = data['url']
+                        next_track.stream_ts = time.time()
                 # F2: /stop atau reconnect selama ekstraksi membump generation dan
                 # mengganti voice client. Lanjut memutar = memakai vc lama yang
                 # sudah putus (ClientException) dan lagu baru tak pernah diputar.
@@ -2677,8 +2696,8 @@ class MusicBot(discord.Client):
                     try:
                         vc.play(source, after=after, application='audio', bitrate=bitrate_kbps, signal_type='music')
                     except discord.ClientException as exc:
-                        if 'Not connected to voice' in str(exc):
-                            log.error('vc.play gagal: %s', exc)
+                        log.error('vc.play gagal: %s', exc)
+                        if 'Not connected to voice' in str(exc) or not getattr(vc, 'is_connected', lambda: False)():
                             asyncio.create_task(self.quit_voice(guild, clear_queue=False))
                         # L2: TOCTOU — player lain menang balapan di sela await.
                         # Jangan salahkan track ini (bukan kegagalan stream).

@@ -1416,3 +1416,14 @@ class PanelPortAndNonceRegressionTests(unittest.TestCase):
             second = panel._form_tokens.pop('NONCE1', 0) > time.monotonic()
         self.assertTrue(first)
         self.assertFalse(second, 'nonce kedua harus gagal (sudah dikonsumsi)')
+
+    def test_read_last_update_log_prefers_disk_over_ram(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, 'update.log')
+            with open(log_file, 'w', encoding='utf-8') as f:
+                f.write('log dari disk terbaru')
+            with panel._lock:
+                panel._last_update_output = 'log basi di ram'
+            with unittest.mock.patch('panel.UPDATE_LOG_PATH', log_file):
+                out = panel.read_last_update_log()
+                self.assertEqual(out, 'log dari disk terbaru')

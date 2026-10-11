@@ -3705,3 +3705,38 @@ class DMAutoInviteTests(unittest.TestCase):
         asyncio.run(self.bot.on_message(msg))
 
         self.assertEqual(msg.reply.await_count, 1)
+
+
+class AuditOptimizationRegressionTests(unittest.TestCase):
+    def test_track_has_slots(self):
+        t = Track('Title', 'https://example.com', 'user')
+        self.assertTrue(hasattr(t, '__slots__'))
+        self.assertFalse(hasattr(t, '__dict__'))
+
+    def test_source_for_cleans_up_buffered_on_transformer_error(self):
+        with patch('discord.FFmpegPCMAudio') as mock_ffmpeg, \
+             patch('bot.BufferedAudioSource') as mock_buf_cls, \
+             patch('discord.PCMVolumeTransformer', side_effect=ValueError('bad volume')):
+            mock_buf_inst = MagicMock()
+            mock_buf_cls.return_value = mock_buf_inst
+            with self.assertRaises(ValueError):
+                source_for({'url': 'http://stream'}, volume=-1.0)
+            mock_buf_inst.cleanup.assert_called_once()
+
+    def test_refresh_trailing_edge(self):
+        bot = MusicBot()
+        state = QueueState()
+        mock_msg = MagicMock()
+        mock_msg.edit = AsyncMock()
+        state.message = mock_msg
+
+        async def worker():
+            t1 = asyncio.create_task(bot.refresh(state))
+            await asyncio.sleep(0.1)
+            t2 = asyncio.create_task(bot.refresh(state))
+            await t1
+            if state.refresh_task:
+                await state.refresh_task
+
+        asyncio.run(worker())
+        self.assertGreaterEqual(mock_msg.edit.await_count, 1)
