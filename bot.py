@@ -1551,6 +1551,7 @@ class MusicBot(discord.Client):
         self.tree.command(name='autoplay', description='Aktifkan atau nonaktifkan putar otomatis (AutoPlay)')(self.cmd_autoplay)
         self.tree.command(name='help', description='Tampilkan daftar perintah dan cara pakai bot')(self.cmd_help)
         self._queue_state_file: str | None = None
+        self._dm_cooldowns: dict[int, float] = {}
 
     def _save_persistent_queue(self) -> None:
         path = getattr(self, '_queue_state_file', None) or _persistent_queue_file()
@@ -1815,6 +1816,34 @@ class MusicBot(discord.Client):
             state.idle_task = state.empty_task = state.afk_task = state.refresh_task = state.announce_task = None
             state.afk_paused = False
         self._save_persistent_queue()
+
+    async def on_message(self, message: discord.Message):
+        if getattr(message.author, 'bot', False) or message.guild is not None:
+            return
+        bot_id = getattr(self.user, 'id', None)
+        if not bot_id:
+            return
+        now = time.monotonic()
+        last = self._dm_cooldowns.get(message.author.id, 0.0)
+        if now - last < 5.0:
+            return
+        self._dm_cooldowns[message.author.id] = now
+        if len(self._dm_cooldowns) > 256:
+            self._dm_cooldowns = {uid: t for uid, t in self._dm_cooldowns.items() if now - t < 30.0}
+
+        invite_url = (
+            f'https://discord.com/oauth2/authorize?client_id={bot_id}'
+            '&permissions=277028595712&scope=bot%20applications.commands'
+        )
+        reply_text = (
+            'Halo! Bot musik tidak bisa masuk server secara otomatis lewat link invite server.\n'
+            f'Silakan undang saya ke server kamu menggunakan link berikut:\n{invite_url}\n\n'
+            'Setelah bot masuk, ketik `/musik` di text channel untuk memanggil panel kontrol.'
+        )
+        try:
+            await message.reply(reply_text, mention_author=False)
+        except Exception as exc:
+            log.warning('Gagal membalas DM user %s: %s', message.author, exc)
 
     def _register_signals(self) -> None:
         try:

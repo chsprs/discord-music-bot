@@ -3650,3 +3650,58 @@ class AFKQuitVoiceSelfCancellationRegressionTests(unittest.TestCase):
             asyncio.run(worker())
 
         vc.disconnect.assert_awaited_once()
+
+
+class DMAutoInviteTests(unittest.TestCase):
+    def setUp(self):
+        self.bot = MusicBot()
+        self.bot._connection = MagicMock()
+        user = MagicMock()
+        user.id = 9876543210
+        user.bot = True
+        self.bot._connection.user = user
+
+    def test_dm_replies_with_invite_link(self):
+        msg = MagicMock()
+        msg.guild = None
+        msg.author = MagicMock(id=111, bot=False)
+        msg.content = 'https://discord.gg/invite'
+        msg.reply = AsyncMock()
+
+        asyncio.run(self.bot.on_message(msg))
+
+        msg.reply.assert_awaited_once()
+        args, kwargs = msg.reply.call_args
+        self.assertIn('9876543210', args[0])
+        self.assertIn('https://discord.com/oauth2/authorize', args[0])
+
+    def test_dm_ignores_bot_author(self):
+        msg = MagicMock()
+        msg.guild = None
+        msg.author = MagicMock(id=222, bot=True)
+        msg.reply = AsyncMock()
+
+        asyncio.run(self.bot.on_message(msg))
+
+        msg.reply.assert_not_awaited()
+
+    def test_dm_ignores_guild_message(self):
+        msg = MagicMock()
+        msg.guild = MagicMock(id=333)
+        msg.author = MagicMock(id=444, bot=False)
+        msg.reply = AsyncMock()
+
+        asyncio.run(self.bot.on_message(msg))
+
+        msg.reply.assert_not_awaited()
+
+    def test_dm_cooldown_blocks_spam(self):
+        msg = MagicMock()
+        msg.guild = None
+        msg.author = MagicMock(id=555, bot=False)
+        msg.reply = AsyncMock()
+
+        asyncio.run(self.bot.on_message(msg))
+        asyncio.run(self.bot.on_message(msg))
+
+        self.assertEqual(msg.reply.await_count, 1)
