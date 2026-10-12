@@ -4894,3 +4894,202 @@ class Wave7RemediationTests(unittest.TestCase):
             self.assertIsNone(state.idle_task)
 
         asyncio.run(run_idle())
+
+    def test_wave9_announce_now_playing_channel_resolution_for_id(self):
+        """Wave 9: _announce_now_playing meneruskan channel saat menghapus message ID lama."""
+        bot = MusicBot()
+        guild = MagicMock(id=99601)
+        ch_music = MagicMock(id=202)
+        guild.get_channel = MagicMock(return_value=ch_music)
+        state = QueueState()
+        state.now_message = 123456789
+        state.text_channel_id = 202
+        bot.states[guild.id] = state
+
+        track = Track('AnnounceTrack', 'https://mock.url/ann', 'user')
+        with patch.object(bot, '_safe_delete_msg', new=AsyncMock()) as mock_safe_delete:
+            with patch.object(ch_music, 'send', new=AsyncMock()):
+                asyncio.run(bot._announce_now_playing(guild, track))
+            mock_safe_delete.assert_called_once_with(123456789, channel=ch_music, guild=guild)
+
+    def test_wave9_refresh_panel_preserves_message_on_transient_http(self):
+        """Wave 9: refresh() tidak membuang state.message pada HTTP 429 atau 5xx."""
+        async def _run():
+            bot = MusicBot()
+            state = QueueState()
+            msg = MagicMock()
+            mock_resp = MagicMock(status=429)
+            msg.edit = AsyncMock(side_effect=discord.HTTPException(mock_resp, 'Rate limited'))
+            state.message = msg
+            with patch('bot.asyncio.sleep', new=AsyncMock()):
+                await bot.refresh(state)
+                if state.refresh_task:
+                    await state.refresh_task
+            self.assertIs(state.message, msg)
+        asyncio.run(_run())
+
+    def test_wave9_dump_runtime_state_offline_increments_seq(self):
+        """Wave 9: dump_runtime_state_offline menaikkan urutan seq di bawah lock."""
+        import bot as bot_mod
+        with bot_mod._RUNTIME_STATE_LOCK:
+            s_before = bot_mod._RUNTIME_STATE_LAST_SEQ
+            l_before = bot_mod._RUNTIME_LISTENERS_LAST_SEQ
+
+        with patch.dict(os.environ, {"BOT_STATE_FILE": "/tmp/dummy_state_w9.json"}):
+            bot_mod.dump_runtime_state_offline()
+
+        with bot_mod._RUNTIME_STATE_LOCK:
+            self.assertGreater(bot_mod._RUNTIME_STATE_LAST_SEQ, s_before)
+            self.assertGreater(bot_mod._RUNTIME_LISTENERS_LAST_SEQ, l_before)
+
+    def test_wave9_safedeque_contains_mutation_race(self):
+        """Wave 9: SafeDeque.__contains__ menangani mutasi konkuren tanpa melempar RuntimeError."""
+        import bot as bot_mod
+        sd = bot_mod.SafeDeque()
+        for i in range(50):
+            sd.append(Track(f"T{i}", "http://u", "u"))
+        t = Track("Target", "http://u", "u")
+        self.assertFalse(t in sd)
+
+    def test_wave9_panel_empty_queue_schedules_idle(self):
+        """Wave 9: Tombol skip/pause/back pada antrian kosong menjadwalkan idle disconnect."""
+        bot = MusicBot()
+        guild = MagicMock(id=99605)
+        vc = MagicMock(is_playing=MagicMock(return_value=False), is_paused=MagicMock(return_value=False), channel=MagicMock(id=8001))
+        guild.voice_client = vc
+        state = QueueState()
+        bot.states[guild.id] = state
+        panel = MusicPanel(bot)
+        panel.guard = AsyncMock(return_value=True)
+
+        interaction = MagicMock(guild=guild)
+        interaction.user.voice.channel = vc.channel
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch.object(bot, '_schedule_idle') as mock_idle:
+            asyncio.run(panel.skip.callback(interaction))
+            mock_idle.assert_called_once_with(guild, state.generation)
+
+    def test_wave9_empty_room_idle_task_cancelled_on_human_return(self):
+        """Wave 9: on_voice_state_update membatalkan idle_task saat pendengar manusia kembali."""
+        bot = MusicBot()
+        guild = MagicMock(id=99606)
+        vc = MagicMock(is_playing=MagicMock(return_value=False), is_paused=MagicMock(return_value=False), channel=MagicMock(id=8001))
+        guild.voice_client = vc
+        state = QueueState()
+        mock_idle_task = MagicMock(done=MagicMock(return_value=False))
+        state.idle_task = mock_idle_task
+        bot.states[guild.id] = state
+
+        member = MagicMock(bot=False, guild=guild)
+        before = MagicMock(channel=None)
+        after = MagicMock(channel=vc.channel)
+        vc.channel.members = [member]
+
+        asyncio.run(bot.on_voice_state_update(member, before, after))
+        mock_idle_task.cancel.assert_called_once()
+        self.assertIsNone(state.idle_task)
+
+    def test_wave9_tracks_from_metadata_filters_youtube_web_urls(self):
+        """Wave 9: _tracks_from_metadata menyaring URL web YouTube agar tidak di-cache sebagai stream_url."""
+        import bot as bot_mod
+        for bad_url in ("https://www.youtube.com/embed/xyz", "https://www.youtube.com/live/xyz", "https://www.youtube.com/v/xyz"):
+            raw = {"title": "Song", "webpage_url": "https://www.youtube.com/watch?v=xyz", "url": bad_url}
+            tracks = bot_mod._tracks_from_metadata(raw, "u", "https://www.youtube.com/watch?v=xyz")
+            self.assertIsNone(tracks[0].stream_url)
+
+    def test_wave9_buffered_audio_source_reader_cleanup_suppresses_current_error(self):
+        """Wave 9: BufferedAudioSource._reader tidak mengisi _current_error bila stop_event aktif saat cleanup."""
+        import bot as bot_mod
+        mock_src = MagicMock()
+        closed = threading.Event()
+        reading_event = threading.Event()
+
+        def mock_read():
+            reading_event.set()
+            if closed.wait(timeout=0.1):
+                raise ValueError("pipe closed")
+            return b"\x00" * 3840
+
+        def mock_cleanup():
+            closed.set()
+
+        mock_src.read = mock_read
+        mock_src.cleanup = mock_cleanup
+        mock_src.is_opus.return_value = False
+        bas = bot_mod.BufferedAudioSource(mock_src)
+        reading_event.wait(timeout=0.5)
+        bas.cleanup()
+        time.sleep(0.02)
+        self.assertIsNone(bas._current_error)
+
+    def test_wave9_cmd_queue_and_playlist_lock_contention(self):
+        """Wave 9: cmd_queue dan playlist tidak menahan state.lock selama network I/O."""
+        bot = MusicBot()
+        guild = MagicMock(id=99609)
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        interaction = MagicMock(guild=guild)
+        interaction.response.defer = AsyncMock()
+        lock_held = False
+        async def mock_send(*args, **kwargs):
+            nonlocal lock_held
+            lock_held = state.lock.locked()
+        interaction.followup.send = mock_send
+
+        asyncio.run(bot.cmd_queue(interaction))
+        self.assertFalse(lock_held)
+
+    def test_wave9_on_guild_remove_clears_synced_guilds(self):
+        """Wave 9: on_guild_remove membuang guild.id dari _synced_guilds."""
+        bot = MusicBot()
+        guild = MagicMock(id=99610)
+        bot._synced_guilds.add(guild.id)
+        asyncio.run(bot.on_guild_remove(guild))
+        self.assertNotIn(guild.id, bot._synced_guilds)
+
+    def test_wave9_panel_logout_revokes_server_session(self):
+        """Wave 9: Endpoint /logout membatalkan token di tabel _sessions server."""
+        import panel as panel_mod
+        token = "test_logout_token_w9"
+        panel_mod._sessions[token] = time.monotonic() + 3600.0
+        orig_pw = panel_mod.PASSWORD
+        panel_mod.PASSWORD = "validpassword"
+        try:
+            handler = panel_mod.Handler.__new__(panel_mod.Handler)
+            handler.path = "/logout"
+            handler.headers = {"Cookie": f"{panel_mod.COOKIE}={token}", "Host": "127.0.0.1:9130"}
+            handler._host_ok = MagicMock(return_value=True)
+            handler._redirect = MagicMock(return_value="redirect_ok")
+            handler.log_message = MagicMock()
+            handler.do_GET()
+            self.assertNotIn(token, panel_mod._sessions)
+        finally:
+            panel_mod.PASSWORD = orig_pw
+            panel_mod._sessions.pop(token, None)
+
+    def test_wave9_panel_update_invalidates_caches(self):
+        """Wave 9: _update() membersihkan _state_cache dan _log_cache pasca pembaruan."""
+        import panel as panel_mod
+        with panel_mod._state_cache_lock:
+            panel_mod._state_cache["bot"] = (time.monotonic() + 15.0, "old")
+        with panel_mod._log_cache_lock:
+            panel_mod._log_cache["journal"] = (time.monotonic() + 15.0, "old")
+        handler = panel_mod.Handler.__new__(panel_mod.Handler)
+        handler.log_message = MagicMock()
+        handler.log_exception = MagicMock()
+        handler._set_flash = MagicMock()
+        handler._redirect = MagicMock(return_value="redirect_ok")
+
+        orig_update = panel_mod.run_update
+        panel_mod.run_update = lambda: (True, "updated")
+        try:
+            handler._update()
+            with panel_mod._state_cache_lock:
+                self.assertNotIn("bot", panel_mod._state_cache)
+            with panel_mod._log_cache_lock:
+                self.assertNotIn("journal", panel_mod._log_cache)
+        finally:
+            panel_mod.run_update = orig_update

@@ -94,6 +94,14 @@ class SafeDeque(deque):
                 pass
         return iter([])
 
+    def __contains__(self, item):
+        for _ in range(10):
+            try:
+                return super().__contains__(item)
+            except RuntimeError:
+                pass
+        return False
+
 
 @dataclass
 class QueueState:
@@ -520,17 +528,21 @@ def dump_runtime_state_offline() -> None:
             path = '/run/discord-music/state.json'
         else:
             path = '/tmp/discord-music-state.json'
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
-    listeners_path = os.path.join(os.path.dirname(path), "listeners.json")
-    try:
-        if os.path.exists(listeners_path):
-            os.remove(listeners_path)
-    except Exception:
-        pass
+    global _RUNTIME_STATE_LAST_SEQ, _RUNTIME_LISTENERS_LAST_SEQ
+    with _RUNTIME_STATE_LOCK:
+        _RUNTIME_STATE_LAST_SEQ += 1
+        _RUNTIME_LISTENERS_LAST_SEQ += 1
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+        listeners_path = os.path.join(os.path.dirname(path), "listeners.json")
+        try:
+            if os.path.exists(listeners_path):
+                os.remove(listeners_path)
+        except Exception:
+            pass
 
 
 def _persistent_queue_file() -> str:
@@ -695,7 +707,7 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
             stream_url = None
             stream_ts = 0.0
             u = entry.get('url')
-            if u and u != stable_url and not any(p in u for p in ('youtube.com/watch', 'youtu.be/', 'youtube.com/shorts', 'youtube.com/playlist')):
+            if u and u != stable_url and not any(p in u for p in ('youtube.com', 'youtu.be')):
                 stream_url = u
                 stream_ts = time.time()
             dur = entry.get('duration') or 0
@@ -713,7 +725,7 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
         stream_url = None
         stream_ts = 0.0
         u = data.get('url')
-        if u and u != stable_url and not any(p in u for p in ('youtube.com/watch', 'youtu.be/', 'youtube.com/shorts', 'youtube.com/playlist')):
+        if u and u != stable_url and not any(p in u for p in ('youtube.com', 'youtu.be')):
             stream_url = u
             stream_ts = time.time()
         dur = data.get('duration') or 0
@@ -966,7 +978,8 @@ class BufferedAudioSource(discord.AudioSource):
                 if count >= threshold and not self.ready_event.is_set():
                     self.ready_event.set()
         except Exception as exc:
-            self._current_error = exc
+            if not self.stop_event.is_set():
+                self._current_error = exc
             self._enqueue(None)
         finally:
             self.ready_event.set()
@@ -1493,6 +1506,8 @@ class MusicPanel(discord.ui.View):
                     state.queue.appendleft(state.current)
                     state.current = None
         if not had_prev:
+            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.current and not state.queue:
+                self.bot._schedule_idle(interaction.guild, state.generation)
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self.bot._stop_player(interaction.guild)
         await self.bot.advance(interaction.guild)
@@ -1530,6 +1545,8 @@ class MusicPanel(discord.ui.View):
             text = 'Melanjutkan pemutaran antrian lagu.'
         else:
             text = 'Tidak ada lagu aktif atau antrian kosong.'
+            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.current and not state.queue:
+                self.bot._schedule_idle(interaction.guild, state.generation)
         await interaction.followup.send(text, ephemeral=True)
         await self.bot.refresh(state)
 
@@ -1579,6 +1596,8 @@ class MusicPanel(discord.ui.View):
             text = 'Memutar lagu berikutnya dari antrian.'
         else:
             text = 'Tidak ada lagu aktif.'
+            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.current and not state.queue:
+                self.bot._schedule_idle(interaction.guild, state.generation)
         await interaction.followup.send(text, ephemeral=True)
 
     @discord.ui.button(label='Up', emoji='🔊', style=discord.ButtonStyle.secondary, custom_id='music:up', row=0)
@@ -1660,8 +1679,9 @@ class MusicPanel(discord.ui.View):
     async def playlist(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = self.bot.states.setdefault(interaction.guild.id, QueueState())
         async with state.lock:
-            if not state.queue and not state.current:
-                return await interaction.response.send_modal(SearchModal(self.bot))
+            empty = not state.queue and not state.current
+        if empty:
+            return await interaction.response.send_modal(SearchModal(self.bot))
 
         await interaction.response.defer(ephemeral=True)
         if not await self.guard(interaction):
@@ -2026,6 +2046,8 @@ class MusicBot(discord.Client):
 
     async def on_guild_remove(self, guild: discord.Guild):
         dump_runtime_state(self)
+        if hasattr(self, '_synced_guilds') and isinstance(self._synced_guilds, set):
+            self._synced_guilds.discard(getattr(guild, 'id', None))
         state = self.states.pop(guild.id, None)
         if state:
             for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task, state.announce_task):
@@ -2504,16 +2526,20 @@ class MusicBot(discord.Client):
         state = self.states.get(interaction.guild.id)
         if not state:
             return await interaction.followup.send('Antrian lagu kosong.', ephemeral=True)
+        empty = False
         async with state.lock:
             if not state.queue and not state.current:
-                return await interaction.followup.send('Antrian lagu kosong.', ephemeral=True)
-            try:
-                tracks = list(state.queue)[:10]
-                queue_len = len(state.queue)
-            except RuntimeError:
-                tracks = []
-                queue_len = 0
-            current_track = state.current
+                empty = True
+            else:
+                try:
+                    tracks = list(state.queue)[:10]
+                    queue_len = len(state.queue)
+                except RuntimeError:
+                    tracks = []
+                    queue_len = 0
+                current_track = state.current
+        if empty:
+            return await interaction.followup.send('Antrian lagu kosong.', ephemeral=True)
         header = f"**Sedang Diputar:** {discord.utils.escape_markdown(current_track.title)}\n\n" if current_track else ""
         if tracks:
             text = '\n'.join(f'{i}. {discord.utils.escape_markdown(t.title)} ({t.duration_str})' for i, t in enumerate(tracks, 1))
@@ -2746,9 +2772,11 @@ class MusicBot(discord.Client):
                     async with state.lock:
                         embed = self.embed(state)
                     await msg.edit(embed=embed)
-                except discord.HTTPException:
-                    if state.message is msg:
-                        state.message = None
+                except discord.HTTPException as err:
+                    status = getattr(err, 'status', None)
+                    if status != 429 and not (isinstance(status, int) and 500 <= status < 600):
+                        if state.message is msg:
+                            state.message = None
                     break
                 except Exception:
                     # state.message bisa di-null-kan coroutine lain di sela await;
@@ -3127,7 +3155,11 @@ class MusicBot(discord.Client):
                         state.history.popleft()
                     state.current = None
             self._save_persistent_queue()
-            schedule_idle = state.current is None and not (vc.is_playing() or vc.is_paused())
+            schedule_idle = (
+                state.current is None
+                and not (vc.is_playing() or vc.is_paused())
+                and not (state.afk_task and not state.afk_task.done())
+            )
             gen = state.generation
         await self.refresh(state)
         if schedule_idle:
@@ -3147,7 +3179,10 @@ class MusicBot(discord.Client):
                 channel = self.get_channel(state.text_channel_id)
         old = getattr(state, 'now_message', None)
         if old is not None:
-            await self._safe_delete_msg(old, guild=guild)
+            if hasattr(old, 'delete') and callable(old.delete):
+                await self._safe_delete_msg(old, guild=guild)
+            else:
+                await self._safe_delete_msg(old, channel=channel, guild=guild)
             state.now_message = None
         if panel_msg is None:
             return
@@ -3314,10 +3349,13 @@ class MusicBot(discord.Client):
                     pass
         else:
             # Ada pendengar manusia di channel bot
-            # Batalkan timer AFK
+            # Batalkan timer AFK & idle
             if state.afk_task and not state.afk_task.done():
                 state.afk_task.cancel()
             state.afk_task = state.empty_task = None
+            if state.idle_task and not state.idle_task.done():
+                state.idle_task.cancel()
+                state.idle_task = None
 
             # Lanjutkan pemutaran jika sebelumnya di-pause oleh AFK Guard
             if state.afk_paused:

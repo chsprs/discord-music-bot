@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 8).
+"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 9).
 
 Skenario Simulasi & Verifikasi:
 1. Burst skips & _advance_lock race condition (Wave 3)
@@ -56,11 +56,23 @@ Skenario Simulasi & Verifikasi:
 52. Stale _log_cache retention in panel.py after systemctl service actions (Wave 8)
 53. Counter underflow on _release_extract_slot breaching MAX_EXTRACT_THREADS concurrency (Wave 8)
 54. state.idle_task reference leak on idle_disconnect completion without finally cleanup (Wave 8)
+55. announce_now_playing fallback channel mismatch on message ID deletion (Wave 9)
+56. Stale panel message discard on transient HTTP 429/5xx in refresh() (Wave 9)
+57. Race condition out-of-order write dump_runtime_state_offline vs dump_runtime_state (Wave 9)
+58. Unhandled SafeDeque.__contains__ race condition during concurrent mutation (Wave 9)
+59. Voice client stranded in voice channel on empty queue skip/back/pause (Wave 9)
+60. Redundant dual timer collision (afk_task and idle_task) in empty room (Wave 9)
+61. False caching stream URL for web page URLs (/embed/, /live/, /v/) in _tracks_from_metadata (Wave 9)
+62. False positive audio playback error in BufferedAudioSource._reader post cleanup (Wave 9)
+63. Blocking event loop latency due to await network I/O inside state.lock (Wave 9)
+64. Permanent command desync post re-invite guild due to retained _synced_guilds (Wave 9)
+65. Server-side session leak in panel.py on /logout endpoint (Wave 9)
+66. Stale log & state cache in panel.py post /update execution (Wave 9)
 
 Usage:
     ./venv/bin/python tools/stress_concurrency_fuzz.py
     ./venv/bin/python tools/stress_concurrency_fuzz.py --json
-    ./venv/bin/python tools/stress_concurrency_fuzz.py --scenario ghost_voice_client_lockout_modal_and_panel
+    ./venv/bin/python tools/stress_concurrency_fuzz.py --scenario announce_now_playing_fallback_channel_mismatch
 """
 from __future__ import annotations
 
@@ -3194,6 +3206,628 @@ async def fuzz_idle_disconnect_task_leak_finally(iterations: int = 5) -> FuzzSce
 
 
 # ==============================================================================
+# 55. ANNOUNCE NOW PLAYING FALLBACK CHANNEL MISMATCH (Wave 9)
+# ==============================================================================
+async def fuzz_announce_now_playing_fallback_channel_mismatch(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="announce_now_playing_fallback_channel_mismatch",
+        description="Verifikasi pemanggilan _safe_delete_msg pada _announce_now_playing menggunakan resolved channel untuk message ID",
+        iterations=iterations,
+    )
+    mismatch_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild, vc = _create_mock_environment(guild_id=25000 + it)
+        ch_first = MagicMock(spec=discord.TextChannel)
+        ch_first.id = 101
+        ch_first.get_partial_message = MagicMock()
+        ch_music = MagicMock(spec=discord.TextChannel)
+        ch_music.id = 202
+        ch_music.get_partial_message = MagicMock()
+        guild.text_channels = [ch_first, ch_music]
+        guild.get_channel = MagicMock(side_effect=lambda cid: ch_music if cid == 202 else ch_first if cid == 101 else None)
+
+        state = QueueState()
+        panel_msg = MagicMock()
+        panel_msg.channel = ch_music
+        state.message = panel_msg
+        state.text_channel_id = 202
+        state.now_message = 998877 + it
+        bot.states[guild.id] = state
+
+        called_channel = None
+        orig_safe_delete = bot._safe_delete_msg
+
+        async def mock_safe_delete(msg, channel=None, guild=None):
+            nonlocal called_channel
+            called_channel = channel
+            return await orig_safe_delete(msg, channel=channel, guild=guild)
+
+        bot._safe_delete_msg = mock_safe_delete
+
+        track = Track("TestSong", "http://url", "user")
+        with patch.object(ch_music, "send", new=AsyncMock(return_value=MagicMock())):
+            await bot._announce_now_playing(guild, track)
+
+        if called_channel is None or getattr(called_channel, "id", None) != ch_music.id:
+            mismatch_events += 1
+
+    if mismatch_events > 0:
+        res.anomalies.append(
+            f"Fallback channel mismatch terkonfirmasi: {mismatch_events}/{iterations} iterasi memanggil "
+            "_safe_delete_msg tanpa target channel yang telah di-resolve sehingga fallback ke text channel pertama dan gagal hapus (404)."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"mismatch_events": mismatch_events}
+    return res
+
+
+# ==============================================================================
+# 56. REFRESH PANEL HTTP RATE LIMIT DISCARD (Wave 9)
+# ==============================================================================
+async def fuzz_refresh_panel_http_rate_limit_discard(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="refresh_panel_http_rate_limit_discard",
+        description="Verifikasi penanganan HTTP 429/5xx pada refresh() agar tidak membuang state.message aktif",
+        iterations=iterations,
+    )
+    discard_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild, vc = _create_mock_environment(guild_id=26000 + it)
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        mock_msg = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status = 429
+        mock_msg.edit = AsyncMock(side_effect=discord.HTTPException(mock_resp, "Rate limited"))
+        state.message = mock_msg
+
+        with patch("bot.asyncio.sleep", new=AsyncMock(return_value=None)):
+            await bot.refresh(state)
+            if state.refresh_task:
+                await state.refresh_task
+
+        if state.message is None:
+            discard_events += 1
+
+    if discard_events > 0:
+        res.anomalies.append(
+            f"Stale panel message discard terkonfirmasi: {discard_events}/{iterations} iterasi men-null-kan "
+            "state.message saat terjadi transient HTTP 429 rate limit sehingga kontrol panel aktif hilang."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"discard_events": discard_events}
+    return res
+
+
+# ==============================================================================
+# 57. DUMP RUNTIME STATE OFFLINE WRITER RACE (Wave 9)
+# ==============================================================================
+async def fuzz_dump_runtime_state_offline_writer_race(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="dump_runtime_state_offline_writer_race",
+        description="Fuzzing race condition out-of-order write antara dump_runtime_state_offline dan background writer",
+        iterations=iterations,
+    )
+    race_events = 0
+
+    for it in range(iterations):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            s_path = os.path.join(tmpdir, "state.json")
+            l_path = os.path.join(tmpdir, "listeners.json")
+
+            with bot_module._RUNTIME_STATE_LOCK:
+                bot_module._RUNTIME_STATE_LAST_SEQ = 10
+                bot_module._RUNTIME_LISTENERS_LAST_SEQ = 10
+
+            with patch.dict(os.environ, {"BOT_STATE_FILE": s_path}):
+                bot_module.dump_runtime_state_offline()
+
+            with bot_module._RUNTIME_STATE_LOCK:
+                seq_state = bot_module._RUNTIME_STATE_LAST_SEQ
+                seq_listeners = bot_module._RUNTIME_LISTENERS_LAST_SEQ
+
+            if seq_state <= 10 or seq_listeners <= 10:
+                delayed_seq = 11
+                tmp_delayed = f"{l_path}.delayed.tmp"
+                with open(tmp_delayed, "w", encoding="utf-8") as f:
+                    json.dump({"active_listeners": 1}, f)
+
+                with bot_module._RUNTIME_STATE_LOCK:
+                    if delayed_seq >= bot_module._RUNTIME_LISTENERS_LAST_SEQ:
+                        os.replace(tmp_delayed, l_path)
+
+                if os.path.exists(l_path):
+                    race_events += 1
+
+    if race_events > 0:
+        res.anomalies.append(
+            f"Race condition dump_runtime_state_offline terkonfirmasi: {race_events}/{iterations} iterasi membiarkan "
+            "background writer menimpa listeners.json pasca shutdown karena sequence tidak di-bump secara atomik."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"race_events": race_events}
+    return res
+
+
+# ==============================================================================
+# 58. SAFEDEQUE CONTAINS MUTATION RACE (Wave 9)
+# ==============================================================================
+async def fuzz_safedeque_contains_mutation_race(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="safedeque_contains_mutation_race",
+        description="Fuzzing keanggotaan 'in' pada SafeDeque saat mutasi konkuren tanpa proteksi exception",
+        iterations=iterations,
+    )
+    contains_race_events = 0
+
+    for it in range(iterations):
+        sd = bot_module.SafeDeque()
+        for i in range(200):
+            sd.append(Track(f"Track-{i}", f"http://url/{i}", "user"))
+
+        has_custom_contains = "__contains__" in bot_module.SafeDeque.__dict__
+        if not has_custom_contains:
+            contains_race_events += 1
+        else:
+            stop_flag = threading.Event()
+            mutation_error = False
+
+            def mutator():
+                while not stop_flag.is_set():
+                    try:
+                        sd.append(Track("New", "http://new", "u"))
+                        sd.popleft()
+                    except Exception:
+                        pass
+
+            t = threading.Thread(target=mutator)
+            t.start()
+            try:
+                target = Track("Target", "http://target", "u")
+                for _ in range(500):
+                    _ = target in sd
+            except RuntimeError:
+                mutation_error = True
+            finally:
+                stop_flag.set()
+                t.join()
+
+            if mutation_error:
+                contains_race_events += 1
+
+    if contains_race_events > 0:
+        res.anomalies.append(
+            f"Unhandled SafeDeque.__contains__ race terkonfirmasi: {contains_race_events}/{iterations} iterasi "
+            "memanggil deque.__contains__ bawaan CPython tanpa retry/proteksi saat mutasi konkuren (RuntimeError unhandled)."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"contains_race_events": contains_race_events}
+    return res
+
+
+# ==============================================================================
+# 59. PANEL EMPTY QUEUE VOICE STRANDED (Wave 9)
+# ==============================================================================
+async def fuzz_panel_empty_queue_voice_stranded(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_empty_queue_voice_stranded",
+        description="Verifikasi penjadwalan idle disconnect pada tombol skip/back/pause saat antrian dan audio kosong",
+        iterations=iterations,
+    )
+    stranded_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild, vc = _create_mock_environment(guild_id=27000 + it)
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+
+        state = QueueState()
+        state.current = None
+        state.queue.clear()
+        state.history.clear()
+        state.idle_task = None
+        bot.states[guild.id] = state
+
+        panel = MusicPanel(bot)
+        panel.guard = AsyncMock(return_value=True)
+
+        user_ch = MagicMock()
+        user_ch.id = vc.channel.id
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.guild = guild
+        interaction.user = MagicMock()
+        interaction.user.voice = MagicMock(channel=user_ch)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        await panel.skip.callback(interaction)
+
+        if state.idle_task is None and not (vc.is_playing() or vc.is_paused()) and state.current is None:
+            stranded_events += 1
+
+    if stranded_events > 0:
+        res.anomalies.append(
+            f"Voice client stranded terkonfirmasi: {stranded_events}/{iterations} iterasi tidak menjadwalkan "
+            "idle disconnect pada tombol skip/back/pause saat antrian kosong sehingga bot tertahan di voice channel selamanya."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"stranded_events": stranded_events}
+    return res
+
+
+# ==============================================================================
+# 60. EMPTY ROOM DUAL TIMER COLLISION (Wave 9)
+# ==============================================================================
+async def fuzz_empty_room_dual_timer_collision(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="empty_room_dual_timer_collision",
+        description="Fuzzing dual timer collision (afk_task dan idle_task) di room kosong dan retensi idle_task saat user kembali",
+        iterations=iterations,
+    )
+    collision_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild, vc = _create_mock_environment(guild_id=28000 + it)
+        vc.channel.members = [MagicMock(bot=True)]
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+
+        state = QueueState()
+        state.current = None
+        state.queue.clear()
+        bot.states[guild.id] = state
+
+        with patch("bot.asyncio.sleep", new=AsyncMock(return_value=None)):
+            await bot.advance(guild)
+
+            both_scheduled = (state.afk_task is not None) and (state.idle_task is not None)
+
+            human_member = MagicMock()
+            human_member.bot = False
+            human_member.guild = guild
+            before = MagicMock(channel=None)
+            after = MagicMock(channel=vc.channel)
+
+            await bot.on_voice_state_update(human_member, before, after)
+
+            idle_not_cancelled = state.idle_task is not None and not state.idle_task.done()
+
+            if both_scheduled or idle_not_cancelled:
+                collision_events += 1
+
+    if collision_events > 0:
+        res.anomalies.append(
+            f"Dual timer collision terkonfirmasi: {collision_events}/{iterations} iterasi menjadwalkan afk_task "
+            "dan idle_task sekaligus di room kosong, dan idle_task tidak dibatalkan saat user kembali sehingga memutus koneksi bot."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"collision_events": collision_events}
+    return res
+
+
+# ==============================================================================
+# 61. TRACKS FROM METADATA WEB URL CACHING (Wave 9)
+# ==============================================================================
+async def fuzz_tracks_from_metadata_web_url_caching(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="tracks_from_metadata_web_url_caching",
+        description="Verifikasi filtering URL web YouTube (/embed/, /live/, /v/) agar tidak di-cache sebagai stream_url",
+        iterations=iterations,
+    )
+    false_cache_events = 0
+
+    bad_urls = [
+        "https://www.youtube.com/embed/dQw4w9WgXcQ",
+        "https://www.youtube.com/live/dQw4w9WgXcQ",
+        "https://www.youtube.com/v/dQw4w9WgXcQ",
+    ]
+
+    for it in range(iterations):
+        for u in bad_urls:
+            raw_data = {
+                "title": "Test Title",
+                "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "url": u,
+                "duration": 180,
+            }
+            tracks = bot_module._tracks_from_metadata(raw_data, "user", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            if tracks and tracks[0].stream_url is not None:
+                false_cache_events += 1
+
+    if false_cache_events > 0:
+        res.anomalies.append(
+            f"False caching stream URL terkonfirmasi: {false_cache_events}/{iterations * len(bad_urls)} percobaan "
+            "menyimpan URL halaman web YouTube (/embed/, /live/, /v/) sebagai stream_url mentah sehingga ffmpeg gagal memutar."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"false_cache_events": false_cache_events}
+    return res
+
+
+# ==============================================================================
+# 62. BUFFERED AUDIO SOURCE READER CLEANUP FALSE ERROR (Wave 9)
+# ==============================================================================
+async def fuzz_buffered_audio_source_reader_cleanup_false_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="buffered_audio_source_reader_cleanup_false_error",
+        description="Verifikasi pencegahan pencatatan _current_error pada BufferedAudioSource saat normal cleanup",
+        iterations=iterations,
+    )
+    false_error_events = 0
+
+    for it in range(iterations):
+        mock_source = MagicMock(spec=discord.AudioSource)
+        closed = threading.Event()
+        reading_event = threading.Event()
+
+        def mock_read():
+            reading_event.set()
+            if closed.wait(timeout=0.1):
+                raise ValueError("I/O operation on closed pipe")
+            return b"\x00" * 3840
+
+        def mock_cleanup():
+            closed.set()
+
+        mock_source.read = mock_read
+        mock_source.cleanup = mock_cleanup
+        mock_source.is_opus.return_value = False
+
+        bas = BufferedAudioSource(mock_source)
+        reading_event.wait(timeout=0.5)
+        bas.cleanup()
+        time.sleep(0.01)
+
+        err = _source_error(bas)
+        if err is not None:
+            false_error_events += 1
+
+    if false_error_events > 0:
+        res.anomalies.append(
+            f"False positive audio error terkonfirmasi: {false_error_events}/{iterations} iterasi mencatat "
+            "penutupan ffmpeg normal sebagai _current_error sehingga memicu kenaikan consecutive_playback_errors dan false circuit breaker trip."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"false_error_events": false_error_events}
+    return res
+
+
+# ==============================================================================
+# 63. CMD QUEUE AND PLAYLIST LOCK CONTENTION (Wave 9)
+# ==============================================================================
+async def fuzz_cmd_queue_and_playlist_lock_contention(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_queue_and_playlist_lock_contention",
+        description="Fuzzing penahanan state.lock selama network I/O Discord API di cmd_queue dan MusicPanel.playlist",
+        iterations=iterations,
+    )
+    contention_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild, vc = _create_mock_environment(guild_id=29000 + it)
+        state = QueueState()
+        state.current = None
+        state.queue.clear()
+        bot.states[guild.id] = state
+
+        lock_held_in_queue = False
+        interaction1 = MagicMock(spec=discord.Interaction)
+        interaction1.guild = guild
+        interaction1.response.defer = AsyncMock()
+
+        async def mock_followup_send(*args, **kwargs):
+            nonlocal lock_held_in_queue
+            if state.lock.locked():
+                lock_held_in_queue = True
+
+        interaction1.followup.send = mock_followup_send
+        await bot.cmd_queue(interaction1)
+
+        lock_held_in_playlist = False
+        interaction2 = MagicMock(spec=discord.Interaction)
+        interaction2.guild = guild
+
+        async def mock_send_modal(*args, **kwargs):
+            nonlocal lock_held_in_playlist
+            if state.lock.locked():
+                lock_held_in_playlist = True
+
+        interaction2.response.send_modal = mock_send_modal
+        panel = MusicPanel(bot)
+        await panel.playlist.callback(interaction2)
+
+        if lock_held_in_queue or lock_held_in_playlist:
+            contention_events += 1
+
+    if contention_events > 0:
+        res.anomalies.append(
+            f"Blocking event loop lock contention terkonfirmasi: {contention_events}/{iterations} iterasi menahan "
+            "state.lock selama network I/O Discord API (followup.send / send_modal) sehingga memblokir pemutaran audio di STB ARM."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"contention_events": contention_events}
+    return res
+
+
+# ==============================================================================
+# 64. SYNCED GUILDS RETENTION ON GUILD REMOVE (Wave 9)
+# ==============================================================================
+async def fuzz_synced_guilds_retention_on_guild_remove(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="synced_guilds_retention_on_guild_remove",
+        description="Verifikasi pembersihan _synced_guilds pada on_guild_remove agar slash command sinkron saat re-invite",
+        iterations=iterations,
+    )
+    desync_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild, vc = _create_mock_environment(guild_id=30000 + it)
+        bot._synced_guilds.add(guild.id)
+
+        await bot.on_guild_remove(guild)
+
+        is_retained = guild.id in bot._synced_guilds
+
+        bot.tree.sync = AsyncMock()
+        await bot.on_guild_join(guild)
+
+        sync_called = bot.tree.sync.called
+
+        if is_retained or not sync_called:
+            desync_events += 1
+
+    if desync_events > 0:
+        res.anomalies.append(
+            f"Permanent command desync terkonfirmasi: {desync_events}/{iterations} iterasi tidak mereset "
+            "_synced_guilds di on_guild_remove sehingga slash commands tidak pernah disinkronkan kembali saat bot di-invite ulang."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"desync_events": desync_events}
+    return res
+
+
+# ==============================================================================
+# 65. PANEL LOGOUT SERVER SESSION REVOCATION (Wave 9)
+# ==============================================================================
+async def fuzz_panel_logout_server_session_revocation(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_logout_server_session_revocation",
+        description="Verifikasi pembatalan token di tabel server-side _sessions saat mengakses endpoint /logout",
+        iterations=iterations,
+    )
+    leak_events = 0
+
+    for it in range(iterations):
+        token = f"session_test_token_{it}_{time.time()}"
+        panel_module._sessions[token] = time.time() + 3600.0
+
+        orig_pw = panel_module.PASSWORD
+        panel_module.PASSWORD = "validpassword"
+        try:
+            handler = panel_module.Handler.__new__(panel_module.Handler)
+            handler.path = "/logout"
+            handler.headers = {"Cookie": f"{panel_module.COOKIE}={token}", "Host": "127.0.0.1:9130"}
+            handler._host_ok = MagicMock(return_value=True)
+            handler._redirect = MagicMock(return_value="redirect_ok")
+            handler.log_message = MagicMock()
+
+            handler.do_GET()
+
+            token_still_active = token in panel_module._sessions
+            if token_still_active:
+                leak_events += 1
+        finally:
+            panel_module.PASSWORD = orig_pw
+            panel_module._sessions.pop(token, None)
+
+    if leak_events > 0:
+        res.anomalies.append(
+            f"Server-side session leak terkonfirmasi: {leak_events}/{iterations} iterasi membiarkan token sesi tetap aktif "
+            "di tabel _sessions server pasca /logout sehingga rentan replay attack hingga 12 jam."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"leak_events": leak_events}
+    return res
+
+
+# ==============================================================================
+# 66. PANEL UPDATE CACHE INVALIDATION (Wave 9)
+# ==============================================================================
+async def fuzz_panel_update_cache_invalidation(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_update_cache_invalidation",
+        description="Verifikasi pembersihan _state_cache dan _log_cache pasca eksekusi pembaruan /update pada panel.py",
+        iterations=iterations,
+    )
+    stale_cache_events = 0
+
+    for it in range(iterations):
+        with panel_module._state_cache_lock:
+            panel_module._state_cache["bot"] = (time.monotonic() + 15.0, "OLD_BOT_STATE")
+        with panel_module._log_cache_lock:
+            panel_module._log_cache["journal"] = (time.monotonic() + 15.0, "OLD_JOURNAL_LOG")
+
+        handler = panel_module.Handler.__new__(panel_module.Handler)
+        handler.log_message = MagicMock()
+        handler.log_exception = MagicMock()
+        handler._set_flash = MagicMock()
+        handler._redirect = MagicMock(return_value="redirect_ok")
+
+        orig_run_update = panel_module.run_update
+        panel_module.run_update = lambda: (True, "yt-dlp updated successfully")
+        try:
+            handler._update()
+
+            with panel_module._state_cache_lock:
+                has_stale_state = "bot" in panel_module._state_cache
+            with panel_module._log_cache_lock:
+                has_stale_log = "journal" in panel_module._log_cache
+
+            if has_stale_state or has_stale_log:
+                stale_cache_events += 1
+        finally:
+            panel_module.run_update = orig_run_update
+            with panel_module._state_cache_lock:
+                panel_module._state_cache.clear()
+            with panel_module._log_cache_lock:
+                panel_module._log_cache.clear()
+
+    if stale_cache_events > 0:
+        res.anomalies.append(
+            f"Stale cache pasca /update terkonfirmasi: {stale_cache_events}/{iterations} iterasi membiarkan "
+            "_state_cache dan _log_cache tetap tersimpan pasca update yt-dlp sehingga tampilan web panel kadaluarsa hingga 15 detik."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"stale_cache_events": stale_cache_events}
+    return res
+
+
+# ==============================================================================
 # RUNNER
 # ==============================================================================
 ALL_SCENARIOS = {
@@ -3257,6 +3891,19 @@ ALL_SCENARIOS = {
     "panel_stale_log_cache_post_service_action": fuzz_panel_stale_log_cache_post_service_action,
     "release_extract_slot_underflow": fuzz_release_extract_slot_underflow,
     "idle_disconnect_task_leak_finally": fuzz_idle_disconnect_task_leak_finally,
+    # Wave 9 Additions
+    "announce_now_playing_fallback_channel_mismatch": fuzz_announce_now_playing_fallback_channel_mismatch,
+    "refresh_panel_http_rate_limit_discard": fuzz_refresh_panel_http_rate_limit_discard,
+    "dump_runtime_state_offline_writer_race": fuzz_dump_runtime_state_offline_writer_race,
+    "safedeque_contains_mutation_race": fuzz_safedeque_contains_mutation_race,
+    "panel_empty_queue_voice_stranded": fuzz_panel_empty_queue_voice_stranded,
+    "empty_room_dual_timer_collision": fuzz_empty_room_dual_timer_collision,
+    "tracks_from_metadata_web_url_caching": fuzz_tracks_from_metadata_web_url_caching,
+    "buffered_audio_source_reader_cleanup_false_error": fuzz_buffered_audio_source_reader_cleanup_false_error,
+    "cmd_queue_and_playlist_lock_contention": fuzz_cmd_queue_and_playlist_lock_contention,
+    "synced_guilds_retention_on_guild_remove": fuzz_synced_guilds_retention_on_guild_remove,
+    "panel_logout_server_session_revocation": fuzz_panel_logout_server_session_revocation,
+    "panel_update_cache_invalidation": fuzz_panel_update_cache_invalidation,
 }
 
 
@@ -3273,7 +3920,7 @@ async def run_all(scenarios: list[str], iterations: int) -> list[FuzzScenarioRes
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 8)")
+    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 9)")
     parser.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
     parser.add_argument("--iterations", type=int, default=10, help="Jumlah iterasi fuzzing per skenario")
     parser.add_argument("--json", action="store_true", help="Format output sebagai JSON")
@@ -3288,7 +3935,7 @@ def main():
         return
 
     print("\n" + "=" * 76)
-    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 8)")
+    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 9)")
     print("=" * 76)
 
     total_passed = 0

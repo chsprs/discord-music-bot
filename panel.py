@@ -278,6 +278,13 @@ def _session_valid(token: str) -> bool:
         return True
 
 
+def _revoke_session(token: str) -> None:
+    if not token:
+        return
+    with _lock:
+        _sessions.pop(token, None)
+
+
 
 def store() -> ConfigStore:
     return STORE if STORE is not None else ConfigStore(CONFIG_PATH)
@@ -800,6 +807,13 @@ class Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
+    def _revoke_session_from_cookie(self) -> None:
+        raw = self.headers.get('Cookie', '')
+        for part in raw.split(';'):
+            name, _, value = part.strip().partition('=')
+            if name == COOKIE and value:
+                _revoke_session(value)
+
     MAX_BODY = 65536
 
     def _host_ok(self, host: str) -> bool:
@@ -960,6 +974,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._login_page()
         if path == '/logout':
             if PASSWORD:
+                self._revoke_session_from_cookie()
                 cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
                 return self._redirect('/login', {'Set-Cookie': cookie})
             return self._redirect('/')
@@ -1035,6 +1050,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._login(fields)
         if path == '/logout':
             if PASSWORD:
+                self._revoke_session_from_cookie()
                 cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
                 return self._redirect('/login', {'Set-Cookie': cookie})
             return self._redirect('/')
@@ -1279,6 +1295,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _update(self):
         ok, out = run_update()
+        with _state_cache_lock:
+            _state_cache.pop('bot', None)
+        with _log_cache_lock:
+            _log_cache.clear()
         if ok:
             self._set_flash(f'Pembaruan yt-dlp berhasil dijalankan.\n{out}')
         else:
