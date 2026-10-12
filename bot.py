@@ -197,7 +197,8 @@ def _reserve_extract_slot() -> bool:
 def _release_extract_slot() -> None:
     global _EXTRACT_THREADS
     with _EXTRACT_THREADS_LOCK:
-        _EXTRACT_THREADS -= 1
+        if _EXTRACT_THREADS > 0:
+            _EXTRACT_THREADS -= 1
 
 
 class _ExtractSlot:
@@ -397,6 +398,7 @@ def _with_cookies(options: dict) -> dict:
 _RUNTIME_STATE_LOCK = threading.Lock()
 _RUNTIME_STATE_SEQ = 0
 _RUNTIME_STATE_LAST_SEQ = 0
+_RUNTIME_LISTENERS_LAST_SEQ = 0
 
 
 def dump_runtime_state(bot) -> None:
@@ -465,7 +467,7 @@ def dump_runtime_state(bot) -> None:
         listeners_payload = {"total_listeners": total_listeners, "updated_at": time.time()}
 
         def _do_write():
-            global _RUNTIME_STATE_LAST_SEQ
+            global _RUNTIME_STATE_LAST_SEQ, _RUNTIME_LISTENERS_LAST_SEQ
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 l_tmp_path = f"{listeners_path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
@@ -474,7 +476,8 @@ def dump_runtime_state(bot) -> None:
                         json.dump(listeners_payload, f)
                     os.chmod(l_tmp_path, 0o644)
                     with _RUNTIME_STATE_LOCK:
-                        if seq >= _RUNTIME_STATE_LAST_SEQ:
+                        if seq >= _RUNTIME_LISTENERS_LAST_SEQ:
+                            _RUNTIME_LISTENERS_LAST_SEQ = seq
                             os.replace(l_tmp_path, listeners_path)
                 finally:
                     if os.path.exists(l_tmp_path):
@@ -520,6 +523,12 @@ def dump_runtime_state_offline() -> None:
     try:
         if os.path.exists(path):
             os.remove(path)
+    except Exception:
+        pass
+    listeners_path = os.path.join(os.path.dirname(path), "listeners.json")
+    try:
+        if os.path.exists(listeners_path):
+            os.remove(listeners_path)
     except Exception:
         pass
 
@@ -1183,6 +1192,11 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
                 perms = voice.channel.permissions_for(interaction.guild.me) if interaction.guild.me else None
                 if perms is not None and (not getattr(perms, 'connect', True) or not getattr(perms, 'speak', True)):
                     return await interaction.followup.send('Bot butuh izin Connect + Speak di channel ini.', ephemeral=True)
+                if vc:
+                    try:
+                        await vc.disconnect(force=True)
+                    except Exception:
+                        pass
                 conn_res = voice.channel.connect(timeout=20, self_deaf=True)
                 vc = await conn_res if hasattr(conn_res, '__await__') else conn_res
             except (asyncio.TimeoutError, TimeoutError):
@@ -1361,6 +1375,11 @@ class MusicPanel(discord.ui.View):
                     else:
                         await interaction.followup.send(msg, ephemeral=True)
                     return False
+                if vc:
+                    try:
+                        await vc.disconnect(force=True)
+                    except Exception:
+                        pass
                 if not interaction.response.is_done():
                     try:
                         await interaction.response.defer(ephemeral=True)
@@ -1863,6 +1882,7 @@ class MusicBot(discord.Client):
                 restored_guilds += 1
         if restored_guilds > 0:
             log.info('Persistent queue berhasil dipulihkan untuk %d guild.', restored_guilds)
+            self._save_persistent_queue()
 
     async def _stop_player(self, guild: discord.Guild) -> None:
         """Hentikan player + bump generation agar after() basi tidak fire (C7)."""
@@ -2092,7 +2112,15 @@ class MusicBot(discord.Client):
         target_channel = channel or getattr(msg, 'channel', None)
         if not target_channel and guild and hasattr(guild, 'get_channel'):
             ch_id = getattr(msg, 'channel_id', None)
-            if ch_id:
+            if not ch_id and hasattr(self, 'states'):
+                st = self.states.get(getattr(guild, 'id', None))
+                if st:
+                    ch_id = getattr(st, 'text_channel_id', None)
+                    if not ch_id and getattr(st, 'message', None):
+                        ch_id = getattr(getattr(st.message, 'channel', None), 'id', None)
+                    if not target_channel and getattr(st, 'message', None):
+                        target_channel = getattr(st.message, 'channel', None)
+            if ch_id and not target_channel:
                 try:
                     target_channel = guild.get_channel(int(ch_id))
                 except (ValueError, TypeError):
@@ -2252,7 +2280,7 @@ class MusicBot(discord.Client):
                     if existing:
                         state.message = None
                         try:
-                            await existing.delete()
+                            await self._safe_delete_msg(existing, channel=channel, guild=interaction.guild)
                         except Exception:
                             pass
                     try:
@@ -2412,14 +2440,14 @@ class MusicBot(discord.Client):
                     state.message = None
             if announce_task and not announce_task.done() and announce_task is not current:
                 announce_task.cancel()
+            ch = getattr(old_message, 'channel', None)
+            if not ch and getattr(state, 'text_channel_id', None) and hasattr(guild, 'get_channel'):
+                ch = guild.get_channel(state.text_channel_id)
+            if not ch and hasattr(guild, 'text_channels') and guild.text_channels:
+                ch = guild.text_channels[0]
             if old_now_message is not None:
-                await self._safe_delete_msg(old_now_message, guild=guild)
+                await self._safe_delete_msg(old_now_message, channel=ch, guild=guild)
             if delete_panel and old_message is not None:
-                ch = getattr(old_message, 'channel', None)
-                if not ch and getattr(state, 'text_channel_id', None) and hasattr(guild, 'get_channel'):
-                    ch = guild.get_channel(state.text_channel_id)
-                if not ch and hasattr(guild, 'text_channels') and guild.text_channels:
-                    ch = guild.text_channels[0]
                 await self._safe_delete_msg(old_message, channel=ch, guild=guild)
         vc = getattr(guild, 'voice_client', None)
         if vc:
@@ -2658,7 +2686,7 @@ class MusicBot(discord.Client):
             old_msg = state.message
             state.message = None
             try:
-                await old_msg.delete()
+                await self._safe_delete_msg(old_msg, channel=interaction.channel, guild=interaction.guild)
             except Exception:
                 pass
 
@@ -2942,6 +2970,11 @@ class MusicBot(discord.Client):
                     def after(error, _gen=generation):
                         if error:
                             log.error('Audio playback error: %s', error)
+                            try:
+                                next_track.stream_url = None
+                                next_track.stream_ts = 0
+                            except Exception:
+                                pass
                         # Skip/back manual: after() dari vc.stop() diabaikan,
                         # advance manual di handler yang jalan — anti dobel.
                         async def _after_dispatch():
@@ -2959,6 +2992,9 @@ class MusicBot(discord.Client):
                             if error:
                                 circuit_broken = False
                                 async with st.lock:
+                                    if st.current:
+                                        st.current.stream_url = None
+                                        st.current.stream_ts = 0
                                     st.consecutive_playback_errors = getattr(st, 'consecutive_playback_errors', 0) + 1
                                     if st.consecutive_playback_errors >= MAX_TRACK_RETRIES:
                                         circuit_broken = True
@@ -3102,20 +3138,20 @@ class MusicBot(discord.Client):
         state = self.states.get(guild.id)
         if state is None or track is None:
             return
+        panel_msg = getattr(state, 'message', None)
+        channel = getattr(panel_msg, 'channel', None) if panel_msg else None
+        if channel is None and getattr(state, 'text_channel_id', None):
+            if hasattr(guild, 'get_channel'):
+                channel = guild.get_channel(state.text_channel_id)
+            if channel is None and hasattr(self, 'get_channel'):
+                channel = self.get_channel(state.text_channel_id)
         old = getattr(state, 'now_message', None)
         if old is not None:
             await self._safe_delete_msg(old, guild=guild)
             state.now_message = None
-        panel_msg = getattr(state, 'message', None)
         if panel_msg is None:
             return
         try:
-            channel = getattr(panel_msg, 'channel', None)
-            if channel is None and getattr(state, 'text_channel_id', None):
-                if hasattr(guild, 'get_channel'):
-                    channel = guild.get_channel(state.text_channel_id)
-                if channel is None and hasattr(self, 'get_channel'):
-                    channel = self.get_channel(state.text_channel_id)
             if channel is None:
                 return
             state.now_message = await channel.send(
@@ -3192,6 +3228,16 @@ class MusicBot(discord.Client):
                 await self.quit_voice(guild, clear_queue=False)
         except asyncio.CancelledError:
             pass
+        finally:
+            st = self.states.get(guild.id)
+            if st:
+                try:
+                    if st.idle_task and st.idle_task.done():
+                        st.idle_task = None
+                    elif st.idle_task is asyncio.current_task():
+                        st.idle_task = None
+                except Exception:
+                    pass
 
     async def on_voice_state_update(self, member, before, after):
         guild = getattr(member, 'guild', None)
@@ -3283,7 +3329,7 @@ class MusicBot(discord.Client):
                 state.afk_paused = False
                 await self.refresh(state)
                 dump_runtime_state(self)
-            elif not getattr(vc, 'is_playing', lambda: False)() and not getattr(vc, 'is_paused', lambda: False)() and (state.current or state.queue):
+            elif not getattr(vc, 'is_playing', lambda: False)() and not getattr(vc, 'is_paused', lambda: False)() and (state.current or state.queue or state.autoplay):
                 try:
                     asyncio.get_running_loop().create_task(self.advance(guild))
                 except RuntimeError:

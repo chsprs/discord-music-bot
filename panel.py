@@ -1314,6 +1314,8 @@ class Handler(BaseHTTPRequestHandler):
         self.log_message('systemctl %s ok', action)
         with _state_cache_lock:
             _state_cache.pop('bot', None)
+        with _log_cache_lock:
+            _log_cache.clear()
         self._set_flash(labels.get(action, 'Selesai.'))
         return self._redirect('/')
 

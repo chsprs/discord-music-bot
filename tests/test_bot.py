@@ -2342,8 +2342,8 @@ class PersistentQueueTests(unittest.TestCase):
             self.assertEqual(restored_state.queue[0].title, 'Lagu Antri 1')
             self.assertEqual(restored_state.queue[1].title, 'Lagu Antri 2')
 
-            # Berkas harus dihapus/dibersihkan setelah restore berhasil
-            self.assertFalse(os.path.exists(queue_file))
+            # Berkas di-repersist setelah restore agar tahan restart/crash berikutnya
+            self.assertTrue(os.path.exists(queue_file))
 
     def test_persistent_queue_corrupt_json_fallback(self):
         """Persistent Queue: Handling JSON corrupt ditangani anggun tanpa crash dan berkas dibersihkan."""
@@ -4641,3 +4641,256 @@ class Wave7RemediationTests(unittest.TestCase):
             asyncio.run(bot._advance_loop(guild, state, vc))
             self.assertFalse(vc.play.called)
             self.assertFalse(mock_sf.called)
+
+    def test_wave8_ghost_vc_disconnect_search_modal_and_panel_guard(self):
+        """Wave 8: SearchModal.on_submit dan MusicPanel.guard memutus ghost vc sebelum connect."""
+        bot = MusicBot()
+        guild = MagicMock(id=99501)
+        ghost_vc = MagicMock(channel=None)
+        ghost_vc.disconnect = AsyncMock()
+        guild.voice_client = ghost_vc
+
+        user_ch = MagicMock(id=1122)
+        user_ch.permissions_for.return_value = MagicMock(connect=True, speak=True)
+        user_ch.connect = AsyncMock(return_value=ghost_vc)
+
+        # 1. SearchModal
+        interaction = MagicMock(guild=guild)
+        interaction.user.voice.channel = user_ch
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        modal = SearchModal(bot)
+        modal.query = "https://youtube.com/watch?v=valid"
+
+        with patch("bot.extract_tracks", new=AsyncMock(return_value=[Track("M", "u", "r")])), \
+             patch.object(bot, "_enqueue_tracks", new=AsyncMock(return_value=True)), \
+             patch.object(bot, "refresh", new=AsyncMock()):
+            asyncio.run(modal.on_submit(interaction))
+            self.assertTrue(ghost_vc.disconnect.called)
+
+        # 2. MusicPanel.guard
+        ghost_vc.disconnect.reset_mock()
+        panel_interaction = MagicMock(guild=guild)
+        panel_interaction.user.voice.channel = user_ch
+        panel_interaction.response.is_done.return_value = False
+        panel_interaction.response.defer = AsyncMock()
+        panel = MusicPanel(bot)
+        asyncio.run(panel.guard(panel_interaction, require_voice=True))
+        self.assertTrue(ghost_vc.disconnect.called)
+
+    def test_wave8_restore_persistent_queue_repersists_on_disk(self):
+        """Wave 8: _restore_persistent_queue memanggil _save_persistent_queue agar state tidak hilang."""
+        bot = MusicBot()
+        bot._save_persistent_queue = MagicMock()
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as tf:
+            json.dump({"12345": {"queue": [{"title": "Restored", "url": "http://u"}]}}, tf)
+            path = tf.name
+
+        try:
+            with patch("bot._persistent_queue_file", return_value=path):
+                bot._restore_persistent_queue()
+            self.assertTrue(bot._save_persistent_queue.called)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_wave8_listeners_seq_atomic_update(self):
+        """Wave 8: _RUNTIME_LISTENERS_LAST_SEQ diperbarui saat penulisan listeners.json."""
+        import bot as bot_mod
+        with bot_mod._RUNTIME_STATE_LOCK:
+            bot_mod._RUNTIME_LISTENERS_LAST_SEQ = 0
+            bot_mod._RUNTIME_STATE_LAST_SEQ = 0
+
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = os.path.join(tmpdir, "state.json")
+            with patch.dict(os.environ, {"BOT_STATE_FILE": state_file}):
+                bot_mod.dump_runtime_state(bot)
+                time.sleep(0.05)
+                with bot_mod._RUNTIME_STATE_LOCK:
+                    self.assertGreaterEqual(bot_mod._RUNTIME_LISTENERS_LAST_SEQ, 1)
+
+    def test_wave8_dump_runtime_state_offline_cleans_listeners(self):
+        """Wave 8: dump_runtime_state_offline menghapus state.json dan listeners.json."""
+        import bot as bot_mod
+        with tempfile.TemporaryDirectory() as tmpdir:
+            s_path = os.path.join(tmpdir, "state.json")
+            l_path = os.path.join(tmpdir, "listeners.json")
+            with open(s_path, "w") as f:
+                f.write("{}")
+            with open(l_path, "w") as f:
+                f.write("{}")
+
+            with patch.dict(os.environ, {"BOT_STATE_FILE": s_path}):
+                bot_mod.dump_runtime_state_offline()
+
+            self.assertFalse(os.path.exists(s_path))
+            self.assertFalse(os.path.exists(l_path))
+
+    def test_wave8_empty_room_user_return_restarts_autoplay(self):
+        """Wave 8: on_voice_state_update memanggil advance saat user kembali ke room kosong dan autoplay True."""
+        bot = MusicBot()
+        guild = MagicMock(id=99505)
+        vc = MagicMock()
+        human = MagicMock(bot=False, guild=guild, id=4433)
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+        vc.channel = MagicMock(id=8899)
+        vc.channel.members = [human]
+
+        state = QueueState()
+        state.current = None
+        state.queue.clear()
+        state.autoplay = True
+        state.afk_paused = False
+        bot.states[guild.id] = state
+
+        before = MagicMock(channel=None)
+        after = MagicMock(channel=vc.channel)
+
+        async def run_test():
+            with patch.object(bot, "advance", new=AsyncMock()) as mock_adv:
+                await bot.on_voice_state_update(human, before, after)
+                await asyncio.sleep(0.01)
+                self.assertTrue(mock_adv.called)
+        asyncio.run(run_test())
+
+    def test_wave8_stream_error_resets_cached_stream_url(self):
+        """Wave 8: stream playback error membatalkan next_track.stream_url dan st.current.stream_url."""
+        bot = MusicBot()
+        guild = MagicMock(id=99506, name="G99506")
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel = MagicMock(members=[MagicMock(bot=False)])
+        guild.voice_client = vc
+
+        state = QueueState()
+        track = Track("StreamTrack", "http://u", "user")
+        track.stream_url = "http://expired-cdn"
+        track.stream_ts = time.time()
+        state.queue.append(track)
+        bot.states[guild.id] = state
+
+        after_cb = None
+        def mock_play(src, after=None, **kwargs):
+            nonlocal after_cb
+            after_cb = after
+        vc.play = mock_play
+
+        with patch("bot.source_for", return_value=MagicMock()), \
+             patch.object(bot, "finished", new=AsyncMock()), \
+             patch.object(bot, "refresh", new=AsyncMock()), \
+             patch.object(bot, "_announce"):
+            asyncio.run(bot._advance_loop(guild, state, vc))
+            self.assertIsNotNone(after_cb)
+            after_cb(Exception("403 Forbidden"))
+            self.assertIsNone(track.stream_url)
+
+    def test_wave8_cmd_play_and_summon_safe_delete_integer_panel(self):
+        """Wave 8: cmd_play dan summon memanggil _safe_delete_msg untuk message ID bertipe integer."""
+        bot = MusicBot()
+        guild = MagicMock(id=99507)
+        vc = MagicMock(channel=MagicMock(id=7788))
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.message = 123456789
+        bot.states[guild.id] = state
+
+        user_ch = MagicMock(id=7788)
+        user_ch.permissions_for.return_value = MagicMock(connect=True, speak=True)
+        interaction = MagicMock(guild=guild)
+        interaction.channel = MagicMock(id=9900)
+        interaction.channel.send = AsyncMock()
+        interaction.user.voice.channel = user_ch
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch("bot.extract_tracks", new=AsyncMock(return_value=[Track("T", "u", "r")])), \
+             patch.object(bot, "_enqueue_tracks", new=AsyncMock(return_value=True)), \
+             patch.object(bot, "refresh", new=AsyncMock()), \
+             patch.object(bot, "_safe_delete_msg") as mock_safe_delete:
+            asyncio.run(bot.cmd_play(interaction, "http://u"))
+            self.assertTrue(mock_safe_delete.called)
+
+        state.message = 987654321
+        with patch.object(bot, "_safe_delete_msg") as mock_safe_delete_summon:
+            asyncio.run(bot.summon(interaction))
+            self.assertTrue(mock_safe_delete_summon.called)
+
+    def test_wave8_announce_now_playing_and_quit_voice_channel_resolution(self):
+        """Wave 8: _safe_delete_msg menyelesaikan target channel dari state.text_channel_id."""
+        bot = MusicBot()
+        guild = MagicMock(id=99508)
+        ch_target = MagicMock(spec=discord.TextChannel, id=5566)
+        guild.get_channel.return_value = ch_target
+        guild.text_channels = [MagicMock(id=1111)]
+
+        state = QueueState()
+        state.text_channel_id = 5566
+        state.now_message = 334455
+        state.message = MagicMock(channel=ch_target)
+        bot.states[guild.id] = state
+
+        with patch.object(bot, "_safe_delete_msg", wraps=bot._safe_delete_msg):
+            asyncio.run(bot._announce_now_playing(guild, Track("NewSong", "http://u", "user")))
+            self.assertTrue(ch_target.get_partial_message.called)
+
+        state.now_message = 998877
+        with patch.object(bot, "_safe_delete_msg", wraps=bot._safe_delete_msg):
+            asyncio.run(bot.quit_voice(guild, clear_queue=False))
+            self.assertTrue(ch_target.get_partial_message.called)
+
+    def test_wave8_panel_service_action_clears_log_cache(self):
+        """Wave 8: Handler._service pada panel.py membersihkan _log_cache pasca aksi service."""
+        import panel as panel_mod
+        with panel_mod._log_cache_lock:
+            panel_mod._log_cache["journal"] = (time.monotonic() + 15.0, "stale log")
+
+        handler = panel_mod.Handler.__new__(panel_mod.Handler)
+        handler.log_message = MagicMock()
+        handler.log_exception = MagicMock()
+        handler._set_flash = MagicMock()
+        handler._redirect = MagicMock(return_value="redirect_ok")
+        handler._page = MagicMock(return_value="page_err")
+
+        orig_runner = panel_mod.SERVICE_RUNNER
+        panel_mod.SERVICE_RUNNER = lambda act: (True, "ok")
+        try:
+            with patch.object(panel_mod.store(), "read", return_value={"token": "t"}):
+                handler._service("restart")
+            with panel_mod._log_cache_lock:
+                self.assertNotIn("journal", panel_mod._log_cache)
+        finally:
+            panel_mod.SERVICE_RUNNER = orig_runner
+
+    def test_wave8_release_extract_slot_underflow_guard(self):
+        """Wave 8: _release_extract_slot tidak mengurangi counter di bawah 0."""
+        import bot as bot_mod
+        with bot_mod._EXTRACT_THREADS_LOCK:
+            bot_mod._EXTRACT_THREADS = 0
+
+        bot_mod._release_extract_slot()
+        with bot_mod._EXTRACT_THREADS_LOCK:
+            self.assertEqual(bot_mod._EXTRACT_THREADS, 0)
+
+    def test_wave8_idle_disconnect_finally_cleans_idle_task(self):
+        """Wave 8: idle_disconnect membersihkan state.idle_task di blok finally."""
+        bot = MusicBot()
+        guild = MagicMock(id=99511)
+        state = QueueState()
+        state.generation = 1
+        state.current = Track("PlayingSong", "http://u", "user")
+        bot.states[guild.id] = state
+
+        async def run_idle():
+            task = asyncio.create_task(bot.idle_disconnect(guild, state.generation))
+            state.idle_task = task
+            with patch("bot.asyncio.sleep", new=AsyncMock(return_value=None)):
+                await task
+            self.assertIsNone(state.idle_task)
+
+        asyncio.run(run_idle())
