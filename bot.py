@@ -113,6 +113,7 @@ class QueueState:
     _last_skip_time: float = 0.0
     _last_pause_time: float = 0.0
     _last_back_time: float = 0.0
+    _last_volume_time: float = 0.0
 
 
 GuildState = QueueState
@@ -446,16 +447,30 @@ def dump_runtime_state(bot) -> None:
         def _do_write():
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                l_tmp_path = listeners_path + ".tmp"
-                with open(l_tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(listeners_payload, f)
-                os.chmod(l_tmp_path, 0o644)
-                os.replace(l_tmp_path, listeners_path)
+                l_tmp_path = f"{listeners_path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+                try:
+                    with open(l_tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(listeners_payload, f)
+                    os.chmod(l_tmp_path, 0o644)
+                    os.replace(l_tmp_path, listeners_path)
+                finally:
+                    if os.path.exists(l_tmp_path):
+                        try:
+                            os.remove(l_tmp_path)
+                        except Exception:
+                            pass
 
-                tmp_path = path + ".tmp"
-                with open(tmp_path, 'w', encoding='utf-8') as f:
-                    json.dump(payload, f)
-                os.replace(tmp_path, path)
+                tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+                try:
+                    with open(tmp_path, 'w', encoding='utf-8') as f:
+                        json.dump(payload, f)
+                    os.replace(tmp_path, path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
             except Exception as exc:
                 log.debug('Gagal menulis state runtime bot: %s', exc)
 
@@ -1375,6 +1390,10 @@ class MusicPanel(discord.ui.View):
         if not await self.guard(interaction):
             return
         state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        now = time.monotonic()
+        if now - getattr(state, '_last_volume_time', 0.0) < 0.3:
+            return await interaction.followup.send('Mohon tunggu sebentar sebelum mengatur volume lagi.', ephemeral=True)
+        state._last_volume_time = now
         await self.bot.change_volume(interaction, state.volume - 0.1)
 
     @discord.ui.button(label='Back', emoji='⏮️', style=discord.ButtonStyle.secondary, custom_id='music:back', row=0)
@@ -1504,6 +1523,10 @@ class MusicPanel(discord.ui.View):
         if not await self.guard(interaction):
             return
         state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        now = time.monotonic()
+        if now - getattr(state, '_last_volume_time', 0.0) < 0.3:
+            return await interaction.followup.send('Mohon tunggu sebentar sebelum mengatur volume lagi.', ephemeral=True)
+        state._last_volume_time = now
         await self.bot.change_volume(interaction, state.volume + 0.1)
 
     # ROW 1: Shuffle, Loop, Stop, AutoPlay, Playlist
@@ -1672,10 +1695,17 @@ class MusicBot(discord.Client):
 
                 try:
                     os.makedirs(os.path.dirname(path), exist_ok=True)
-                    tmp_path = path + ".tmp"
-                    with open(tmp_path, 'w', encoding='utf-8') as f:
-                        json.dump(payload, f)
-                    os.replace(tmp_path, path)
+                    tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+                    try:
+                        with open(tmp_path, 'w', encoding='utf-8') as f:
+                            json.dump(payload, f)
+                        os.replace(tmp_path, path)
+                    finally:
+                        if os.path.exists(tmp_path):
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
                 except Exception as exc:
                     log.debug('Gagal menulis persistent queue: %s', exc)
 
@@ -2149,6 +2179,12 @@ class MusicBot(discord.Client):
         except Exception as exc:
             log.warning('Pencarian gagal: %s', exc)
             await interaction.followup.send(f'Gagal mencari atau memproses lagu: {exc}', ephemeral=True)
+            state = self.states.get(interaction.guild.id)
+            if state is None:
+                state = QueueState()
+                self.states[interaction.guild.id] = state
+            if not state.current and not state.queue:
+                self._schedule_idle(interaction.guild, state.generation)
 
     async def cmd_skip(self, interaction: discord.Interaction):
         if not _check_guild_only(interaction):
@@ -2626,6 +2662,8 @@ class MusicBot(discord.Client):
         gen0 = state.generation  # F2: deteksi /stop atau reconnect di tengah jalan
         loop = asyncio.get_running_loop()
         consecutive_errors = 0
+        autoplay_candidates: list[Track] = []
+        autoplay_failed_urls: set[str] = set()
         while True:
             if consecutive_errors >= MAX_TRACK_RETRIES:
                 log.error('3 lagu berturut-turut gagal diputar di guild %s. Pemutaran dihentikan agar sisa %d lagu di antrian tidak hilang.', guild.name, len(state.queue))
@@ -2648,6 +2686,7 @@ class MusicBot(discord.Client):
                     break
 
             # --- fase 2: autoplay resolve di luar lock (M9) ---
+            is_autoplay = False
             if next_track is None and state.autoplay and (state.current or state.history):
                 try:
                     async with state.lock:
@@ -2661,16 +2700,24 @@ class MusicBot(discord.Client):
                         played_urls = {t.url for t in list(state.history)[-20:]}
                         if state.current:
                             played_urls.add(state.current.url)
-                    candidates = await fetch_recommendations(
-                        seed_titles, played_urls, seed_urls=seed_urls)
-                    async with state.lock:
-                        if state.queue:
-                            continue
-                    next_track = next((c for c in candidates
+                    played_urls.update(autoplay_failed_urls)
+
+                    next_track = next((c for c in autoplay_candidates
                                        if c.url not in played_urls), None)
+                    if next_track is None:
+                        candidates = await fetch_recommendations(
+                            seed_titles, played_urls, seed_urls=seed_urls)
+                        async with state.lock:
+                            if state.queue:
+                                continue
+                        autoplay_candidates = [c for c in candidates if c.url not in played_urls]
+                        next_track = next((c for c in autoplay_candidates
+                                           if c.url not in played_urls), None)
+
                     if next_track is None:
                         log.info('AutoPlay: tidak ada rekomendasi baru, pemutaran berhenti.')
                         break
+                    is_autoplay = True
                     log.info('AutoPlay (Mix) memilih: %s', next_track.title)
                 except Exception as exc:
                     log.warning('AutoPlay failed: %s', exc)
@@ -2720,9 +2767,9 @@ class MusicBot(discord.Client):
                                     state.queue.remove(next_track)
                                 except ValueError:
                                     pass
-                        elif state.loop_mode == 'track' and state.current is next_track:
-                            # Loop track: skip manual harus keluar dari track yang
-                            # sama, bukan mengulangnya lagi.
+                        elif state.loop_mode in ('track', 'queue') and state.current is next_track:
+                            # Loop track / single-track loop queue: skip manual harus keluar
+                            # dari track yang sama, bukan mengulangnya lagi.
                             state.current = None
                 if skip_now:
                     log.info('Skip saat ekstraksi: %s dilewati.', next_track.title)
@@ -2868,6 +2915,8 @@ class MusicBot(discord.Client):
             except Exception as exc:
                 consecutive_errors += 1
                 log.warning('Tidak bisa memutar (%d/3): %s (penyebab: %s)', consecutive_errors, next_track.title, exc)
+                if is_autoplay and next_track:
+                    autoplay_failed_urls.add(next_track.url)
                 async with state.lock:
                     # F1: konsumsi _skip_pending apa pun. Bila tidak, skip yang
                     # menargetkan track gagal ini tetap "menggantung" dan ikut
@@ -2883,6 +2932,13 @@ class MusicBot(discord.Client):
                             state.queue.append(next_track)
                         except ValueError:
                             pass
+                    elif state.current is next_track and len(state.queue) > 0:
+                        state.history.append(state.current)
+                        if len(state.history) > 20:
+                            state.history.popleft()
+                        state.current = None
+                    elif is_autoplay and any(c.url not in autoplay_failed_urls for c in autoplay_candidates):
+                        pass
                     else:
                         break
 
@@ -2913,10 +2969,7 @@ class MusicBot(discord.Client):
             return
         old = getattr(state, 'now_message', None)
         if old is not None:
-            try:
-                await old.delete()
-            except Exception:
-                pass
+            await self._safe_delete_msg(old, guild=guild)
             state.now_message = None
         panel_msg = getattr(state, 'message', None)
         if panel_msg is None:
@@ -2989,10 +3042,11 @@ class MusicBot(discord.Client):
                 return
             should_quit = False
             async with state.lock:
-                if state.generation == generation and state.current is None and not state.queue and guild.voice_client:
+                cb_tripped = getattr(state, 'consecutive_playback_errors', 0) >= MAX_TRACK_RETRIES
+                if state.generation == generation and state.current is None and (not state.queue or cb_tripped) and guild.voice_client:
                     should_quit = True
             if should_quit:
-                log.info('Idle 3 menit tanpa antrian di guild %s, bot keluar.', guild.name)
+                log.info('Idle 3 menit tanpa antrian aktif di guild %s, bot keluar.', guild.name)
                 await self.quit_voice(guild, clear_queue=False)
         except asyncio.CancelledError:
             pass
