@@ -371,23 +371,30 @@ def read_bot_logs(lines: int = 35) -> str:
 # menumpuk subprocess (M3). read_bot_logs() mentah tetap ada untuk pemanggilan
 # langsung/test; page render memakai versi ber-cache ini.
 LOG_CACHE_TTL = 15.0
+LOG_FRESH_DEBOUNCE_TTL = 1.0
 _log_cache: dict[str, tuple[float, str]] = {}
+_last_fresh_log_time: dict[str, float] = {}
 _log_cache_lock = threading.Lock()
 
 
 def read_bot_logs_cached(lines: int = 35, fresh: bool = False) -> str:
-    """read_bot_logs dengan cache TTL (M3). `fresh=True` melewati cache."""
+    """read_bot_logs dengan cache TTL (M3). `fresh=True` melewati cache dengan debounce 1s."""
     key = str(lines)
     started = time.monotonic()
-    if not fresh:
-        with _log_cache_lock:
-            hit = _log_cache.get(key)
-            if hit is not None and started - hit[0] < LOG_CACHE_TTL:
+    with _log_cache_lock:
+        hit = _log_cache.get(key)
+        if hit is not None:
+            if not fresh and started - hit[0] < LOG_CACHE_TTL:
+                return hit[1]
+            last_fresh = _last_fresh_log_time.get(key, 0.0)
+            if fresh and (started - last_fresh < LOG_FRESH_DEBOUNCE_TTL):
                 return hit[1]
     value = read_bot_logs(lines)
     finished = time.monotonic()
     with _log_cache_lock:
         _log_cache[key] = (finished, value)
+        if fresh:
+            _last_fresh_log_time[key] = finished
     return value
 
 
@@ -1299,6 +1306,7 @@ class Handler(BaseHTTPRequestHandler):
             _state_cache.pop('bot', None)
         with _log_cache_lock:
             _log_cache.clear()
+            _last_fresh_log_time.clear()
         if ok:
             self._set_flash(f'Pembaruan yt-dlp berhasil dijalankan.\n{out}')
         else:
@@ -1336,6 +1344,7 @@ class Handler(BaseHTTPRequestHandler):
             _state_cache.pop('bot', None)
         with _log_cache_lock:
             _log_cache.clear()
+            _last_fresh_log_time.clear()
         self._set_flash(labels.get(action, 'Selesai.'))
         return self._redirect('/')
 

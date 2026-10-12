@@ -65,8 +65,8 @@ class Track:
     duration: int = 0
     duration_str: str = "Unknown"
     author: str = "Unknown"
-    stream_url: str | None = None
-    stream_ts: float | None = None
+    stream_url: str | None = field(default=None, compare=False)
+    stream_ts: float | None = field(default=None, compare=False)
 
 
 DEFAULT_VOLUME = 0.5
@@ -498,6 +498,7 @@ def dump_runtime_state(bot) -> None:
                 try:
                     with open(tmp_path, 'w', encoding='utf-8') as f:
                         json.dump(payload, f)
+                    os.chmod(tmp_path, 0o644)
                     with _RUNTIME_STATE_LOCK:
                         if seq < _RUNTIME_STATE_LAST_SEQ:
                             return
@@ -530,8 +531,8 @@ def dump_runtime_state_offline() -> None:
             path = '/tmp/discord-music-state.json'
     global _RUNTIME_STATE_LAST_SEQ, _RUNTIME_LISTENERS_LAST_SEQ
     with _RUNTIME_STATE_LOCK:
-        _RUNTIME_STATE_LAST_SEQ += 1
-        _RUNTIME_LISTENERS_LAST_SEQ += 1
+        _RUNTIME_STATE_LAST_SEQ = max(_RUNTIME_STATE_SEQ, _RUNTIME_STATE_LAST_SEQ) + 1
+        _RUNTIME_LISTENERS_LAST_SEQ = max(_RUNTIME_STATE_SEQ, _RUNTIME_LISTENERS_LAST_SEQ) + 1
         try:
             if os.path.exists(path):
                 os.remove(path)
@@ -1036,13 +1037,14 @@ class BufferedAudioSource(discord.AudioSource):
             self.source.cleanup()
         except Exception:
             pass
-        try:
-            while True:
-                self.queue.get_nowait()
-        except queue.Empty:
-            pass
+        if hasattr(self, 'queue'):
+            try:
+                while True:
+                    self.queue.get_nowait()
+            except Exception:
+                pass
         if self.worker.is_alive() and threading.current_thread() is not self.worker:
-            self.worker.join(timeout=2.0)
+            self.worker.join(timeout=0)
 
     def is_opus(self) -> bool:
         return self.source.is_opus()
@@ -1471,7 +1473,10 @@ class MusicPanel(discord.ui.View):
         if now - getattr(state, '_last_volume_time', 0.0) < 0.3:
             return await interaction.followup.send('Mohon tunggu sebentar sebelum mengatur volume lagi.', ephemeral=True)
         state._last_volume_time = now
-        await self.bot.change_volume(interaction, state.volume - 0.1)
+        async with state.lock:
+            cur_vol = state.volume
+            target_vol = round(cur_vol - 0.1, 2)
+        await self.bot.change_volume(interaction, target_vol)
 
     @discord.ui.button(label='Back', emoji='⏮️', style=discord.ButtonStyle.secondary, custom_id='music:back', row=0)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1506,7 +1511,8 @@ class MusicPanel(discord.ui.View):
                     state.queue.appendleft(state.current)
                     state.current = None
         if not had_prev:
-            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.current and not state.queue:
+            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
+                state.current = None
                 self.bot._schedule_idle(interaction.guild, state.generation)
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self.bot._stop_player(interaction.guild)
@@ -1545,7 +1551,8 @@ class MusicPanel(discord.ui.View):
             text = 'Melanjutkan pemutaran antrian lagu.'
         else:
             text = 'Tidak ada lagu aktif atau antrian kosong.'
-            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.current and not state.queue:
+            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
+                state.current = None
                 self.bot._schedule_idle(interaction.guild, state.generation)
         await interaction.followup.send(text, ephemeral=True)
         await self.bot.refresh(state)
@@ -1581,9 +1588,27 @@ class MusicPanel(discord.ui.View):
             # M4: belum ada audio yang berputar tetapi advance() sedang
             # mengekstraksi. Rekam permintaan skip; advance() yang sedang jalan
             # akan membuang track itu alih-alih memutarnya.
+            skip_recorded = False
             async with state.lock:
-                state._skip_pending = True
-            text = 'Dilewati.'
+                if state._advancing > 0:
+                    state._skip_pending = True
+                    skip_recorded = True
+            if skip_recorded:
+                text = 'Dilewati.'
+            elif state.queue:
+                async with state.lock:
+                    if state.current:
+                        state.history.append(state.current)
+                        if len(state.history) > 20:
+                            state.history.popleft()
+                        state.current = None
+                await self.bot.advance(interaction.guild)
+                text = 'Memutar lagu berikutnya dari antrian.'
+            else:
+                text = 'Tidak ada lagu aktif.'
+                if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
+                    state.current = None
+                    self.bot._schedule_idle(interaction.guild, state.generation)
         elif state.queue:
             async with state.lock:
                 if state.current:
@@ -1596,7 +1621,8 @@ class MusicPanel(discord.ui.View):
             text = 'Memutar lagu berikutnya dari antrian.'
         else:
             text = 'Tidak ada lagu aktif.'
-            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.current and not state.queue:
+            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
+                state.current = None
                 self.bot._schedule_idle(interaction.guild, state.generation)
         await interaction.followup.send(text, ephemeral=True)
 
@@ -1610,7 +1636,10 @@ class MusicPanel(discord.ui.View):
         if now - getattr(state, '_last_volume_time', 0.0) < 0.3:
             return await interaction.followup.send('Mohon tunggu sebentar sebelum mengatur volume lagi.', ephemeral=True)
         state._last_volume_time = now
-        await self.bot.change_volume(interaction, state.volume + 0.1)
+        async with state.lock:
+            cur_vol = state.volume
+            target_vol = round(cur_vol + 0.1, 2)
+        await self.bot.change_volume(interaction, target_vol)
 
     # ROW 1: Shuffle, Loop, Stop, AutoPlay, Playlist
     @discord.ui.button(label='Shuffle', emoji='🔀', style=discord.ButtonStyle.secondary, custom_id='music:shuffle', row=1)
@@ -1618,7 +1647,7 @@ class MusicPanel(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         if not await self.guard(interaction):
             return
-        state = self.bot.states[interaction.guild.id]
+        state = self.bot.states.setdefault(interaction.guild.id, QueueState())
         async with state.lock:
             if len(state.queue) < 2:
                 too_few = True
@@ -1642,7 +1671,7 @@ class MusicPanel(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         if not await self.guard(interaction):
             return
-        state = self.bot.states[interaction.guild.id]
+        state = self.bot.states.setdefault(interaction.guild.id, QueueState())
         cycle = {'off': 'track', 'track': 'queue', 'queue': 'off'}
         async with state.lock:
             state.loop_mode = cycle.get(state.loop_mode, 'off')
@@ -1655,7 +1684,8 @@ class MusicPanel(discord.ui.View):
     @discord.ui.button(label='Stop', emoji='⏹️', style=discord.ButtonStyle.secondary, custom_id='music:stop', row=1)
     async def button_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        if not await self.guard(interaction):
+        vc = interaction.guild.voice_client if interaction.guild else None
+        if vc and not await self.guard(interaction):
             return
         if interaction.guild:
             await self.bot.quit_voice(interaction.guild, clear_queue=True)
@@ -1666,13 +1696,17 @@ class MusicPanel(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         if not await self.guard(interaction):
             return
-        state = self.bot.states[interaction.guild.id]
+        state = self.bot.states.setdefault(interaction.guild.id, QueueState())
         async with state.lock:
             state.autoplay = not state.autoplay
             autoplay_on = state.autoplay
         self.bot._save_persistent_queue()
         status = 'Aktif' if autoplay_on else 'Nonaktif'
         await interaction.followup.send(f'AutoPlay sekarang: **{status}**', ephemeral=True)
+        if autoplay_on:
+            vc = interaction.guild.voice_client if interaction.guild else None
+            if vc and vc.is_connected() and not (vc.is_playing() or vc.is_paused()) and not state.current:
+                await self.bot.advance(interaction.guild)
         await self.bot.refresh(state)
 
     @discord.ui.button(label='Playlist', emoji='🎵', style=discord.ButtonStyle.secondary, custom_id='music:playlist', row=1)
@@ -2295,6 +2329,8 @@ class MusicBot(discord.Client):
             await interaction.followup.send(msg)
 
             channel = interaction.channel
+            if channel is None and getattr(interaction, 'channel_id', None) and interaction.guild:
+                channel = interaction.guild.get_channel(interaction.channel_id)
             if channel and hasattr(channel, 'send'):
                 existing = state.message
                 existing_channel_id = getattr(getattr(existing, 'channel', None), 'id', None)
@@ -2340,8 +2376,9 @@ class MusicBot(discord.Client):
         vc = interaction.guild.voice_client
         if state._advancing > 0 and not (vc and (vc.is_playing() or vc.is_paused())):
             async with state.lock:
-                state._skip_pending = True
-            return await interaction.followup.send('Lagu dilewati.', ephemeral=True)
+                if state._advancing > 0:
+                    state._skip_pending = True
+                    return await interaction.followup.send('Lagu dilewati.', ephemeral=True)
         await self._stop_player(interaction.guild)
         async with state.lock:
             if state.current:
@@ -2367,6 +2404,7 @@ class MusicBot(discord.Client):
         if now - getattr(state, '_last_back_time', 0.0) < 0.5:
             return await interaction.followup.send('Mohon tunggu sebentar sebelum menekan back lagi.', ephemeral=True)
         state._last_back_time = now
+        had_prev = False
         async with state.lock:
             if state.history:
                 prev = state.history.pop()
@@ -2374,9 +2412,17 @@ class MusicBot(discord.Client):
                     state.queue.appendleft(state.current)
                 state.queue.appendleft(prev)
                 state.current = None
+                had_prev = True
             elif state.current:
                 state.queue.appendleft(state.current)
                 state.current = None
+                had_prev = True
+        if not had_prev:
+            vc = interaction.guild.voice_client if interaction.guild else None
+            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
+                state.current = None
+                self._schedule_idle(interaction.guild, state.generation)
+            return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self._stop_player(interaction.guild)
         await self.advance(interaction.guild)
         # removed # removed self._save_persistent_queue()
@@ -2431,6 +2477,10 @@ class MusicBot(discord.Client):
         self._save_persistent_queue()
         status = 'Aktif' if autoplay_on else 'Nonaktif'
         await interaction.followup.send(f'AutoPlay sekarang: **{status}**', ephemeral=True)
+        if autoplay_on:
+            vc = interaction.guild.voice_client if interaction.guild else None
+            if vc and vc.is_connected() and not (vc.is_playing() or vc.is_paused()) and not state.current:
+                await self.advance(interaction.guild)
         await self.refresh(state)
 
     async def quit_voice(self, guild: discord.Guild, clear_queue: bool = False, delete_panel: bool = True) -> None:
@@ -2497,7 +2547,10 @@ class MusicBot(discord.Client):
                 await asyncio.to_thread(clear_cache)
             except Exception as exc:
                 log.debug('Gagal membersihkan cache: %s', exc)
-            gc.collect()
+            try:
+                await asyncio.to_thread(gc.collect)
+            except Exception:
+                pass
 
     async def cmd_stop(self, interaction: discord.Interaction):
         if not _check_guild_only(interaction):
@@ -2505,6 +2558,10 @@ class MusicBot(discord.Client):
         await interaction.response.defer(ephemeral=True)
         ok, msg = _check_same_voice(interaction)
         if not ok:
+            vc = interaction.guild.voice_client if interaction.guild else None
+            if not vc:
+                await self.quit_voice(interaction.guild, clear_queue=True)
+                return await interaction.followup.send('Musik dihentikan, antrian direset, dan bot keluar voice.', ephemeral=True)
             return await interaction.followup.send(msg, ephemeral=True)
         await self.quit_voice(interaction.guild, clear_queue=True)
         await interaction.followup.send('Musik dihentikan, antrian direset, dan bot keluar voice.', ephemeral=True)
@@ -2515,6 +2572,10 @@ class MusicBot(discord.Client):
         await interaction.response.defer(ephemeral=True)
         ok, msg = _check_same_voice(interaction)
         if not ok:
+            vc = interaction.guild.voice_client if interaction.guild else None
+            if not vc:
+                await self.quit_voice(interaction.guild, clear_queue=True)
+                return await interaction.followup.send('Bot keluar dari voice channel, antrian direset, dan cache dibersihkan.', ephemeral=True)
             return await interaction.followup.send(msg, ephemeral=True)
         await self.quit_voice(interaction.guild, clear_queue=True)
         await interaction.followup.send('Bot keluar dari voice channel, antrian direset, dan cache dibersihkan.', ephemeral=True)
@@ -2987,7 +3048,7 @@ class MusicBot(discord.Client):
                 try:
                     source = source_for(data, volume=state.volume)
                     async with state.lock:
-                        if vc.is_playing() or vc.is_paused():
+                        if state.generation != gen0 or guild.voice_client is not vc or vc.is_playing() or vc.is_paused():
                             try:
                                 source.cleanup()
                             except Exception:
@@ -3350,24 +3411,32 @@ class MusicBot(discord.Client):
         else:
             # Ada pendengar manusia di channel bot
             # Batalkan timer AFK & idle
-            if state.afk_task and not state.afk_task.done():
-                state.afk_task.cancel()
-            state.afk_task = state.empty_task = None
-            if state.idle_task and not state.idle_task.done():
-                state.idle_task.cancel()
-                state.idle_task = None
+            should_refresh = False
+            should_advance = False
+            async with state.lock:
+                if state.afk_task and not state.afk_task.done():
+                    state.afk_task.cancel()
+                state.afk_task = state.empty_task = None
+                if state.idle_task and not state.idle_task.done():
+                    state.idle_task.cancel()
+                    state.idle_task = None
 
-            # Lanjutkan pemutaran jika sebelumnya di-pause oleh AFK Guard
-            if state.afk_paused:
-                if getattr(vc, 'is_paused', lambda: False)():
-                    try:
-                        vc.resume()
-                    except Exception:
-                        pass
-                state.afk_paused = False
+                # Lanjutkan pemutaran jika sebelumnya di-pause oleh AFK Guard
+                if state.afk_paused:
+                    if getattr(vc, 'is_paused', lambda: False)():
+                        try:
+                            vc.resume()
+                        except Exception:
+                            pass
+                    state.afk_paused = False
+                    should_refresh = True
+                elif not getattr(vc, 'is_playing', lambda: False)() and not getattr(vc, 'is_paused', lambda: False)() and (state.current or state.queue or state.autoplay):
+                    should_advance = True
+
+            if should_refresh:
                 await self.refresh(state)
                 dump_runtime_state(self)
-            elif not getattr(vc, 'is_playing', lambda: False)() and not getattr(vc, 'is_paused', lambda: False)() and (state.current or state.queue or state.autoplay):
+            elif should_advance:
                 try:
                     asyncio.get_running_loop().create_task(self.advance(guild))
                 except RuntimeError:

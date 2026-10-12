@@ -5093,3 +5093,123 @@ class Wave7RemediationTests(unittest.TestCase):
                 self.assertNotIn("journal", panel_mod._log_cache)
         finally:
             panel_mod.run_update = orig_update
+
+
+class Wave10RemediationTests(unittest.TestCase):
+    def test_wave10_track_dataclass_equality_ignores_stream_url_ts(self):
+        """Wave 10: Track __eq__ mengabaikan perbedaan stream_url dan stream_ts dinamis."""
+        t1 = Track(title="Lagu", url="https://yt.com/1", requester="u", duration=100, stream_url=None, stream_ts=None)
+        t2 = Track(title="Lagu", url="https://yt.com/1", requester="u", duration=100, stream_url="http://expired", stream_ts=9999.0)
+        self.assertEqual(t1, t2)
+        self.assertIn(t1, [t2])
+
+    def test_wave10_dump_runtime_state_offline_max_seq(self):
+        """Wave 10: dump_runtime_state_offline menggunakan max seq + 1."""
+        import bot as bot_mod
+        with bot_mod._RUNTIME_STATE_LOCK:
+            bot_mod._RUNTIME_STATE_SEQ = 80
+            bot_mod._RUNTIME_STATE_LAST_SEQ = 20
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"BOT_STATE_FILE": os.path.join(td, "state.json")}):
+                bot_mod.dump_runtime_state_offline()
+        with bot_mod._RUNTIME_STATE_LOCK:
+            self.assertGreater(bot_mod._RUNTIME_STATE_LAST_SEQ, 80)
+
+    def test_wave10_dump_runtime_state_tmp_chmod(self):
+        """Wave 10: dump_runtime_state menyetel izin 0644 pada state.json."""
+        import bot as bot_mod
+        with tempfile.TemporaryDirectory() as td:
+            s_file = os.path.join(td, "state.json")
+            bot = MusicBot()
+            with patch.dict(os.environ, {"BOT_STATE_FILE": s_file}):
+                bot_mod.dump_runtime_state(bot)
+                time.sleep(0.05)
+            if os.path.exists(s_file):
+                mode = os.stat(s_file).st_mode & 0o777
+                self.assertEqual(mode, 0o644)
+
+    def test_wave10_buffered_audio_source_cleanup_nonblocking(self):
+        """Wave 10: BufferedAudioSource.cleanup tidak memanggil join dengan timeout > 0."""
+        from bot import BufferedAudioSource
+        import queue
+        mock_source = MagicMock(spec=discord.AudioSource)
+        slow_worker = MagicMock()
+        slow_worker.is_alive.return_value = True
+        joined_timeouts = []
+        def mock_join(timeout=None):
+            joined_timeouts.append(timeout)
+        slow_worker.join = mock_join
+
+        bas = BufferedAudioSource.__new__(BufferedAudioSource)
+        bas._cleaned = False
+        bas.stop_event = threading.Event()
+        bas.ready_event = threading.Event()
+        bas.source = mock_source
+        bas.queue = queue.Queue()
+        bas.worker = slow_worker
+        bas.cleanup()
+        self.assertNotIn(2.0, joined_timeouts)
+
+    def test_wave10_music_panel_direct_dict_indexing_no_keyerror(self):
+        """Wave 10: MusicPanel shuffle/loop/autoplay tidak melempar KeyError saat guild belum terdaftar."""
+        bot = MusicBot()
+        guild = MagicMock(id=99701)
+        bot.states.pop(guild.id, None)
+        panel = MusicPanel(bot)
+        panel.guard = AsyncMock(return_value=True)
+        interaction = MagicMock(guild=guild)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        asyncio.run(panel.shuffle.callback(interaction))
+        asyncio.run(panel.loop.callback(interaction))
+        asyncio.run(panel.autoplay.callback(interaction))
+
+    def test_wave10_cmd_play_missing_get_channel_fallback(self):
+        """Wave 10: cmd_play fallback ke guild.get_channel saat interaction.channel None."""
+        bot = MusicBot()
+        guild = MagicMock(id=99702)
+        vc = MagicMock(channel=MagicMock(id=123))
+        guild.voice_client = vc
+        txt_chan = MagicMock(send=AsyncMock())
+        guild.get_channel.return_value = txt_chan
+        interaction = MagicMock(guild=guild, channel=None, channel_id=5555)
+        interaction.user.voice.channel = vc.channel
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        with patch("bot.extract_tracks", return_value=[Track("T", "http://t", "u")]), \
+             patch("bot._check_same_voice", return_value=(True, "")):
+            asyncio.run(bot.cmd_play(interaction, "http://t"))
+        txt_chan.send.assert_called_once()
+
+    def test_wave10_stop_quit_disconnected_voice_clears_queue(self):
+        """Wave 10: cmd_stop dan cmd_quit tetap membersihkan antrian saat bot tidak terhubung voice."""
+        bot = MusicBot()
+        guild = MagicMock(id=99703, voice_client=None)
+        state = QueueState()
+        state.queue.append(Track("T", "http://t", "u"))
+        state.current = Track("Cur", "http://cur", "u")
+        bot.states[guild.id] = state
+        interaction = MagicMock(guild=guild)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        asyncio.run(bot.cmd_stop(interaction))
+        self.assertEqual(len(state.queue), 0)
+        self.assertIsNone(state.current)
+
+    def test_wave10_panel_logs_fresh_debounce(self):
+        """Wave 10: read_bot_logs_cached mendebounce panggilan fresh=True bertubi-tubi."""
+        import panel as panel_mod
+        call_count = 0
+        def fake_logs(lines=35):
+            nonlocal call_count
+            call_count += 1
+            return "LOGS"
+        with patch.object(panel_mod, "read_bot_logs", side_effect=fake_logs):
+            with panel_mod._log_cache_lock:
+                panel_mod._log_cache.clear()
+                panel_mod._last_fresh_log_time.clear()
+            for _ in range(5):
+                panel_mod.read_bot_logs_cached(50, fresh=True)
+            self.assertEqual(call_count, 1)
