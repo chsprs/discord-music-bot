@@ -1312,6 +1312,8 @@ class Handler(BaseHTTPRequestHandler):
         labels = {'start': 'Bot dinyalakan.', 'restart': 'Bot dimulai ulang.',
                   'stop': 'Bot dimatikan.'}
         self.log_message('systemctl %s ok', action)
+        with _state_cache_lock:
+            _state_cache.pop('bot', None)
         self._set_flash(labels.get(action, 'Selesai.'))
         return self._redirect('/')
 
