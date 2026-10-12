@@ -112,6 +112,7 @@ class QueueState:
     _advance_pending: bool = False
     _last_skip_time: float = 0.0
     _last_pause_time: float = 0.0
+    _last_back_time: float = 0.0
 
 
 GuildState = QueueState
@@ -439,19 +440,30 @@ def dump_runtime_state(bot) -> None:
             'total_listeners': total_listeners,
             'guilds': guilds_data,
         }
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         listeners_path = os.path.join(os.path.dirname(path), "listeners.json")
         listeners_payload = {"total_listeners": total_listeners, "updated_at": time.time()}
-        l_tmp_path = listeners_path + ".tmp"
-        with open(l_tmp_path, "w", encoding="utf-8") as f:
-            json.dump(listeners_payload, f)
-        os.chmod(l_tmp_path, 0o644)
-        os.replace(l_tmp_path, listeners_path)
 
-        tmp_path = path + ".tmp"
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(payload, f)
-        os.replace(tmp_path, path)
+        def _do_write():
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                l_tmp_path = listeners_path + ".tmp"
+                with open(l_tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(listeners_payload, f)
+                os.chmod(l_tmp_path, 0o644)
+                os.replace(l_tmp_path, listeners_path)
+
+                tmp_path = path + ".tmp"
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f)
+                os.replace(tmp_path, path)
+            except Exception as exc:
+                log.debug('Gagal menulis state runtime bot: %s', exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, _do_write)
+        except RuntimeError:
+            _do_write()
     except Exception as exc:
         log.debug('Gagal menulis state runtime bot: %s', exc)
 
@@ -916,6 +928,8 @@ class BufferedAudioSource(discord.AudioSource):
             return b''
         now = time.monotonic()
         if self._stall_deadline is not None and now >= self._stall_deadline and self.queue.empty():
+            if self._current_error is None:
+                self._current_error = TimeoutError(f"Stream audio terputus (stall > {STALL_EOF_SECONDS}s)")
             return b''
         try:
             data = self.queue.get(timeout=0.3)
@@ -943,6 +957,8 @@ class BufferedAudioSource(discord.AudioSource):
             self._misses += 1
             self._consecutive_hits = 0
             if self._misses >= MAX_ERROR_STREAK or now >= self._stall_deadline:
+                if self._current_error is None:
+                    self._current_error = TimeoutError(f"Stream audio terputus (stall > {STALL_EOF_SECONDS}s)")
                 return b''
             return SILENCE_FRAME
 
@@ -1121,6 +1137,9 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
         vc = guild.voice_client
         if not vc or getattr(vc, 'channel', None) is None:
             try:
+                perms = voice.channel.permissions_for(interaction.guild.me) if interaction.guild.me else None
+                if perms is not None and (not getattr(perms, 'connect', True) or not getattr(perms, 'speak', True)):
+                    return await interaction.followup.send('Bot butuh izin Connect + Speak di channel ini.', ephemeral=True)
                 vc = await voice.channel.connect(timeout=20, self_deaf=True)
             except (asyncio.TimeoutError, TimeoutError):
                 try:
@@ -1152,6 +1171,12 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
         except Exception as exc:
             log.warning('Pencarian gagal: %s', exc)
             await interaction.followup.send(f'Gagal memproses lagu: {exc}', ephemeral=True)
+            state = self.bot.states.get(guild.id)
+            if state is None:
+                state = QueueState()
+                self.bot.states[guild.id] = state
+            if not state.current and not state.queue:
+                self.bot._schedule_idle(guild, state.generation)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         self.stop()
@@ -1357,7 +1382,11 @@ class MusicPanel(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         if not await self.guard(interaction, require_voice=True):
             return
-        state = self.bot.states[interaction.guild.id]
+        state = self.bot.states.setdefault(interaction.guild.id, QueueState())
+        now = time.monotonic()
+        if now - getattr(state, '_last_back_time', 0.0) < 0.5:
+            return await interaction.followup.send('Mohon tunggu sebentar sebelum menekan back lagi.', ephemeral=True)
+        state._last_back_time = now
         vc = interaction.guild.voice_client
         vc_channel_id = getattr(getattr(vc, 'channel', None), 'id', None)
         user_vc = getattr(interaction.user, 'voice', None)
@@ -1409,9 +1438,11 @@ class MusicPanel(discord.ui.View):
             vc.pause()
             text = 'Dijeda.'
         elif vc.is_paused():
+            state.consecutive_playback_errors = 0
             vc.resume()
             text = 'Dilanjutkan.'
         elif state.queue:
+            state.consecutive_playback_errors = 0
             await self.bot.advance(interaction.guild)
             text = 'Melanjutkan pemutaran antrian lagu.'
         else:
@@ -1630,19 +1661,29 @@ class MusicBot(discord.Client):
                     if ch_id is not None:
                         g_entry['text_channel_id'] = ch_id
                     payload[str(gid)] = g_entry
-            if not payload:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except Exception:
-                        pass
-                return
+            def _write_file():
+                if not payload:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                    return
 
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp_path = path + ".tmp"
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f)
-            os.replace(tmp_path, path)
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    tmp_path = path + ".tmp"
+                    with open(tmp_path, 'w', encoding='utf-8') as f:
+                        json.dump(payload, f)
+                    os.replace(tmp_path, path)
+                except Exception as exc:
+                    log.debug('Gagal menulis persistent queue: %s', exc)
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(None, _write_file)
+            except RuntimeError:
+                _write_file()
         except Exception as exc:
             log.debug('Gagal menyimpan persistent queue: %s', exc)
 
@@ -1687,7 +1728,7 @@ class MusicBot(discord.Client):
                     state.current = track
                     has_restored = True
             queue_data = g_data.get('queue', [])
-            if isinstance(queue_data, list):
+            if isinstance(queue_data, list) and not state.queue:
                 for item in queue_data:
                     track = _dict_to_track(item)
                     if track:
@@ -1852,11 +1893,9 @@ class MusicBot(discord.Client):
                 await asyncio.sleep(1)
 
     async def on_resumed(self):
-        self._restore_persistent_queue()
         dump_runtime_state(self)
 
     async def on_guild_join(self, guild: discord.Guild):
-        self._restore_persistent_queue()
         dump_runtime_state(self)
         await self._sync_guild(guild)
 
@@ -2151,6 +2190,10 @@ class MusicBot(discord.Client):
         state = self.states.get(interaction.guild.id)
         if not state or (not state.history and not state.current):
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
+        now = time.monotonic()
+        if now - getattr(state, '_last_back_time', 0.0) < 0.5:
+            return await interaction.followup.send('Mohon tunggu sebentar sebelum menekan back lagi.', ephemeral=True)
+        state._last_back_time = now
         async with state.lock:
             if state.history:
                 prev = state.history.pop()
@@ -2339,10 +2382,12 @@ class MusicBot(discord.Client):
             vc.pause()
             await interaction.followup.send('Pemutaran dijeda.', ephemeral=True)
         elif vc.is_paused():
+            state.consecutive_playback_errors = 0
             vc.resume()
             await interaction.followup.send('Pemutaran dilanjutkan.', ephemeral=True)
         else:
             if state and state.queue:
+                state.consecutive_playback_errors = 0
                 await self.advance(interaction.guild)
                 await interaction.followup.send('Melanjutkan pemutaran antrian lagu.', ephemeral=True)
             else:
@@ -2636,6 +2681,10 @@ class MusicBot(discord.Client):
                 if not next_track:
                     break
 
+            if state.generation != gen0 or guild.voice_client is not vc:
+                log.info('advance() basi (generation/voice berubah) sebelum ekstraksi; dibatalkan.')
+                break
+
             # --- fase 3: extract stream di luar lock (C4) + batas thread (H3) ---
             try:
                 if next_track.stream_url and next_track.stream_ts and (time.time() - next_track.stream_ts) < 1800:
@@ -2837,7 +2886,6 @@ class MusicBot(discord.Client):
                     else:
                         break
 
-        await self.refresh(state)
         async with state.lock:
             # Kalau loop berhenti tanpa ada yang berputar, `current` tidak boleh
             # dianggap masih diputar: kalau tidak, /play berikutnya akan mengira
@@ -2854,6 +2902,7 @@ class MusicBot(discord.Client):
             self._save_persistent_queue()
             schedule_idle = state.current is None and not state.queue
             gen = state.generation
+        await self.refresh(state)
         if schedule_idle:
             self._schedule_idle(guild, gen)
 
