@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import queue
+import random
 import re
 import shutil
 import signal
@@ -108,6 +109,7 @@ class QueueState:
     _refresh_pending: bool = False
     announce_task: asyncio.Task | None = None
     _advance_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _advance_pending: bool = False
     _last_skip_time: float = 0.0
     _last_pause_time: float = 0.0
 
@@ -185,15 +187,48 @@ def _release_extract_slot() -> None:
         _EXTRACT_THREADS -= 1
 
 
-def _tracked_extract(func, *args, **kwargs):
+class _ExtractSlot:
+    __slots__ = ('started', 'released', 'lock')
+
+    def __init__(self):
+        self.started = False
+        self.released = False
+        self.lock = threading.Lock()
+
+    def mark_started(self) -> bool:
+        with self.lock:
+            if self.released:
+                return False
+            self.started = True
+            return True
+
+    def release_if_unstarted(self) -> None:
+        with self.lock:
+            if not self.started and not self.released:
+                self.released = True
+                _release_extract_slot()
+
+
+def _tracked_extract(arg1, *args, **kwargs):
     """Jalankan func di thread; slot sudah direservasi pemanggil, lepas di finally.
 
     Slot dilepas DI DALAM thread (bukan oleh coroutine) supaya thread yt-dlp yang
     menggantung tetap terhitung walau `wait_for` sudah timeout dan coroutine-nya
-    dibatalkan.
+    dibatalkan. Jika coroutine dibatalkan sebelum thread mulai, slot dilepas aman.
     """
+    if isinstance(arg1, _ExtractSlot):
+        slot = arg1
+        func = args[0]
+        f_args = args[1:]
+    else:
+        slot = None
+        func = arg1
+        f_args = args
+
+    if slot is not None and not slot.mark_started():
+        return None
     try:
-        return func(*args, **kwargs)
+        return func(*f_args, **kwargs)
     finally:
         _release_extract_slot()
 
@@ -206,20 +241,20 @@ async def run_extract(func, *args, timeout: float = 60, **kwargs):
     """
     async with EXTRACT_SEM:
         # Reservasi slot SETELAH semaphore didapat: bila akuisisi semaphore
-        # dibatalkan, tidak ada slot yang bocor. Setelah ini thread pasti jalan
-        # (to_thread selalu mengeksekusi), jadi finally-nya yang melepas slot.
+        # dibatalkan, tidak ada slot yang bocor.
         if not _reserve_extract_slot():
             with _EXTRACT_THREADS_LOCK:
                 alive = _EXTRACT_THREADS
             log.warning('Ekstraksi ditolak: %d thread yt-dlp masih hidup (batas %d).',
                         alive, MAX_EXTRACT_THREADS)
             raise ExtractionBusy('Server sedang sibuk menyiapkan lagu. Coba lagi sebentar lagi.')
+        slot = _ExtractSlot()
         try:
-            task = asyncio.to_thread(_tracked_extract, func, *args, **kwargs)
-        except Exception:
-            _release_extract_slot()
+            task = asyncio.to_thread(_tracked_extract, slot, func, *args, **kwargs)
+            return await asyncio.wait_for(task, timeout=timeout)
+        except (BaseException, asyncio.CancelledError):
+            slot.release_if_unstarted()
             raise
-        return await asyncio.wait_for(task, timeout=timeout)
 
 
 def _cookies_file() -> str | None:
@@ -596,8 +631,9 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
                 stable_url = f'https://www.youtube.com/watch?v={vid_id}'
             stream_url = None
             stream_ts = 0.0
-            if entry.get('url') and entry.get('url') != stable_url:
-                stream_url = entry.get('url')
+            u = entry.get('url')
+            if u and u != stable_url and not any(p in u for p in ('youtube.com/watch', 'youtu.be/', 'youtube.com/shorts', 'youtube.com/playlist')):
+                stream_url = u
                 stream_ts = time.time()
             dur = entry.get('duration') or 0
             author = entry.get('uploader') or entry.get('channel') or entry.get('artist') or 'Unknown'
@@ -613,8 +649,9 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
         stable_url = data.get('webpage_url') or target
         stream_url = None
         stream_ts = 0.0
-        if data.get('url') and data.get('url') != stable_url:
-            stream_url = data.get('url')
+        u = data.get('url')
+        if u and u != stable_url and not any(p in u for p in ('youtube.com/watch', 'youtu.be/', 'youtube.com/shorts', 'youtube.com/playlist')):
+            stream_url = u
             stream_ts = time.time()
         dur = data.get('duration') or 0
         author = data.get('uploader') or data.get('channel') or data.get('artist') or 'Unknown'
@@ -1572,7 +1609,11 @@ class MusicBot(discord.Client):
             payload = {}
             for gid, st in list(self.states.items()):
                 curr = _track_to_dict(st.current) if getattr(st, 'current', None) else None
-                q = [_track_to_dict(t) for t in getattr(st, 'queue', [])]
+                try:
+                    q_snap = list(getattr(st, 'queue', []))
+                except RuntimeError:
+                    q_snap = []
+                q = [_track_to_dict(t) for t in q_snap]
                 if curr or q:
                     g_entry = {
                         'current': curr,
@@ -2064,6 +2105,8 @@ class MusicBot(discord.Client):
                             state.text_channel_id = channel.id
                     except Exception:
                         log.exception('Gagal memunculkan panel otomatis saat play')
+                else:
+                    await self.refresh(state)
         except Exception as exc:
             log.warning('Pencarian gagal: %s', exc)
             await interaction.followup.send(f'Gagal mencari atau memproses lagu: {exc}', ephemeral=True)
@@ -2508,21 +2551,30 @@ class MusicBot(discord.Client):
             asyncio.create_task(self.quit_voice(guild, clear_queue=False))
             return
         if state._advance_lock.locked():
+            state._advance_pending = True
             return
         async with state._advance_lock:
-            async with state.lock:
-                if state.idle_task and not state.idle_task.done():
-                    state.idle_task.cancel()
-                state.idle_task = None
-                if vc.is_playing() or vc.is_paused():
-                    return
-                # M4: tandai bahwa advance() benar-benar berjalan (fase ekstraksi/putar).
-                state._advancing += 1
-            try:
-                await self._advance_loop(guild, state, vc)
-            finally:
+            while True:
+                state._advance_pending = False
+                vc = guild.voice_client
+                if not vc or not getattr(vc, 'is_connected', lambda: False)():
+                    break
                 async with state.lock:
-                    state._advancing = max(0, state._advancing - 1)
+                    if state.idle_task and not state.idle_task.done():
+                        state.idle_task.cancel()
+                    state.idle_task = None
+                    if vc.is_playing() or vc.is_paused():
+                        return
+                    # M4: tandai bahwa advance() benar-benar berjalan (fase ekstraksi/putar).
+                    state._advancing += 1
+                try:
+                    await self._advance_loop(guild, state, vc)
+                finally:
+                    async with state.lock:
+                        state._advancing = max(0, state._advancing - 1)
+
+                if not getattr(state, '_advance_pending', False) or vc.is_playing() or vc.is_paused():
+                    break
 
     async def _advance_loop(self, guild: discord.Guild, state: QueueState, vc) -> None:
         """Inti advance(): pilih, ekstraksi, putar. Selalu dipanggil dari advance()."""
@@ -2611,8 +2663,14 @@ class MusicBot(discord.Client):
                     if state._skip_pending:
                         state._skip_pending = False
                         skip_now = True
-                        if state.queue and state.queue[0] is next_track:
-                            state.queue.popleft()
+                        if state.queue:
+                            if state.queue[0] is next_track:
+                                state.queue.popleft()
+                            else:
+                                try:
+                                    state.queue.remove(next_track)
+                                except ValueError:
+                                    pass
                         elif state.loop_mode == 'track' and state.current is next_track:
                             # Loop track: skip manual harus keluar dari track yang
                             # sama, bukan mengulangnya lagi.
@@ -2623,8 +2681,14 @@ class MusicBot(discord.Client):
                 if isinstance(data, dict) and (data.get('is_live') or data.get('live_status') == 'is_live'):
                     log.warning('Live stream dilewati: %s', next_track.title)
                     async with state.lock:
-                        if state.queue and state.queue[0] is next_track:
-                            state.queue.popleft()
+                        if state.queue:
+                            if state.queue[0] is next_track:
+                                state.queue.popleft()
+                            else:
+                                try:
+                                    state.queue.remove(next_track)
+                                except ValueError:
+                                    pass
                     consecutive_errors += 1
                     continue
                 channel = getattr(vc, 'channel', None)
@@ -2733,8 +2797,14 @@ class MusicBot(discord.Client):
                     if (state.loop_mode == 'track' or (state.loop_mode == 'queue' and not state.queue)) and state.current is next_track:
                         pass
                     else:
-                        if state.queue and state.queue[0] is next_track:
-                            state.queue.popleft()
+                        if state.queue:
+                            if state.queue[0] is next_track:
+                                state.queue.popleft()
+                            else:
+                                try:
+                                    state.queue.remove(next_track)
+                                except ValueError:
+                                    pass
                         if state.current and state.current is not next_track:
                             state.history.append(state.current)
                             if len(state.history) > 20:
@@ -2758,9 +2828,12 @@ class MusicBot(discord.Client):
                         break
                     # Gagal: jangan sentuh history/queue (C3); biarkan track di head untuk retry manual.
                     # Putar kandidat berikutnya hanya bila masih ada track lain.
-                    if state.queue and state.queue[0] is next_track and len(state.queue) > 1:
-                        state.queue.popleft()
-                        state.queue.append(next_track)
+                    if next_track in state.queue and len(state.queue) > 1:
+                        try:
+                            state.queue.remove(next_track)
+                            state.queue.append(next_track)
+                        except ValueError:
+                            pass
                     else:
                         break
 
@@ -2976,7 +3049,7 @@ class MusicBot(discord.Client):
                 humans = [m for m in getattr(vc.channel, 'members', []) if not getattr(m, 'bot', False)]
                 if not humans:
                     state = self.states.get(guild.id)
-                    if state and generation != state.generation and generation != 0:
+                    if state and generation != state.generation:
                         return
                     dur_str = "3 menit" if timeout == 180 else (f"{int(timeout // 60)} menit" if timeout >= 60 else f"{int(timeout)} detik")
                     log.info("AFK timeout: room kosong selama %s, bot keluar dari voice channel", dur_str)

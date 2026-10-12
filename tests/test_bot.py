@@ -3773,3 +3773,192 @@ class AuditOptimizationRegressionTests(unittest.TestCase):
             asyncio.run(bot.advance(guild))
 
         self.assertEqual(state.current.title, 'Lagu Pilihan User')
+
+    def test_advance_lock_trailing_edge_schedules_pending(self):
+        """Wave 3: advance() trailing edge memproses track baru jika terpanggil saat _advance_lock aktif."""
+        bot = MusicBot()
+        guild = MagicMock(id=99101, name='AdvanceGuild')
+        vc = MagicMock(is_connected=lambda: True)
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        async def worker():
+            orig_loop = bot._advance_loop
+            entered = asyncio.Event()
+            allow_done = asyncio.Event()
+
+            async def delayed_loop(g, st, v):
+                res = await orig_loop(g, st, v)
+                entered.set()
+                await allow_done.wait()
+                return res
+
+            bot._advance_loop = delayed_loop
+
+            task_a = asyncio.create_task(bot.advance(guild))
+            await entered.wait()
+
+            new_track = Track('Pending Song', 'https://youtube.com/watch?v=pending', 'u')
+            state.queue.append(new_track)
+
+            # Panggilan kedua saat lock masih dipegang
+            task_b = asyncio.create_task(bot.advance(guild))
+            await task_b
+            self.assertTrue(state._advance_pending)
+
+            allow_done.set()
+            await task_a
+
+            self.assertEqual(len(state.queue), 0)
+            self.assertEqual(state.current.title, 'Pending Song')
+
+        with patch('bot.extract', return_value={'url': 'https://cdn/a'}), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(bot, 'refresh', new=AsyncMock()), \
+             patch.object(bot, '_announce'):
+            asyncio.run(worker())
+
+    def test_afk_disconnect_honors_generation_zero_change(self):
+        """Wave 3: _afk_disconnect dengan generation=0 tidak memutus voice jika state.generation dinaikkan."""
+        bot = MusicBot()
+        guild = MagicMock(id=99102)
+        vc = MagicMock()
+        vc.channel.members = []
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.generation = 1  # Berubah dari 0 ke 1
+        bot.states[guild.id] = state
+
+        quit_called = False
+        async def mock_quit(*args, **kwargs):
+            nonlocal quit_called
+            quit_called = True
+
+        bot.quit_voice = mock_quit
+
+        async def worker():
+            await bot._afk_disconnect(guild, generation=0, timeout=0.001)
+
+        asyncio.run(worker())
+        self.assertFalse(quit_called)
+
+    def test_run_extract_cancellation_releases_slot(self):
+        """Wave 3: Pembatalan run_extract coroutine sebelum thread jalan tidak membocorkan slot."""
+        async def worker():
+            import bot as bmod
+            with bmod._EXTRACT_THREADS_LOCK:
+                bmod._EXTRACT_THREADS = 0
+
+            task = asyncio.create_task(bmod.run_extract(lambda: time.sleep(0.05)))
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            for _ in range(20):
+                if bmod._EXTRACT_THREADS == 0:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertEqual(bmod._EXTRACT_THREADS, 0)
+
+        asyncio.run(worker())
+
+    def test_shuffle_during_extraction_does_not_duplicate_track(self):
+        """Wave 3: Shuffle saat ekstraksi tidak menyebabkan track aktif tertinggal di queue."""
+        bot = MusicBot()
+        guild = MagicMock(id=99103, name='ShuffleGuild')
+        vc = MagicMock(is_connected=lambda: True)
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.channel.bitrate = 96000
+        guild.voice_client = vc
+
+        state = QueueState()
+        t1 = Track('Song1', 'https://youtube.com/watch?v=1', 'u')
+        t2 = Track('Song2', 'https://youtube.com/watch?v=2', 'u')
+        t3 = Track('Song3', 'https://youtube.com/watch?v=3', 'u')
+        state.queue.extend([t1, t2, t3])
+        bot.states[guild.id] = state
+
+        gate_ext = asyncio.Event()
+        gate_shuf = asyncio.Event()
+
+        async def controlled_extract(*args, **kwargs):
+            gate_ext.set()
+            await gate_shuf.wait()
+            return {'url': 'https://cdn/stream', 'title': t1.title}
+
+        async def worker():
+            adv_task = asyncio.create_task(bot.advance(guild))
+            await gate_ext.wait()
+
+            # Pindahkan t1 ke akhir queue akibat shuffle
+            async with state.lock:
+                state.queue.clear()
+                state.queue.extend([t2, t3, t1])
+
+            gate_shuf.set()
+            await adv_task
+
+            self.assertEqual(state.current, t1)
+            self.assertNotIn(t1, state.queue)
+
+        with patch('bot.run_extract', new=controlled_extract), \
+             patch('bot.source_for', return_value=MagicMock()), \
+             patch.object(bot, 'refresh', new=AsyncMock()), \
+             patch.object(bot, '_announce'):
+            asyncio.run(worker())
+
+    def test_flat_playlist_stream_url_not_cached_as_watch_page(self):
+        """Wave 3: _tracks_from_metadata tidak meng-cache URL watch YouTube sebagai stream_url."""
+        import bot as bmod
+        mock_playlist_data = {
+            '_type': 'playlist',
+            'title': 'Test Playlist',
+            'entries': [
+                {
+                    'title': 'Song 1',
+                    'url': 'https://www.youtube.com/watch?v=entry123',
+                    'webpage_url': 'https://www.youtube.com/watch?v=page123',
+                    'duration': 210,
+                }
+            ],
+        }
+        tracks = bmod._tracks_from_metadata(mock_playlist_data, 'user', 'https://youtube.com/playlist')
+        self.assertEqual(len(tracks), 1)
+        self.assertIsNone(tracks[0].stream_url)
+
+    def test_cmd_play_refreshes_existing_message(self):
+        """Wave 3: cmd_play memanggil refresh(state) bila panel sudah ada di channel yang sama."""
+        bot = MusicBot()
+        guild = MagicMock(id=99104)
+        vc = MagicMock(channel=MagicMock(id=9001))
+        guild.voice_client = vc
+
+        state = QueueState()
+        mock_msg = MagicMock()
+        mock_msg.channel.id = 9001
+        state.message = mock_msg
+        bot.states[guild.id] = state
+
+        interaction = MagicMock()
+        interaction.guild = guild
+        interaction.user.voice.channel = vc.channel
+        interaction.channel.id = 9001
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        track = Track('New Song', 'https://youtube.com/watch?v=new', 'u')
+        with patch('bot.extract_tracks', new=AsyncMock(return_value=[track])), \
+             patch.object(bot, '_enqueue_tracks', new=AsyncMock(return_value=True)), \
+             patch.object(bot, 'refresh', new=AsyncMock()) as mock_refresh:
+            asyncio.run(bot.cmd_play(interaction, 'New Song'))
+            mock_refresh.assert_called_once_with(state)
