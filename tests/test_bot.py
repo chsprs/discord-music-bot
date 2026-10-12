@@ -1,8 +1,11 @@
 import asyncio
+from collections import deque
 import json
 import os
 import signal
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 
@@ -4153,3 +4156,287 @@ class AuditOptimizationRegressionTests(unittest.TestCase):
             interaction.followup.send.assert_called_with(
                 'Mohon tunggu sebentar sebelum mengatur volume lagi.', ephemeral=True
             )
+
+
+class Wave6RemediationTests(unittest.TestCase):
+    def test_ghost_voice_client_lockout_reconnects(self):
+        """Wave 6: Ghost VoiceClient (vc.channel is None) tidak memicu lockout di cmd_play."""
+        bot = MusicBot()
+        guild = MagicMock(id=99301)
+        vc = MagicMock()
+        vc.channel = None
+        vc.is_connected.return_value = False
+        guild.voice_client = vc
+
+        user_ch = MagicMock(id=7788)
+        user_ch.connect = AsyncMock(return_value=vc)
+        user_ch.permissions_for.return_value = MagicMock(connect=True, speak=True)
+
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.guild = guild
+        interaction.user.voice.channel = user_ch
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch("bot.extract_tracks", new=AsyncMock(return_value=[Track("T1", "url", "user")])), \
+             patch.object(bot, "_enqueue_tracks", new=AsyncMock(return_value=True)), \
+             patch.object(bot, "refresh", new=AsyncMock()), \
+             patch.object(bot, "_save_persistent_queue"):
+            asyncio.run(bot.cmd_play(interaction, "https://mock.url/1"))
+            for call in interaction.followup.send.call_args_list:
+                args, _ = call
+                if args:
+                    self.assertNotIn("Bot sedang dipakai di voice channel lain.", str(args[0]))
+
+    def test_cross_generation_after_error_ignored(self):
+        """Wave 6: Callback after() dari generasi lama tidak menaikkan consecutive_playback_errors generasi baru."""
+        bot = MusicBot()
+        guild = MagicMock(id=99302, name="Guild99302")
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.generation = 1
+        state.consecutive_playback_errors = 2
+        bot.states[guild.id] = state
+
+        real_after = None
+        def capture_play(src, after=None, **kwargs):
+            nonlocal real_after
+            real_after = after
+            vc.is_playing.return_value = True
+
+        vc.play = MagicMock(side_effect=capture_play)
+
+        with patch("bot.run_extract", new=AsyncMock(return_value={"url": "http://mock/stream", "title": "Track"})), \
+             patch("bot.source_for", return_value=MagicMock()), \
+             patch.object(bot, "refresh", new=AsyncMock()), \
+             patch.object(bot, "_announce"), \
+             patch.object(bot, "_save_persistent_queue"):
+            state.queue.append(Track("Track1", "https://mock.url/1", "user"))
+            asyncio.run(bot._advance_loop(guild, state, vc))
+
+            self.assertIsNotNone(real_after)
+            state.generation = 2
+            state.current = Track("FreshTrack", "https://mock.url/fresh", "user")
+            state.consecutive_playback_errors = 2
+            state._skip_armed = False
+
+            real_after(RuntimeError("Late stream drop"))
+            async def wait_tick():
+                await asyncio.sleep(0.05)
+            asyncio.run(wait_tick())
+
+            self.assertEqual(state.consecutive_playback_errors, 2)
+            self.assertIsNotNone(state.current)
+
+    def test_single_failing_track_schedules_idle(self):
+        """Wave 6: Ekstraksi gagal pada antrean 1 lagu menjadwalkan _schedule_idle."""
+        bot = MusicBot()
+        guild = MagicMock(id=99303, name="Guild99303")
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        bad_track = Track("FailingSoloTrack", "https://mock.url/fail", "user")
+        state.queue.append(bad_track)
+        state.current = None
+        bot.states[guild.id] = state
+
+        idle_called = False
+        def spy_schedule_idle(g, gen):
+            nonlocal idle_called
+            idle_called = True
+
+        with patch("bot.run_extract", side_effect=RuntimeError("403 Forbidden")), \
+             patch.object(bot, "_schedule_idle", side_effect=spy_schedule_idle), \
+             patch.object(bot, "refresh", new=AsyncMock()), \
+             patch.object(bot, "_save_persistent_queue"):
+            asyncio.run(bot._advance_loop(guild, state, vc))
+            self.assertTrue(idle_called)
+
+    def test_afk_guard_disconnects_empty_room_on_generation_bump(self):
+        """Wave 6: Room yang benar-benar kosong tetap disconnect meskipun generation berubah saat timer berjalan."""
+        bot = MusicBot()
+        guild = MagicMock(id=99304)
+        vc = MagicMock()
+        vc.channel = MagicMock()
+        vc.channel.members = []
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.generation = 1
+        bot.states[guild.id] = state
+
+        quit_called = False
+        async def mock_quit(g, clear_queue=False):
+            nonlocal quit_called
+            quit_called = True
+
+        async def worker():
+            with patch.object(bot, "quit_voice", side_effect=mock_quit):
+                task = asyncio.create_task(bot._afk_disconnect(guild, generation=1, timeout=0.01))
+                state.generation = 2
+                await task
+
+        asyncio.run(worker())
+        self.assertTrue(quit_called)
+
+    def test_persistent_queue_out_of_order_writer_suppressed(self):
+        """Wave 6: Penulisan antrean persisten out-of-order tidak menimpa state terbaru."""
+        bot = MusicBot()
+        guild = MagicMock(id=99305)
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tf:
+            test_file = tf.name
+
+        bot._queue_state_file = test_file
+        try:
+            state.queue = deque([Track(f"OldTrack-{i}", f"https://mock.url/old/{i}", "user") for i in range(5)])
+
+            async def run_race():
+                loop = asyncio.get_running_loop()
+                orig_run_in_executor = loop.run_in_executor
+                call_count = 0
+                def mock_executor(executor, func, *args):
+                    nonlocal call_count
+                    call_count += 1
+                    if call_count == 1:
+                        def slow_fn():
+                            time.sleep(0.04)
+                            return func(*args)
+                        return orig_run_in_executor(executor, slow_fn)
+                    return orig_run_in_executor(executor, func, *args)
+
+                with patch.object(loop, "run_in_executor", side_effect=mock_executor):
+                    bot._save_persistent_queue()
+                    state.queue = deque([Track("NewTrack-Latest", "https://mock.url/new", "user")])
+                    bot._save_persistent_queue()
+                    await asyncio.sleep(0.08)
+
+            asyncio.run(run_race())
+            self.assertTrue(os.path.exists(test_file))
+            with open(test_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            q_data = data.get(str(guild.id), {}).get("queue", [])
+            self.assertEqual(len(q_data), 1)
+            self.assertEqual(q_data[0]["title"], "NewTrack-Latest")
+        finally:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+
+    def test_announce_now_playing_message_id_fallback(self):
+        """Wave 6: Now-playing announcement memakai text_channel_id saat state.message berupa integer ID."""
+        bot = MusicBot()
+        guild = MagicMock(id=99306)
+        state = QueueState()
+        state.message = 123456789
+        state.text_channel_id = 987654321
+
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(return_value=MagicMock())
+        guild.get_channel = MagicMock(return_value=mock_channel)
+        bot.states[guild.id] = state
+
+        track = Track("RestoredTrack", "https://mock.url/res", "user")
+        with patch.object(bot, "_safe_delete_msg", new=AsyncMock()):
+            asyncio.run(bot._announce_now_playing(guild, track))
+            mock_channel.send.assert_called_once()
+
+    def test_cmd_volume_channel_auth_and_debounce(self):
+        """Wave 6: /volume memverifikasi channel yang sama dan menerapkan debounce."""
+        bot = MusicBot()
+        guild = MagicMock(id=99307)
+        vc = MagicMock()
+        vc.channel.id = 1111
+        guild.voice_client = vc
+        state = QueueState()
+        state.volume = 1.0
+        bot.states[guild.id] = state
+
+        user_ch = MagicMock()
+        user_ch.id = 2222
+
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.guild = guild
+        interaction.user.voice.channel = user_ch
+        interaction.response.is_done.return_value = True
+        interaction.followup.send = AsyncMock()
+
+        # 1. Beda channel ditolak
+        asyncio.run(bot.cmd_volume(interaction, 150))
+        self.assertEqual(state.volume, 1.0)
+
+        # 2. Channel sama diterima
+        user_ch.id = 1111
+        with patch.object(bot, "refresh", new=AsyncMock()), patch.object(bot, "_save_persistent_queue"):
+            asyncio.run(bot.cmd_volume(interaction, 150))
+            self.assertEqual(state.volume, 1.5)
+
+            # 3. Panggilan cepat berikutnya ditolak debounce
+            asyncio.run(bot.cmd_volume(interaction, 180))
+            self.assertEqual(state.volume, 1.5)
+
+    def test_clean_seed_title_word_boundary_preserves_words(self):
+        """Wave 6: _clean_seed_title memakai word boundary regex sehingga kata valid tidak terpotong."""
+        titles = [
+            ("Radiohead - Creep", "Radiohead"),
+            ("Shadow of the Day", "Shadow"),
+            ("Headlines", "Headlines"),
+            ("Earthquake", "Earthquake"),
+            ("Move Your Body", "Move"),
+        ]
+        for raw, expected in titles:
+            cleaned = _clean_seed_title(raw)
+            self.assertIn(expected.lower(), cleaned.lower())
+
+    def test_panel_session_revocation_on_password_update(self):
+        """Wave 6: Mengganti password panel mencabut seluruh session token lama."""
+        import panel as pmod
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".env") as tf:
+            env_file = tf.name
+        try:
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write("PANEL_PASSWORD=oldpassword\n")
+            with pmod._lock:
+                pmod._sessions.clear()
+            token = pmod._mint_session()
+            self.assertTrue(pmod._session_valid(token))
+            pmod.update_panel_password("newpassword123", env_path=env_file)
+            self.assertFalse(pmod._session_valid(token))
+        finally:
+            if os.path.exists(env_file):
+                os.remove(env_file)
+            with pmod._lock:
+                pmod._sessions.clear()
+
+    def test_safedeque_snapshot_iteration_threadsafe(self):
+        """Wave 6: SafeDeque aman diiterasi saat thread lain memutasi deque."""
+        from bot import SafeDeque
+        sd = SafeDeque()
+        for i in range(50):
+            sd.append(i)
+        stop = False
+        def mutator():
+            while not stop:
+                try:
+                    sd.append(999)
+                    sd.popleft()
+                except Exception:
+                    pass
+                time.sleep(0.0001)
+        th = threading.Thread(target=mutator, daemon=True)
+        th.start()
+        try:
+            for _ in range(30):
+                items = [x for x in sd]
+                self.assertGreater(len(items), 0)
+        finally:
+            stop = True
+            th.join(timeout=0.5)

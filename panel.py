@@ -85,9 +85,8 @@ def update_panel_password(new_password: str, env_path: Optional[str] = None) -> 
             os.fsync(handle.fileno())
 
     PASSWORD = new_password
-    if not new_password:
-        with _lock:
-            _sessions.clear()
+    with _lock:
+        _sessions.clear()
 COOKIE = 'music_session'
 STORE = None
 UPDATE_RUNNER: Optional[Callable[[], tuple[bool, str]]] = None
