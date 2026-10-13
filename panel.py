@@ -609,7 +609,11 @@ def read_bot_runtime_info() -> dict:
 
 
 def format_guilds_html(info: dict) -> str:
+    if not isinstance(info, dict):
+        return ''
     guilds = info.get('guilds', [])
+    if not isinstance(guilds, list):
+        guilds = []
     if not guilds:
         if info.get('status') == 'offline':
             return '<p class="note" style="margin-top:10px">Bot sedang offline. Nyalakan bot untuk melihat daftar server.</p>'
@@ -617,6 +621,8 @@ def format_guilds_html(info: dict) -> str:
 
     cards = []
     for g in guilds:
+        if not isinstance(g, dict):
+            continue
         name = html.escape(str(g.get('name', 'Server Discord')))
         try:
             members = int(g.get('member_count', 0) or 0)
@@ -1060,6 +1066,16 @@ class Handler(BaseHTTPRequestHandler):
             self.log_exception('GET %s', self.path)
             return self._server_error()
 
+    def _logout_get(self):
+        if PASSWORD:
+            fetch_site = (self.headers.get('Sec-Fetch-Site') or '').lower().strip()
+            if fetch_site and fetch_site not in ('same-origin', 'none', 'same-site'):
+                return self._redirect('/')
+            self._revoke_session_from_cookie()
+            cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
+            return self._redirect('/login', {'Set-Cookie': cookie})
+        return self._redirect('/')
+
     def _do_get(self):
         path = urllib.parse.urlsplit(self.path).path
         # Host allowlist berlaku untuk GET juga: tanpa ini, DNS-rebinding bisa
@@ -1073,11 +1089,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._redirect('/')
             return self._login_page()
         if path == '/logout':
-            if PASSWORD:
-                self._revoke_session_from_cookie()
-                cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
-                return self._redirect('/login', {'Set-Cookie': cookie})
-            return self._redirect('/')
+            return self._logout_get()
         if path == '/api/status':
             if not self._authenticated():
                 return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
@@ -1149,6 +1161,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(HTTPStatus.FORBIDDEN, {'error': 'origin'})
             return self._login(fields)
         if path == '/logout':
+            fields = self._body()
+            if fields is None:
+                return
+            if not self._origin_ok(fields):
+                return self._json(HTTPStatus.FORBIDDEN, {'error': 'origin'})
             if PASSWORD:
                 self._revoke_session_from_cookie()
                 cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
