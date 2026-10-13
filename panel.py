@@ -260,7 +260,7 @@ class ConfigStore:
         except OSError:
             pass
         try:
-            dir_fd = os.open(directory, os.O_RDONLY)
+            dir_fd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
             try:
                 os.fsync(dir_fd)
             finally:
@@ -421,8 +421,12 @@ def read_last_update_log() -> str:
 
 def read_bot_logs(lines: int = 35) -> str:
     try:
+        try:
+            safe_lines = max(1, min(int(lines), 500))
+        except (ValueError, TypeError):
+            safe_lines = 35
         res = subprocess.run(
-            ['journalctl', '-u', SERVICE, '-n', str(lines), '--no-pager'],
+            ['journalctl', '-u', SERVICE, '-n', str(safe_lines), '--no-pager'],
             capture_output=True, text=True, timeout=4
         )
         out = res.stdout.strip()
@@ -482,6 +486,19 @@ def listeners_active() -> bool:
     (M1). State basi (>60 dtk) dianggap tidak ada pendengar. Tidak pernah raise.
     """
     try:
+        path = os.environ.get('BOT_STATE_FILE')
+        if not path:
+            if os.path.isdir('/run/discord-music'):
+                path = '/run/discord-music/state.json'
+            else:
+                path = '/tmp/discord-music-state.json'
+        listeners_path = os.path.join(os.path.dirname(path), 'listeners.json')
+        if os.path.exists(listeners_path):
+            with open(listeners_path, 'r', encoding='utf-8') as handle:
+                ldata = json.load(handle)
+            if time.time() - ldata.get('updated_at', 0) < 60:
+                return int(ldata.get('total_listeners') or 0) > 0
+            return False
         info = read_bot_runtime_info()
         return int(info.get('total_listeners') or 0) > 0
     except Exception:
@@ -616,6 +633,10 @@ def read_bot_runtime_info() -> dict:
                 with _runtime_info_lock:
                     _runtime_info_cache = (path, mtime, now, default_info)
                 return default_info
+        else:
+            with _runtime_info_lock:
+                _runtime_info_cache = (path, None, now, default_info)
+            return default_info
     except Exception:
         with _runtime_info_lock:
             _runtime_info_cache = (path, mtime, now, default_info)
@@ -1126,6 +1147,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(HTTPStatus.UNAUTHORIZED, {'error': 'unauthorized'})
             data = store().read()
             runtime = read_bot_runtime_info()
+            guilds_val = runtime.get('guilds')
             # token_hint dihapus: potongan token Discord tidak diperlukan UI dan
             # bisa dipanen saat panel tanpa password (S10).
             return self._json(HTTPStatus.OK, {
@@ -1137,7 +1159,7 @@ class Handler(BaseHTTPRequestHandler):
                 'total_guilds': runtime.get('total_guilds', 0),
                 'active_voice_count': runtime.get('active_voice_count', 0),
                 'total_listeners': runtime.get('total_listeners', 0),
-                'guild_count': len(runtime.get('guilds', []) or []),
+                'guild_count': len(guilds_val) if isinstance(guilds_val, list) else 0,
             })
         if path == '/api/logs':
             if not self._authenticated():

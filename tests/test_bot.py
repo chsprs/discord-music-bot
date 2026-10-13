@@ -5968,3 +5968,97 @@ class Wave19RemediationTests(unittest.TestCase):
         handler = p.Handler.__new__(p.Handler)
         self.assertTrue(handler._host_ok(local_hn))
         self.assertTrue(handler._host_ok(f"{local_hn}:9130"))
+
+
+class Wave20RemediationTests(unittest.TestCase):
+    def test_wave20_extract_video_id_type_check(self):
+        """Wave 20: extract_video_id aman saat candidate bukan string."""
+        from bot import extract_video_id
+        self.assertIsNone(extract_video_id(None))
+        self.assertIsNone(extract_video_id(""))
+        self.assertIsNone(extract_video_id("https://youtube.com/watch?v="))
+
+    def test_wave20_track_to_dict_none_fields(self):
+        """Wave 20: _track_to_dict tidak menghasilkan literal string 'None' saat atribut None."""
+        from bot import Track, _track_to_dict
+        t = Track(title=None, url=None, requester=None, duration=10, duration_str=None, author=None)
+        d = _track_to_dict(t)
+        self.assertEqual(d["title"], "")
+        self.assertEqual(d["url"], "")
+        self.assertEqual(d["requester"], "Unknown")
+        self.assertEqual(d["duration_str"], "Unknown")
+        self.assertEqual(d["author"], "Unknown")
+
+    def test_wave20_restore_persistent_queue_max_queue_cap(self):
+        """Wave 20: _restore_persistent_queue membatasi pemulihan antrean hingga MAX_QUEUE."""
+        import tempfile
+        from bot import MusicBot, MAX_QUEUE
+        bot = MusicBot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            q_file = os.path.join(tmpdir, "q_cap.json")
+            bot._queue_state_file = q_file
+            data = {
+                "123": {
+                    "queue": [{"title": f"T{i}", "url": f"https://youtube.com/watch?v=s{i}"} for i in range(MAX_QUEUE + 50)]
+                }
+            }
+            with open(q_file, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            bot._restore_persistent_queue()
+            self.assertIn(123, bot.states)
+            self.assertLessEqual(len(bot.states[123].queue), MAX_QUEUE)
+
+    def test_wave20_panel_read_bot_logs_bounded(self):
+        """Wave 20: read_bot_logs membatasi jumlah baris journalctl antara 1 dan 500."""
+        import panel as p
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="ok")
+            p.read_bot_logs(9999)
+            cmd = mock_run.call_args[0][0]
+            self.assertIn("500", cmd)
+            p.read_bot_logs(-5)
+            cmd2 = mock_run.call_args[0][0]
+            self.assertIn("1", cmd2)
+
+    def test_wave20_panel_status_guild_count_isinstance(self):
+        """Wave 20: /api/status aman jika runtime.get('guilds') bukan bertipe list."""
+        import panel as p
+        handler = p.Handler.__new__(p.Handler)
+        handler.path = '/api/status'
+        handler.headers = {'Host': '127.0.0.1:9130'}
+        handler.client_address = ('127.0.0.1', 54321)
+        handler._authenticated = MagicMock(return_value=True)
+        handler._json = MagicMock()
+        with patch("panel.store") as mock_store, patch("panel.read_bot_runtime_info") as mock_info:
+            mock_store.return_value.read.return_value = {"token": "", "guild": ""}
+            mock_info.return_value = {"guilds": "invalid_non_list"}
+            handler._do_get()
+            handler._json.assert_called_once()
+            res_payload = handler._json.call_args[0][1]
+            self.assertEqual(res_payload["guild_count"], 0)
+
+    def test_wave20_on_guild_remove_none_guild_id(self):
+        """Wave 20: on_guild_remove aman saat guild tidak memiliki atribut id valid."""
+        from bot import MusicBot
+        bot = MusicBot()
+        fake_guild = MagicMock()
+        del fake_guild.id
+        asyncio.run(bot.on_guild_remove(fake_guild))
+
+    def test_wave20_enqueue_tracks_structural_equality(self):
+        """Wave 20: _enqueue_tracks mendeduplikasi state.current berdasarkan URL saat voice client terputus."""
+        from bot import MusicBot, Track, QueueState
+        bot = MusicBot()
+        guild = MagicMock(id=999, voice_client=None)
+        state = QueueState()
+        t1 = Track(title="Song A", url="https://youtube.com/watch?v=dup1", requester="u")
+        t2 = Track(title="Song A", url="https://youtube.com/watch?v=dup1", requester="u")
+        state.current = t1
+        state.queue.append(t2)
+        bot.states[999] = state
+        new_track = Track(title="Song B", url="https://youtube.com/watch?v=new2", requester="u")
+        asyncio.run(bot._enqueue_tracks(guild, [new_track]))
+        self.assertIsNone(state.current)
+        # t1 should not be prepended as a duplicate since t2 with identical url is already in queue
+        self.assertEqual(len([t for t in state.queue if t.url == "https://youtube.com/watch?v=dup1"]), 1)
+
