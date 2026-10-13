@@ -290,6 +290,9 @@ def store() -> ConfigStore:
     return STORE if STORE is not None else ConfigStore(CONFIG_PATH)
 
 
+_systemctl_lock = threading.Lock()
+
+
 def _cached_systemctl(kind: str, unit: str, timeout: int, fallback: str) -> str:
     """Cache hasil systemctl singkat agar satu page render tidak fork 4x (S9)."""
     started = time.monotonic()
@@ -297,24 +300,22 @@ def _cached_systemctl(kind: str, unit: str, timeout: int, fallback: str) -> str:
         hit = _state_cache.get(kind)
         if hit is not None and started - hit[0] < STATE_CACHE_TTL:
             return hit[1]
-    # Jangan tahan mutex selama systemctl; timeout 2-3 detik tidak boleh
-    # memblokir semua render panel lain.
-    try:
-        result = subprocess.run(['systemctl', 'is-active', unit],
-                                capture_output=True, text=True, timeout=timeout)
-        value = result.stdout.strip()
-    except Exception:
-        value = fallback
-    # Timestamp diambil SETELAH subprocess: kalau memakai `started`, entri akan
-    # langsung dianggap kedaluwarsa setelah systemctl 2-3 detik.
-    finished = time.monotonic()
-    with _state_cache_lock:
-        current = _state_cache.get(kind)
-        if current is None or current[0] <= finished:
+    with _systemctl_lock:
+        now = time.monotonic()
+        with _state_cache_lock:
+            hit = _state_cache.get(kind)
+            if hit is not None and now - hit[0] < STATE_CACHE_TTL:
+                return hit[1]
+        try:
+            result = subprocess.run(['systemctl', 'is-active', unit],
+                                    capture_output=True, text=True, timeout=timeout)
+            value = result.stdout.strip()
+        except Exception:
+            value = fallback
+        finished = time.monotonic()
+        with _state_cache_lock:
             _state_cache[kind] = (finished, value)
-            return value
-        # Pemanggil lain sudah mengisi data yang lebih baru saat subprocess ini jalan.
-        return current[1]
+        return value
 
 
 def bot_state() -> str:
@@ -1352,12 +1353,17 @@ class Handler(BaseHTTPRequestHandler):
         return self._redirect('/', extra_headers)
 
     def _update(self):
+        global _ytdlp_version_cache, _update_log_cache
         ok, out = run_update()
         with _state_cache_lock:
             _state_cache.pop('bot', None)
         with _log_cache_lock:
             _log_cache.clear()
             _last_fresh_log_time.clear()
+        with _ytdlp_version_lock:
+            _ytdlp_version_cache = None
+        with _update_log_lock:
+            _update_log_cache = None
         if ok:
             self._set_flash(f'Pembaruan yt-dlp berhasil dijalankan.\n{out}')
         else:

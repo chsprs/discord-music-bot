@@ -47,7 +47,7 @@ def _int_env(name: str, default: int, lo: int | None = None, hi: int | None = No
 
 
 def format_duration(seconds: int | float | None) -> str:
-    if not seconds or seconds <= 0:
+    if seconds is None or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
         return "Live / Unknown"
     s = int(seconds)
     hours = s // 3600
@@ -156,7 +156,7 @@ def get_afk_timeout() -> float:
     if raw is not None:
         try:
             val = float(raw)
-            if val > 0:
+            if math.isfinite(val) and val > 0:
                 return val
         except (ValueError, TypeError):
             pass
@@ -707,7 +707,12 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
             if not stable_url or not stable_url.startswith('http'):
                 vid_id = entry.get('id') or stable_url
                 if vid_id:
-                    stable_url = f'https://www.youtube.com/watch?v={vid_id}'
+                    if str(vid_id).startswith('watch?v='):
+                        stable_url = f'https://www.youtube.com/{vid_id}'
+                    elif str(vid_id).startswith('/watch?v='):
+                        stable_url = f'https://www.youtube.com{vid_id}'
+                    else:
+                        stable_url = f'https://www.youtube.com/watch?v={vid_id}'
                 else:
                     stable_url = target
             stream_url = None
@@ -727,7 +732,18 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
         title = (data.get('title') or '').strip()
         if not title or title in ('[Private video]', '[Deleted video]', '[Unavailable video]'):
             raise ValueError('Lagu tidak tersedia (video privat atau telah dihapus).')
-        stable_url = data.get('webpage_url') or target
+        stable_url = data.get('webpage_url')
+        if not stable_url or not stable_url.startswith('http'):
+            vid_id = data.get('id')
+            if vid_id:
+                if str(vid_id).startswith('watch?v='):
+                    stable_url = f'https://www.youtube.com/{vid_id}'
+                elif str(vid_id).startswith('/watch?v='):
+                    stable_url = f'https://www.youtube.com{vid_id}'
+                else:
+                    stable_url = f'https://www.youtube.com/watch?v={vid_id}'
+            else:
+                stable_url = target
         stream_url = None
         stream_ts = 0.0
         u = data.get('url')
@@ -780,8 +796,10 @@ def _clean_seed_title(title: str | None) -> str:
                   'Official', 'Lyrics', 'Audio', 'MV', 'HD', '4K', 'HQ'):
         text = re.sub(r'\b' + re.escape(noise) + r'\b', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'[\(\)\[\]\{\}]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip(' -–—|,')
-    return text[:200]
+    cleaned = re.sub(r'\s+', ' ', text).strip(' -–—|,')
+    if not cleaned:
+        return str(title).strip()[:200]
+    return cleaned[:200]
 
 
 async def fetch_recommendations(history_titles: list[str], exclude_urls: set[str],
@@ -1298,9 +1316,9 @@ class PlaylistView(discord.ui.View):
                 tracks = []
                 queue_len = 0
             current_track = state.current
-        header = f"**Sedang Diputar:** {discord.utils.escape_markdown(current_track.title)}\n\n" if current_track else ""
+        header = f"**Sedang Diputar:** {discord.utils.escape_markdown(current_track.title or '')}\n\n" if current_track else ""
         if tracks:
-            list_text = '\n'.join(f'{i}. {discord.utils.escape_markdown(t.title)} ({t.duration_str})' for i, t in enumerate(tracks, 1))
+            list_text = '\n'.join(f"{i}. {discord.utils.escape_markdown(t.title or '')} ({t.duration_str})" for i, t in enumerate(tracks, 1))
             more = f"\n*...dan {queue_len - 10} lagu lainnya*" if queue_len > 10 else ""
             msg = f"{header}**Antrian ({queue_len} lagu):**\n{list_text}{more}"
         else:
@@ -1427,6 +1445,12 @@ class MusicPanel(discord.ui.View):
                 vc = await conn_res if hasattr(conn_res, '__await__') else conn_res
             except (asyncio.TimeoutError, TimeoutError):
                 log.warning('Timeout connect voice dari panel')
+                try:
+                    cur = interaction.guild.voice_client
+                    if cur:
+                        await cur.disconnect(force=True)
+                except Exception:
+                    pass
                 msg = 'Timeout masuk voice. Coba lagi.'
                 if not interaction.response.is_done():
                     await interaction.response.send_message(msg, ephemeral=True)
@@ -1667,8 +1691,8 @@ class MusicPanel(discord.ui.View):
                 import random
                 items = list(state.queue)
                 random.shuffle(items)
-                state.queue.clear()
-                state.queue.extend(items)
+                for idx, itm in enumerate(items):
+                    state.queue[idx] = itm
             shuffled_len = len(state.queue)
         self.bot._save_persistent_queue()
         if too_few:
@@ -1747,9 +1771,9 @@ class MusicPanel(discord.ui.View):
                 tracks = []
                 queue_len = 0
             current_track = state.current
-        header = f"**Sedang Diputar:** {discord.utils.escape_markdown(current_track.title)}\n\n" if current_track else ""
+        header = f"**Sedang Diputar:** {discord.utils.escape_markdown(current_track.title or '')}\n\n" if current_track else ""
         if tracks:
-            list_text = '\n'.join(f'{i}. {discord.utils.escape_markdown(t.title)} ({t.duration_str})' for i, t in enumerate(tracks, 1))
+            list_text = '\n'.join(f"{i}. {discord.utils.escape_markdown(t.title or '')} ({t.duration_str})" for i, t in enumerate(tracks, 1))
             more = f"\n*...dan {queue_len - 10} lagu lainnya*" if queue_len > 10 else ""
             msg = f"{header}**Antrian ({queue_len} lagu):**\n{list_text}{more}"
         else:
@@ -1990,7 +2014,11 @@ class MusicBot(discord.Client):
             # state.current dianggap basi (mis. sisa track yang gagal diputar
             # atau koneksi voice putus diam-diam) agar antrian tidak macet.
             if not playing and state.current is not None:
-                if state.loop_mode != 'track':
+                if vc is None:
+                    if state.current not in state.queue:
+                        state.queue.appendleft(state.current)
+                    state.current = None
+                else:
                     state.history.append(state.current)
                     if len(state.history) > 20:
                         state.history.popleft()
@@ -2313,6 +2341,16 @@ class MusicBot(discord.Client):
                 self._panel_view.stop()
             except Exception:
                 pass
+        for vc in list(getattr(self, 'voice_clients', [])):
+            try:
+                if hasattr(vc, 'stop') and callable(vc.stop):
+                    vc.stop()
+                if hasattr(vc, 'disconnect') and callable(vc.disconnect):
+                    dis_res = vc.disconnect(force=True)
+                    if hasattr(dis_res, '__await__'):
+                        await dis_res
+            except Exception:
+                pass
         if self._exporter_task and not self._exporter_task.done():
             self._exporter_task.cancel()
         await super().close()
@@ -2493,8 +2531,8 @@ class MusicBot(discord.Client):
             import random
             items = list(state.queue)
             random.shuffle(items)
-            state.queue.clear()
-            state.queue.extend(items)
+            for idx, itm in enumerate(items):
+                state.queue[idx] = itm
             shuffled_len = len(state.queue)
         self._save_persistent_queue()
         await interaction.followup.send(f'Antrian berhasil diacak ({shuffled_len} lagu).', ephemeral=True)
@@ -2652,9 +2690,9 @@ class MusicBot(discord.Client):
                 current_track = state.current
         if empty:
             return await interaction.followup.send('Antrian lagu kosong.', ephemeral=True)
-        header = f"**Sedang Diputar:** {discord.utils.escape_markdown(current_track.title)}\n\n" if current_track else ""
+        header = f"**Sedang Diputar:** {discord.utils.escape_markdown(current_track.title or '')}\n\n" if current_track else ""
         if tracks:
-            text = '\n'.join(f'{i}. {discord.utils.escape_markdown(t.title)} ({t.duration_str})' for i, t in enumerate(tracks, 1))
+            text = '\n'.join(f"{i}. {discord.utils.escape_markdown(t.title or '')} ({t.duration_str})" for i, t in enumerate(tracks, 1))
             more = f"\n*...dan {queue_len - 10} lagu lainnya*" if queue_len > 10 else ""
             msg = f"{header}**Antrian Lagu ({queue_len} lagu):**\n{text}{more}"
         else:
@@ -2846,6 +2884,8 @@ class MusicBot(discord.Client):
             channel = interaction.guild.get_channel(interaction.channel_id)
 
         if not channel or not hasattr(channel, 'send'):
+            if vc and getattr(vc, 'is_connected', lambda: False)() and not (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)()) and not state.queue and state.current is None:
+                self._schedule_idle(interaction.guild, state.generation)
             return await interaction.followup.send('Tidak dapat menemukan text channel untuk menampilkan panel.', ephemeral=True)
 
         try:
@@ -2854,14 +2894,15 @@ class MusicBot(discord.Client):
                 state.message = new_msg
                 if hasattr(channel, 'id'):
                     state.text_channel_id = channel.id
-            if vc and getattr(vc, 'is_connected', lambda: False)() and not (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)()) and not state.queue and state.current is None:
-                self._schedule_idle(interaction.guild, state.generation)
             await interaction.followup.send('Panel musik aktif di channel ini.', ephemeral=True)
         except discord.Forbidden:
             await interaction.followup.send('Bot butuh izin Send Messages + Embed Links di channel ini.', ephemeral=True)
         except Exception:
             log.exception('Gagal mengirim panel musik')
             await interaction.followup.send('Gagal memunculkan panel. Coba lagi.', ephemeral=True)
+        finally:
+            if vc and getattr(vc, 'is_connected', lambda: False)() and not (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)()) and not state.queue and state.current is None:
+                self._schedule_idle(interaction.guild, state.generation)
 
     def embed(self, state: QueueState) -> discord.Embed:
         embed = discord.Embed(color=0x2b2d31)
@@ -3295,10 +3336,12 @@ class MusicBot(discord.Client):
                 state._skip_armed = False
                 state._skip_pending = False
                 if state.current is not None:
-                    if state.loop_mode != 'track':
+                    if state.loop_mode != 'track' or consecutive_errors > 0:
                         state.history.append(state.current)
                         if len(state.history) > 20:
                             state.history.popleft()
+                        if state.loop_mode == 'queue' and state.current not in state.queue:
+                            state.queue.append(state.current)
                         state.current = None
             self._save_persistent_queue()
             schedule_idle = (
@@ -3335,8 +3378,14 @@ class MusicBot(discord.Client):
         try:
             if channel is None:
                 return
-            state.now_message = await asyncio.shield(channel.send(
-                f'Now playing: **{discord.utils.escape_markdown(track.title)}**'))
+            msg_fut = asyncio.ensure_future(channel.send(
+                f'Now playing: **{discord.utils.escape_markdown(track.title or "")}**'))
+            def _on_sent(f):
+                if not f.cancelled() and not f.exception():
+                    state.now_message = f.result()
+            msg_fut.add_done_callback(_on_sent)
+            sent_msg = await asyncio.shield(msg_fut)
+            state.now_message = sent_msg
         except asyncio.CancelledError:
             raise
         except discord.HTTPException:

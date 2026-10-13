@@ -5680,3 +5680,192 @@ class Wave10RemediationTests(unittest.TestCase):
         src_l = inspect.getsource(p.read_last_update_log)
         self.assertIn("_ytdlp_version_cache", src_v)
         self.assertIn("_update_log_cache", src_l)
+
+    def test_wave13_loop_track_extraction_failure_schedules_idle(self):
+        """Wave 13: loop_mode=='track' saat ekstraksi gagal menjadwalkan idle disconnect."""
+        bot = MusicBot()
+        guild = MagicMock(id=99920)
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.loop_mode = "track"
+        state.current = Track("FailingLoopTrack", "https://youtube.com/watch?v=fail", "u")
+        state.queue.clear()
+        bot.states[guild.id] = state
+        bot._save_persistent_queue = MagicMock()
+        bot.refresh = AsyncMock()
+        bot._schedule_idle = MagicMock()
+
+        with patch("bot.source_for", side_effect=Exception("Extraction 404")):
+            asyncio.run(bot._advance_loop(guild, state, vc))
+
+        self.assertIsNone(state.current)
+        bot._schedule_idle.assert_called_once()
+
+    def test_wave13_loop_queue_track_preserved_on_failure(self):
+        """Wave 13: loop_mode=='queue' mempertahankan track aktif dalam antrean saat lagu berikutnya gagal ekstraksi."""
+        bot = MusicBot()
+        guild = MagicMock(id=99921)
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.loop_mode = "queue"
+        prev = Track("PrevSong", "https://youtube.com/watch?v=prev", "u")
+        failing = Track("FailingNext", "https://youtube.com/watch?v=failing", "u")
+        state.current = prev
+        state.queue.append(failing)
+        bot.states[guild.id] = state
+        bot._save_persistent_queue = MagicMock()
+        bot.refresh = AsyncMock()
+        bot._schedule_idle = MagicMock()
+
+        with patch("bot.source_for", side_effect=Exception("Extraction 404")):
+            asyncio.run(bot._advance_loop(guild, state, vc))
+
+        self.assertIn(prev, state.queue)
+
+    def test_wave13_close_disconnects_voice_clients(self):
+        """Wave 13: bot.close() memutus dan menghentikan seluruh voice_clients aktif."""
+        import inspect
+        src = inspect.getsource(MusicBot.close)
+        self.assertIn("voice_clients", src)
+        self.assertIn("vc.disconnect", src)
+
+    def test_wave13_summon_channel_send_failure_schedules_idle(self):
+        """Wave 13: /musik (summon) menjadwalkan _schedule_idle saat channel.send gagal (Forbidden)."""
+        bot = MusicBot()
+        guild = MagicMock(id=99922)
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.is_connected.return_value = True
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.queue.clear()
+        state.current = None
+        bot.states[guild.id] = state
+        bot._schedule_idle = MagicMock()
+
+        interaction = MagicMock(guild=guild)
+        interaction.user = MagicMock(voice=MagicMock(channel=vc.channel))
+        channel = MagicMock()
+        channel.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "Forbidden"))
+        interaction.channel = channel
+        interaction.channel_id = 9202
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        asyncio.run(bot.summon(interaction))
+        bot._schedule_idle.assert_called_once()
+
+    def test_wave13_panel_guard_timeout_disconnects_ghost_voice(self):
+        """Wave 13: MusicPanel.guard memutus force=True voice_client saat TimeoutError."""
+        import inspect
+        src = inspect.getsource(MusicPanel.guard)
+        self.assertIn("TimeoutError", src)
+        self.assertIn("disconnect(force=True)", src)
+
+    def test_wave13_enqueue_restores_current_when_bot_offline(self):
+        """Wave 13: _enqueue_tracks mengembalikan state.current ke antrean saat bot belum terhubung voice."""
+        bot = MusicBot()
+        guild = MagicMock(id=99923)
+        guild.voice_client = None
+
+        state = QueueState()
+        track = Track("InterruptedSong", "https://youtube.com/watch?v=interrupted", "u")
+        state.current = track
+        state.queue.clear()
+        bot.states[guild.id] = state
+
+        new_track = [Track("NewSong", "https://youtube.com/watch?v=new", "u")]
+        ok = asyncio.run(bot._enqueue_tracks(guild, new_track))
+        self.assertTrue(ok)
+        self.assertIn(track, state.queue)
+        self.assertNotIn(track, state.history)
+
+    def test_wave13_shuffle_in_place_no_clear(self):
+        """Wave 13: shuffle memutasi antrean in-place tanpa memicu state.queue.clear()."""
+        import inspect
+        src_cmd = inspect.getsource(MusicBot.cmd_shuffle)
+        src_panel = inspect.getsource(MusicPanel.shuffle)
+        self.assertNotIn("state.queue.clear()", src_cmd)
+        self.assertNotIn("state.queue.clear()", src_panel)
+
+    def test_wave13_announce_now_playing_no_orphan_shield(self):
+        """Wave 13: _announce_now_playing tidak menggunakan pola assignment langsung pada asyncio.shield."""
+        import inspect
+        src = inspect.getsource(MusicBot._announce_now_playing)
+        self.assertNotIn("state.now_message = await asyncio.shield", src)
+
+    def test_wave13_escape_markdown_none_title_safe(self):
+        """Wave 13: escape_markdown aman dari NoneType error pada PlaylistView, MusicPanel, cmd_queue, dan _announce."""
+        import inspect
+        src_pv = inspect.getsource(PlaylistView.refresh_playlist)
+        src_panel = inspect.getsource(MusicPanel.playlist)
+        src_cmd = inspect.getsource(MusicBot.cmd_queue)
+        src_ann = inspect.getsource(MusicBot._announce_now_playing)
+        self.assertNotIn("escape_markdown(current_track.title)", src_pv)
+        self.assertNotIn("escape_markdown(current_track.title)", src_panel)
+        self.assertNotIn("escape_markdown(current_track.title)", src_cmd)
+        self.assertNotIn("escape_markdown(track.title)", src_ann)
+
+    def test_wave13_format_duration_nan_inf_safe(self):
+        """Wave 13: format_duration menangani float NaN dan inf tanpa exception."""
+        from bot import format_duration
+        self.assertEqual(format_duration(float("nan")), "Live / Unknown")
+        self.assertEqual(format_duration(float("inf")), "Live / Unknown")
+        self.assertEqual(format_duration(float("-inf")), "Live / Unknown")
+
+    def test_wave13_clean_seed_title_single_noise_word(self):
+        """Wave 13: _clean_seed_title tidak menghapus judul lagu tunggal noise menjadi string kosong."""
+        from bot import _clean_seed_title
+        self.assertEqual(_clean_seed_title("Audio"), "Audio")
+        self.assertEqual(_clean_seed_title("Official"), "Official")
+
+    def test_wave13_tracks_from_metadata_relative_watch_url(self):
+        """Wave 13: _tracks_from_metadata menangani URL relatif 'watch?v=ID' tanpa duplikasi watch?v=."""
+        from bot import _tracks_from_metadata
+        data = {
+            "_type": "playlist",
+            "entries": [{"title": "Song", "url": "watch?v=dQw4w9WgXcQ"}]
+        }
+        tracks = _tracks_from_metadata(data, "u", "target")
+        self.assertEqual(len(tracks), 1)
+        self.assertNotIn("watch?v=watch?v=", tracks[0].url)
+        self.assertEqual(tracks[0].url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    def test_wave13_tracks_from_metadata_non_playlist_constructs_watch_url(self):
+        """Wave 13: _tracks_from_metadata non-playlist membuat watch URL dari data ID jika webpage_url kosong."""
+        from bot import _tracks_from_metadata
+        data = {"id": "dQw4w9WgXcQ", "title": "Song", "duration": 180}
+        tracks = _tracks_from_metadata(data, "u", "ytsearch1:test")
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0].url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    def test_wave13_get_afk_timeout_rejects_inf(self):
+        """Wave 13: get_afk_timeout menolak 'inf' dari AFK_TIMEOUT_SECONDS dan memakai fallback."""
+        from bot import get_afk_timeout
+        with patch.dict(os.environ, {"AFK_TIMEOUT_SECONDS": "inf"}):
+            self.assertEqual(get_afk_timeout(), 180.0)
+
+    def test_wave13_panel_update_invalidates_caches(self):
+        """Wave 13: Handler._update() menginvalidasi _ytdlp_version_cache dan _update_log_cache."""
+        import inspect
+        import panel as p
+        src = inspect.getsource(p.Handler._update)
+        self.assertIn("_ytdlp_version_cache", src)
+        self.assertIn("_update_log_cache", src)
+
+    def test_wave13_panel_cached_systemctl_has_lock(self):
+        """Wave 13: _cached_systemctl memproteksi subprocess fork dari thundering herd dengan lock."""
+        import inspect
+        import panel as p
+        src = inspect.getsource(p._cached_systemctl)
+        self.assertIn("_systemctl_lock", src)
