@@ -6148,4 +6148,85 @@ class Wave20RemediationTests(unittest.TestCase):
             self.assertIsInstance(extra.get("Retry-After"), str)
             self.assertEqual(extra.get("Retry-After"), "3")
 
+    def test_wave22_get_msg_id_invalid_string_returns_none(self):
+        """Wave 22: _get_msg_id mengembalikan None jika parsing int gagal."""
+        from bot import _get_msg_id
+        mock_obj = MagicMock()
+        mock_obj.id = "invalid_string_msg_id"
+        self.assertIsNone(_get_msg_id(mock_obj))
+        self.assertIsNone(_get_msg_id("invalid_string_msg_id"))
+        self.assertIsNone(_get_msg_id(True))
+
+    def test_wave22_save_persistent_queue_boolean_channel_id_omitted(self):
+        """Wave 22: _save_persistent_queue tidak menyimpan boolean text_channel_id."""
+        from bot import MusicBot, QueueState, Track
+        b = MusicBot()
+        st = QueueState()
+        st.current = Track("t1", "https://youtube.com/watch?v=1", "u1")
+        st.text_channel_id = True
+        b.states = {99901: st}
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+            temp_path = tf.name
+        b._queue_state_file = temp_path
+        try:
+            b._save_persistent_queue()
+            time.sleep(0.05)
+            with open(temp_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertIn("99901", data)
+            self.assertNotIn("text_channel_id", data["99901"])
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_wave22_state_accessors_none_guild_handled(self):
+        """Wave 22: Accessor state dengan guild None tidak melempar AttributeError."""
+        from bot import MusicBot
+        b = MusicBot()
+        b._schedule_idle(None, 0)
+        asyncio.run(b.finished(None, 0))
+        b._announce(None, None)
+        self.assertFalse(asyncio.run(b._enqueue_tracks(None, [])))
+
+    def test_wave22_error_message_truncation(self):
+        """Wave 22: on_tree_error memotong pesan error panjang ke batas aman 1900 char."""
+        from bot import MusicBot
+        b = MusicBot()
+        interaction = MagicMock()
+        interaction.response.is_done.return_value = False
+        interaction.response.send_message = AsyncMock()
+        huge_error = Exception("E" * 3000)
+        asyncio.run(b.on_tree_error(interaction, huge_error))
+        sent_msg = interaction.response.send_message.call_args[0][0]
+        self.assertLessEqual(len(sent_msg), 1900)
+
+    def test_wave22_panel_cached_systemctl_no_ask_password(self):
+        """Wave 22: _cached_systemctl menyertakan flag --no-ask-password."""
+        import panel as p
+        with patch("panel.subprocess.run") as mock_run:
+            mock_proc = MagicMock()
+            mock_proc.stdout = "active\n"
+            mock_run.return_value = mock_proc
+            with p._state_cache_lock:
+                p._state_cache.clear()
+            res = p._cached_systemctl("test_unit", "discord-music.service", 2, "unknown")
+            self.assertEqual(res, "active")
+            cmd = mock_run.call_args[0][0]
+            self.assertIn("--no-ask-password", cmd)
+
+    def test_wave22_detect_js_runtime_lazy_loading(self):
+        """Wave 22: _get_js_runtime lazy load dan cache di _JS_RUNTIME."""
+        import bot as b
+        orig_runtime = b._JS_RUNTIME
+        try:
+            b._JS_RUNTIME = None
+            with patch("bot._detect_js_runtime", return_value={"node": {"path": "/usr/bin/node"}}) as mock_detect:
+                r1 = b._get_js_runtime()
+                r2 = b._get_js_runtime()
+                self.assertEqual(r1, {"node": {"path": "/usr/bin/node"}})
+                self.assertEqual(r2, r1)
+                self.assertEqual(mock_detect.call_count, 1)
+        finally:
+            b._JS_RUNTIME = orig_runtime
+
 

@@ -330,7 +330,7 @@ def _cached_systemctl(kind: str, unit: str, timeout: int, fallback: str) -> str:
             if hit is not None and now - hit[0] < STATE_CACHE_TTL:
                 return hit[1]
         try:
-            result = subprocess.run(['systemctl', 'is-active', unit],
+            result = subprocess.run(['systemctl', '--no-ask-password', 'is-active', unit],
                                     capture_output=True, text=True, timeout=timeout)
             value = result.stdout.strip()
         except Exception:
@@ -406,10 +406,10 @@ def read_last_update_log() -> str:
                     handle.seek(max(0, size - 65536))
                     handle.readline()
                 content = handle.read()[-65536:].strip()
-                if content:
-                    with _update_log_lock:
-                        _update_log_cache = (mtime, now, content)
-                    return content
+                res = content if content else (_last_update_output or '')
+                with _update_log_lock:
+                    _update_log_cache = (mtime, now, res)
+                return res
     except Exception:
         pass
     with _lock:
@@ -557,7 +557,7 @@ def _run_update_inner() -> tuple[bool, str]:
                 else:
                     out += f'\nGagal merestart service, return code: {restart_proc.returncode}'
                     ok = False
-        if ok and cmd == [update_script]:
+        if cmd == [update_script]:
             if os.path.exists(UPDATE_LOG_PATH):
                 try:
                     with open(UPDATE_LOG_PATH, 'r', encoding='utf-8', errors='replace') as handle:
