@@ -129,6 +129,7 @@ class ConfigStore:
 
     def __init__(self, path: str):
         self.path = path
+        self._lock = threading.Lock()
 
     @staticmethod
     def _key_of(body: str) -> str:
@@ -194,47 +195,48 @@ class ConfigStore:
         return kept
 
     def write(self, values: dict) -> None:
-        for value in values.values():
-            if '\n' in value or '\r' in value:
-                raise ValueError('Nilai tidak boleh mengandung baris baru.')
+        with self._lock:
+            for value in values.values():
+                if '\n' in value or '\r' in value:
+                    raise ValueError('Nilai tidak boleh mengandung baris baru.')
 
-        preserved = self._preserved_lines()
-        lines = [
-            '# Dikelola panel musik. Jangan commit berkas ini.',
-            f"DISCORD_TOKEN={values.get('token', '')}",
-            f"DISCORD_GUILD_ID={values.get('guild', '')}",
-        ]
-        lines.extend(preserved)
-        body = '\n'.join(lines) + '\n'
+            preserved = self._preserved_lines()
+            lines = [
+                '# Dikelola panel musik. Jangan commit berkas ini.',
+                f"DISCORD_TOKEN={values.get('token', '')}",
+                f"DISCORD_GUILD_ID={values.get('guild', '')}",
+            ]
+            lines.extend(preserved)
+            body = '\n'.join(lines) + '\n'
 
-        directory = os.path.dirname(self.path) or '.'
-        os.makedirs(directory, exist_ok=True)
+            directory = os.path.dirname(self.path) or '.'
+            os.makedirs(directory, exist_ok=True)
 
-        # Nama unik per panggilan: dua /save bersamaan tidak boleh berbagi
-        # berkas sementara (yang bisa membuat salah satunya gagal atau data
-        # saling menimpa). Tulis penuh + fsync lalu rename atomik agar .env
-        # tidak pernah terlihat kosong/terpotong.
-        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.env.', suffix='.tmp')
-        closed = False
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                closed = True
-                handle.write(body)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp_path, self.path)
-        except Exception:
-            if not closed:
+            # Nama unik per panggilan: dua /save bersamaan tidak boleh berbagi
+            # berkas sementara (yang bisa membuat salah satunya gagal atau data
+            # saling menimpa). Tulis penuh + fsync lalu rename atomik agar .env
+            # tidak pernah terlihat kosong/terpotong.
+            fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.env.', suffix='.tmp')
+            closed = False
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                    closed = True
+                    handle.write(body)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, self.path)
+            except Exception:
+                if not closed:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 try:
-                    os.close(fd)
+                    os.remove(tmp_path)
                 except OSError:
                     pass
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
+                raise
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -536,7 +538,13 @@ def _run_update_inner() -> tuple[bool, str]:
         return False, err
 
 
+_runtime_info_cache: tuple[str, float | None, float, dict] | None = None
+_runtime_info_lock = threading.Lock()
+RUNTIME_INFO_CACHE_TTL = 1.0
+
+
 def read_bot_runtime_info() -> dict:
+    global _runtime_info_cache
     active = bot_state() == 'active'
     default_info = {
         'status': 'online' if active else 'offline',
@@ -555,14 +563,28 @@ def read_bot_runtime_info() -> dict:
         else:
             path = '/tmp/discord-music-state.json'
 
+    now = time.monotonic()
     try:
-        if os.path.exists(path):
+        mtime = os.path.getmtime(path) if os.path.exists(path) else None
+    except OSError:
+        mtime = None
+
+    with _runtime_info_lock:
+        if _runtime_info_cache is not None:
+            c_path, c_mtime, c_time, c_data = _runtime_info_cache
+            if c_path == path and c_mtime == mtime and (now - c_time) < RUNTIME_INFO_CACHE_TTL:
+                return c_data
+
+    try:
+        if mtime is not None:
             if os.path.getsize(path) > 1048576:
                 return default_info
             with open(path, 'r', encoding='utf-8') as handle:
                 data = json.load(handle)
             if time.time() - data.get('updated_at', 0) < 60:
                 data['status'] = 'online'
+                with _runtime_info_lock:
+                    _runtime_info_cache = (path, mtime, now, data)
                 return data
     except Exception:
         pass
@@ -607,6 +629,8 @@ def format_guilds_html(info: dict) -> str:
             play_status = '⏸️ Jeda' if is_paused else ('▶️ Memutar' if is_playing else '⏹️ Standby di voice')
             if track:
                 track_html = f'<div class="track-row">{play_status}: <span>{track}</span> <small style="color:var(--muted)">({queue_len} di antrean)</small></div>'
+            elif queue_len > 0:
+                track_html = f'<div class="track-row">{play_status} <small style="color:var(--muted)">({queue_len} di antrean)</small></div>'
             else:
                 track_html = f'<div class="track-row">{play_status} <small style="color:var(--muted)">(antrean kosong)</small></div>'
 
@@ -1308,27 +1332,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._page('Guild ID di luar batas integer yang diizinkan.', HTTPStatus.BAD_REQUEST)
 
-        # Penanganan password panel
-        if clear_pass:
-            try:
-                update_panel_password('')
-                cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
-                extra_headers['Set-Cookie'] = cookie
-            except Exception as exc:
-                self.log_exception('save password gagal: %s', exc)
-                return self._page('Gagal menghapus password panel.', HTTPStatus.INTERNAL_SERVER_ERROR)
-        elif raw_pass:
-            if len(raw_pass) > 128:
-                return self._page('Password panel maksimal 128 karakter.', HTTPStatus.BAD_REQUEST)
-            try:
-                update_panel_password(raw_pass)
-                token_session = _mint_session()
-                cookie = (f'{COOKIE}={token_session}; Path=/; HttpOnly; SameSite=Lax; '
-                          f'Max-Age={SESSION_TTL}')
-                extra_headers['Set-Cookie'] = cookie
-            except Exception as exc:
-                self.log_exception('save password gagal: %s', exc)
-                return self._page('Gagal menyimpan password panel.', HTTPStatus.INTERNAL_SERVER_ERROR)
+        if raw_pass and len(raw_pass) > 128:
+            return self._page('Password panel maksimal 128 karakter.', HTTPStatus.BAD_REQUEST)
 
         try:
             store().write({'token': token, 'guild': guild})
@@ -1342,6 +1347,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._page('Gagal menyimpan konfigurasi: berkas tidak bisa ditulis. '
                               'Periksa izin / ruang disk.',
                               HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        # Penanganan password panel (hanya setelah write konfigurasi sukses)
+        if clear_pass:
+            try:
+                update_panel_password('')
+                cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
+                extra_headers['Set-Cookie'] = cookie
+            except Exception as exc:
+                self.log_exception('save password gagal: %s', exc)
+                return self._page('Gagal menghapus password panel.', HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif raw_pass:
+            try:
+                update_panel_password(raw_pass)
+                token_session = _mint_session()
+                cookie = (f'{COOKIE}={token_session}; Path=/; HttpOnly; SameSite=Lax; '
+                          f'Max-Age={SESSION_TTL}')
+                extra_headers['Set-Cookie'] = cookie
+            except Exception as exc:
+                self.log_exception('save password gagal: %s', exc)
+                return self._page('Gagal menyimpan password panel.', HTTPStatus.INTERNAL_SERVER_ERROR)
         self.log_message('konfigurasi disimpan (token_set=%s guild_set=%s pass_set=%s)',
                          bool(token), bool(guild), bool(PASSWORD))
         if clear_pass:
@@ -1364,6 +1389,8 @@ class Handler(BaseHTTPRequestHandler):
             _ytdlp_version_cache = None
         with _update_log_lock:
             _update_log_cache = None
+        with _runtime_info_lock:
+            _runtime_info_cache = None
         if ok:
             self._set_flash(f'Pembaruan yt-dlp berhasil dijalankan.\n{out}')
         else:
@@ -1402,6 +1429,8 @@ class Handler(BaseHTTPRequestHandler):
         with _log_cache_lock:
             _log_cache.clear()
             _last_fresh_log_time.clear()
+        with _runtime_info_lock:
+            _runtime_info_cache = None
         self._set_flash(labels.get(action, 'Selesai.'))
         return self._redirect('/')
 

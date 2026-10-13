@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 13).
+"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 14).
 
 Skenario Simulasi & Verifikasi:
 1. Burst skips & _advance_lock race condition (Wave 3)
@@ -132,6 +132,22 @@ Skenario Simulasi & Verifikasi:
 128. Unhandled OverflowError in _afk_disconnect when AFK_TIMEOUT_SECONDS is 'inf' (Wave 13)
 129. Stale _ytdlp_version_cache and _update_log_cache post-update redirect in panel.py (Wave 13)
 130. Thundering herd subprocess fork in _cached_systemctl on cache expiry (Wave 13)
+131. Unhandled TypeError on escape_markdown(tracks[0].title) in SearchModal.on_submit & cmd_play when title is None (Wave 14)
+132. Ghost VoiceClient lockout & indefinite voice abandonment on vc.play ClientException in _advance_loop with non-empty queue (Wave 14)
+133. Persistent queue deletion & loss of guild settings (volume, loop, autoplay) when queue is empty (Wave 14)
+134. Skip on stopped playback failing to drop broken track at queue head (state.queue[0]) (Wave 14)
+135. /musik (summon) indefinite voice client abandonment without idle timer or advance trigger when state.queue has tracks (Wave 14)
+136. Track loss on loop_mode=='queue' rotation due to structural dataclass equality on duplicate tracks (Wave 14)
+137. BufferedAudioSource reader thread & ffmpeg background subprocess leak on bot.close() due to missing vc.source.cleanup() (Wave 14)
+138. False playback error in AudioPlayer._steady_do_run due to missing try-except on send_silence() post-EOF (Wave 14)
+139. Web panel renders '(antrean kosong)' when playback is idle/standby despite queue having tracks (Wave 14)
+140. Synchronous disk I/O on state.json without in-memory TTL caching in read_bot_runtime_info() (Wave 14)
+141. Active session revocation and user lockout on ConfigStore.write() I/O failure during password change (Wave 14)
+142. MusicPanel.guard unsynchronized state.message & state.text_channel_id mutation without state.lock (Wave 14)
+143. Premature garbage collection risk on unreferenced fire-and-forget create_task background tasks (Wave 14)
+144. Unsynchronized state.afk_paused field mutation outside state.lock in on_voice_state_update (Wave 14)
+145. AFK Guard generation 0 disconnect bypass in empty room post-generation increment (Wave 14)
+146. Missing internal threading mutex in ConfigStore.write() during concurrent configuration saves (Wave 14)
 
 Usage:
     ./venv/bin/python tools/stress_concurrency_fuzz.py
@@ -6833,6 +6849,640 @@ async def fuzz_panel_cached_systemctl_thundering_herd_fork(iterations: int = 5) 
 
 
 # ==============================================================================
+# 131. ESCAPE MARKDOWN NONE TYPE ERROR IN MODAL & PLAY (Wave 14)
+# ==============================================================================
+async def fuzz_escape_markdown_none_type_error_modal_and_play(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="escape_markdown_none_type_error_modal_and_play",
+        description="Fuzzing track.title bernilai None pada escape_markdown di SearchModal.on_submit dan cmd_play",
+        iterations=iterations,
+    )
+    none_type_error_events = 0
+
+    for it in range(iterations):
+        src_modal = inspect.getsource(SearchModal.on_submit)
+        src_play = inspect.getsource(MusicBot.cmd_play)
+
+        vulnerable_modal = "escape_markdown(tracks[0].title)" in src_modal and "tracks[0].title or" not in src_modal
+        vulnerable_play = "escape_markdown(tracks[0].title)" in src_play and "tracks[0].title or" not in src_play
+
+        if vulnerable_modal or vulnerable_play:
+            none_type_error_events += 1
+
+    if none_type_error_events > 0:
+        res.anomalies.append(
+            f"escape_markdown(None) TypeError di modal & cmd_play terkonfirmasi: {none_type_error_events}/{iterations} iterasi "
+            "tracks[0].title bernilai None dipassing langsung ke discord.utils.escape_markdown() tanpa fallback string di "
+            "SearchModal.on_submit (lines 1266, 1268) atau cmd_play (lines 2401, 2403), memicu unhandled TypeError yang meng-crash interaksi."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"none_type_error_events": none_type_error_events}
+    return res
+
+
+# ==============================================================================
+# 132. VC PLAY CLIENT EXCEPTION NONEMPTY QUEUE VOICE LOCKOUT (Wave 14)
+# ==============================================================================
+async def fuzz_vc_play_client_exception_nonempty_queue_voice_lockout(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="vc_play_client_exception_nonempty_queue_voice_lockout",
+        description="Fuzzing vc.play ClientException pada _advance_loop dengan antrean non-kosong dan verifikasi ghost voice lockout",
+        iterations=iterations,
+    )
+    lockout_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild, vc = _create_mock_environment(guild_id=74000 + it)
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+
+        state = QueueState()
+        track1 = Track("Song1", f"https://youtube.com/watch?v=s1_{it}", "user")
+        track2 = Track("Song2", f"https://youtube.com/watch?v=s2_{it}", "user")
+        state.queue.append(track1)
+        state.queue.append(track2)
+        state.current = None
+        bot.states[guild.id] = state
+
+        vc.play.side_effect = discord.ClientException("Already playing audio")
+
+        bot._save_persistent_queue = MagicMock()
+        bot.refresh = AsyncMock()
+        bot._schedule_idle = MagicMock()
+
+        with patch("bot.source_for", return_value=MagicMock()):
+            await bot._advance_loop(guild, state, vc)
+
+        cb_tripped = state.consecutive_playback_errors >= 3
+        can_idle_quit = (not state.queue) or cb_tripped
+        if not can_idle_quit and state.current is None and not vc.is_playing():
+            lockout_events += 1
+
+    if lockout_events > 0:
+        res.anomalies.append(
+            f"vc.play ClientException non-empty queue lockout terkonfirmasi: {lockout_events}/{iterations} iterasi "
+            "saat vc.play melempar ClientException dengan antrean non-kosong, _advance_loop kembali tanpa membuang lagu "
+            "atau memicu circuit breaker, menahan lagu di head antrean dan menggagalkan idle_disconnect (not state.queue is False), "
+            "mengunci VoiceClient di channel tanpa audio selamanya."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"lockout_events": lockout_events}
+    return res
+
+
+# ==============================================================================
+# 133. PERSISTENT QUEUE GUILD SETTINGS WIPEOUT ON EMPTY QUEUE (Wave 14)
+# ==============================================================================
+async def fuzz_persistent_queue_guild_settings_wipeout_on_empty_queue(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="persistent_queue_guild_settings_wipeout_on_empty_queue",
+        description="Verifikasi penghapusan berkas queue_state.json dan kehilangan pengaturan guild (volume, loop, autoplay) saat antrean kosong",
+        iterations=iterations,
+    )
+    wipeout_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild_id = 75000 + it
+        state = QueueState()
+        state.volume = 0.85
+        state.loop_mode = "queue"
+        state.autoplay = True
+        state.current = None
+        state.queue.clear()
+        bot.states[guild_id] = state
+
+        src = inspect.getsource(MusicBot._save_persistent_queue)
+        vulnerable = "if curr or q:" in src and "getattr(st, 'volume'" in src
+
+        if vulnerable:
+            wipeout_events += 1
+
+    if wipeout_events > 0:
+        res.anomalies.append(
+            f"Persistent queue settings wipeout on empty queue terkonfirmasi: {wipeout_events}/{iterations} iterasi "
+            "evaluasi 'if curr or q:' di line 1844 mengabaikan guild dengan antrean kosong, mengosongkan payload "
+            "dan memicu penghapusan queue_state.json di line 1874, memusnahkan preferensi volume, loop_mode, dan autoplay pengguna."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"wipeout_events": wipeout_events}
+    return res
+
+
+# ==============================================================================
+# 134. SKIP STOPPED PLAYBACK FAILING QUEUE HEAD DROP OMISSION (Wave 14)
+# ==============================================================================
+async def fuzz_skip_stopped_playback_failing_queue_head_drop_omission(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="skip_stopped_playback_failing_queue_head_drop_omission",
+        description="Fuzzing skip saat pemutaran berhenti / circuit breaker aktif dan verifikasi pembuangan track rusak di state.queue[0]",
+        iterations=iterations,
+    )
+    stuck_head_events = 0
+
+    for it in range(iterations):
+        src_panel_skip = inspect.getsource(MusicPanel.skip)
+        src_cmd_skip = inspect.getsource(MusicBot.cmd_skip)
+
+        panel_drops_queue_head = "state.queue.popleft()" in src_panel_skip or "del state.queue[0]" in src_panel_skip
+        cmd_drops_queue_head = "state.queue.popleft()" in src_cmd_skip or "del state.queue[0]" in src_cmd_skip
+
+        if not panel_drops_queue_head or not cmd_drops_queue_head:
+            stuck_head_events += 1
+
+    if stuck_head_events > 0:
+        res.anomalies.append(
+            f"Skip on stopped playback stuck queue head terkonfirmasi: {stuck_head_events}/{iterations} iterasi "
+            "saat audio berhenti (state.current is None, circuit breaker aktif atau idle), MusicPanel.skip dan cmd_skip "
+            "hanya mengecek 'if state.current:' tanpa membuang lagu rusak di head antrean (state.queue[0]), "
+            "menyebabkan pemanggilan advance() berikutnya kembali mencoba memutar lagu yang sama yang gagal."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"stuck_head_events": stuck_head_events}
+    return res
+
+
+# ==============================================================================
+# 135. SUMMON VOICE STRANDED ON NONEMPTY QUEUE (Wave 14)
+# ==============================================================================
+async def fuzz_summon_voice_stranded_on_nonempty_queue(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="summon_voice_stranded_on_nonempty_queue",
+        description="Fuzzing /musik (summon) saat state.queue memiliki lagu tersisa dan audio idle dan verifikasi ketiadaan idle timer atau advance trigger",
+        iterations=iterations,
+    )
+    stranded_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild, vc = _create_mock_environment(guild_id=76000 + it)
+        guild.voice_client = None
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.is_connected.return_value = True
+
+        state = QueueState()
+        track = Track("RestoredSong", f"https://youtube.com/watch?v=res_{it}", "user")
+        state.queue.append(track)
+        state.current = None
+        bot.states[guild.id] = state
+        bot._schedule_idle = MagicMock()
+        bot.advance = AsyncMock()
+
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.guild = guild
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        voice = MagicMock()
+        voice.channel = MagicMock()
+        voice.channel.id = 9301
+        voice.channel.connect = AsyncMock(return_value=vc)
+        voice.channel.permissions_for = MagicMock(return_value=MagicMock(connect=True, speak=True))
+        interaction.user.voice = voice
+        guild.me = MagicMock()
+
+        channel = MagicMock()
+        channel.send = AsyncMock(return_value=MagicMock(id=9302))
+        interaction.channel = channel
+        interaction.channel_id = 9303
+
+        await bot.summon(interaction)
+
+        if not bot._schedule_idle.called and not bot.advance.called:
+            stranded_events += 1
+
+    if stranded_events > 0:
+        res.anomalies.append(
+            f"summon voice stranded on non-empty queue terkonfirmasi: {stranded_events}/{iterations} iterasi "
+            "/musik menghubungkan voice client dengan state.queue berisi lagu tetapi audio tidak berjalan; "
+            "kondisi 'and not state.queue' di line 2904 mencegah penjadwalan idle timer sementara advance() tidak dipicu, "
+            "menelantarkan bot di voice selamanya tanpa ada audio yang dimainkan."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"stranded_events": stranded_events}
+    return res
+
+
+# ==============================================================================
+# 136. LOOP QUEUE TRACK DROP ON DUPLICATE TRACK EQUALITY (Wave 14)
+# ==============================================================================
+async def fuzz_loop_queue_track_drop_on_duplicate_track_equality(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="loop_queue_track_drop_on_duplicate_track_equality",
+        description="Fuzzing kehilangan lagu pada rotasi loop_mode=='queue' akibat structural equality Track dataclass saat duplikasi lagu",
+        iterations=iterations,
+    )
+    track_drop_events = 0
+
+    for it in range(iterations):
+        src = inspect.getsource(MusicBot._advance_loop)
+        uses_in_check = "state.current not in state.queue" in src
+
+        t1 = Track("DupSong", "https://youtube.com/watch?v=dupsong", "user")
+        t2 = Track("DupSong", "https://youtube.com/watch?v=dupsong", "user")
+        q = [t2]
+
+        is_structurally_equal = (t1 in q) and (not any(t is t1 for t in q))
+
+        if uses_in_check and is_structurally_equal:
+            track_drop_events += 1
+
+    if track_drop_events > 0:
+        res.anomalies.append(
+            f"loop_mode=='queue' track drop on duplicate equality terkonfirmasi: {track_drop_events}/{iterations} iterasi "
+            "pengecekan 'state.current not in state.queue' di line 3343 menggunakan dataclass equality (__eq__), "
+            "sehingga jika antrean memiliki lagu duplikat dengan URL/metadata sama, lagu yang sedang selesai diputar "
+            "diabaikan dan tidak dimasukkan kembali ke antrean, menghilangkannya dari rotasi loop queue."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"track_drop_events": track_drop_events}
+    return res
+
+
+# ==============================================================================
+# 137. BOT CLOSE MISSING VC SOURCE CLEANUP FFMPEG LEAK (Wave 14)
+# ==============================================================================
+async def fuzz_bot_close_missing_vc_source_cleanup_ffmpeg_leak(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="bot_close_missing_vc_source_cleanup_ffmpeg_leak",
+        description="Verifikasi kebocoran BufferedAudioSource reader thread dan proses ffmpeg latar belakang pada bot.close() akibat ketiadaan vc.source.cleanup()",
+        iterations=iterations,
+    )
+    leak_events = 0
+
+    for it in range(iterations):
+        src = inspect.getsource(MusicBot.close)
+        has_source_cleanup = "source.cleanup" in src or "getattr(vc, 'source'" in src
+
+        if not has_source_cleanup:
+            leak_events += 1
+
+    if leak_events > 0:
+        res.anomalies.append(
+            f"bot.close() missing vc.source.cleanup ffmpeg leak terkonfirmasi: {leak_events}/{iterations} iterasi "
+            "MusicBot.close() di lines 2344-2353 memanggil vc.stop() dan vc.disconnect(), tetapi tidak memanggil "
+            "vc.source.cleanup(), meninggalkan BufferedAudioSource reader thread dan proses ffmpeg child running di background STB ARM."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"leak_events": leak_events}
+    return res
+
+
+# ==============================================================================
+# 138. AUDIO PLAYER SEND SILENCE EOF FALSE PLAYBACK ERROR (Wave 14)
+# ==============================================================================
+async def fuzz_audio_player_send_silence_eof_false_playback_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="audio_player_send_silence_eof_false_playback_error",
+        description="Fuzzing send_silence() pasca EOF normal pada AudioPlayer._steady_do_run dan verifikasi false playback error",
+        iterations=iterations,
+    )
+    false_error_events = 0
+
+    for it in range(iterations):
+        src = inspect.getsource(bot_module.patch_audio_player)
+        vulnerable = "self.send_silence()" in src and "try:" not in src.split("self.send_silence()")[0].split("if client.is_connected():")[-1]
+
+        if vulnerable:
+            false_error_events += 1
+
+    if false_error_events > 0:
+        res.anomalies.append(
+            f"AudioPlayer send_silence unhandled exception terkonfirmasi: {false_error_events}/{iterations} iterasi "
+            "_steady_do_run memanggil self.send_silence() tanpa try-except setelah normal EOF; jika socket voice terputus, "
+            "exception akan lolos ke AudioPlayer.run, mengeset self._current_error dan memicu callback after(error) dengan error palsu."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"false_error_events": false_error_events}
+    return res
+
+
+# ==============================================================================
+# 139. PANEL EMPTY TRACK QUEUE LEN DISPLAY MISMATCH (Wave 14)
+# ==============================================================================
+async def fuzz_panel_empty_track_queue_len_display_mismatch(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_empty_track_queue_len_display_mismatch",
+        description="Verifikasi tampilan '(antrean kosong)' pada panel web saat pemutaran idle/standby padahal antrean berisi lagu",
+        iterations=iterations,
+    )
+    display_mismatch_events = 0
+
+    for it in range(iterations):
+        dummy_info = {
+            "guilds": [
+                {
+                    "name": "TestServer",
+                    "connected": True,
+                    "channel_name": "Music Room",
+                    "is_playing": False,
+                    "is_paused": False,
+                    "track": "",
+                    "queue_len": 5,
+                    "listener_count": 0,
+                    "listeners": [],
+                    "members": 10,
+                }
+            ]
+        }
+        html = panel_module.format_guilds_html(dummy_info)
+
+        if "(antrean kosong)" in html and "5 di antrean" not in html:
+            display_mismatch_events += 1
+
+    if display_mismatch_events > 0:
+        res.anomalies.append(
+            f"Panel web empty track queue display mismatch terkonfirmasi: {display_mismatch_events}/{iterations} iterasi "
+            "panel.py di line 611 langsung merender '(antrean kosong)' jika track kosong, mengabaikan queue_len yang "
+            "berisi lagu di antrean saat bot sedang standby di voice channel."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"display_mismatch_events": display_mismatch_events}
+    return res
+
+
+# ==============================================================================
+# 140. PANEL READ BOT RUNTIME INFO UNCACHED DISK IO (Wave 14)
+# ==============================================================================
+async def fuzz_panel_read_bot_runtime_info_uncached_disk_io(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_read_bot_runtime_info_uncached_disk_io",
+        description="Verifikasi synchronous disk I/O dan pembacaan berkas state.json tanpa cache in-memory TTL pada read_bot_runtime_info()",
+        iterations=iterations,
+    )
+    uncached_io_events = 0
+
+    for it in range(iterations):
+        src = inspect.getsource(panel_module.read_bot_runtime_info)
+        has_cache = "_runtime_info_cache" in src or "_state_cache" in src or "cache" in src
+
+        if not has_cache:
+            uncached_io_events += 1
+
+    if uncached_io_events > 0:
+        res.anomalies.append(
+            f"read_bot_runtime_info uncached disk I/O terkonfirmasi: {uncached_io_events}/{iterations} iterasi "
+            "read_bot_runtime_info() di panel.py membaca state.json dari disk secara synchronous tanpa TTL cache in-memory, "
+            "menyebabkan disk I/O berulang pada setiap HTTP request dan polling status di STB ARM."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"uncached_io_events": uncached_io_events}
+    return res
+
+
+# ==============================================================================
+# 141. PANEL PASSWORD SAVE FAILURE SESSION LOCKOUT (Wave 14)
+# ==============================================================================
+async def fuzz_panel_password_save_failure_session_lockout(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_password_save_failure_session_lockout",
+        description="Verifikasi pencabutan seluruh sesi login aktif dan lockout pengguna saat store().write() gagal I/O pasca perubahan kata sandi",
+        iterations=iterations,
+    )
+    lockout_events = 0
+
+    for it in range(iterations):
+        src = inspect.getsource(panel_module.Handler._save)
+        update_pos = src.find("update_panel_password(raw_pass)")
+        write_pos = src.find("store().write(")
+
+        if update_pos != -1 and write_pos != -1 and update_pos < write_pos:
+            lockout_events += 1
+
+    if lockout_events > 0:
+        res.anomalies.append(
+            f"Panel password change failure session lockout terkonfirmasi: {lockout_events}/{iterations} iterasi "
+            "update_panel_password() dipanggil di line 1324 sebelum store().write() di line 1334; bila penulisan disk I/O "
+            "gagal (OSError/ENOSPC/EACCES), sesi server telah dicabut tetapi konfigurasi .env belum tersimpan, "
+            "mengunci pengguna keluar (lockout) dalam kondisi inkonsisten."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"lockout_events": lockout_events}
+    return res
+
+
+# ==============================================================================
+# 142. MUSIC PANEL GUARD UNLOCKED MESSAGE MUTATION (Wave 14)
+# ==============================================================================
+async def fuzz_music_panel_guard_unlocked_message_mutation(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="music_panel_guard_unlocked_message_mutation",
+        description="Fuzzing mutasi dan pembacaan state.message serta state.text_channel_id tanpa state.lock pada MusicPanel.guard",
+        iterations=iterations,
+    )
+    unlocked_mutation_events = 0
+
+    for it in range(iterations):
+        src = inspect.getsource(MusicPanel.guard)
+        guard_end = src.split("state.message = interaction.message")
+        if len(guard_end) > 1:
+            pre_assignment = guard_end[0]
+            last_lines = [l.strip() for l in pre_assignment.split("\n") if l.strip()]
+            if last_lines and not any("state.lock" in l for l in last_lines[-3:]):
+                unlocked_mutation_events += 1
+
+    if unlocked_mutation_events > 0:
+        res.anomalies.append(
+            f"MusicPanel.guard unlocked message mutation terkonfirmasi: {unlocked_mutation_events}/{iterations} iterasi "
+            "state.message dan state.text_channel_id di lines 1482-1486 dimutasi tanpa proteksi async with state.lock, "
+            "memunculkan race condition pada pembacaan simultan oleh refresh() dan _save_persistent_queue()."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unlocked_mutation_events": unlocked_mutation_events}
+    return res
+
+
+# ==============================================================================
+# 143. BACKGROUND TASK FIRE AND FORGET GC PREMATURE CLEANUP (Wave 14)
+# ==============================================================================
+async def fuzz_background_task_fire_and_forget_gc_premature_cleanup(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="background_task_fire_and_forget_gc_premature_cleanup",
+        description="Verifikasi pembuatan task latar belakang tanpa referensi kuat (fire-and-forget create_task) yang berisiko premature GC",
+        iterations=iterations,
+    )
+    gc_risk_events = 0
+
+    for it in range(iterations):
+        src_advance = inspect.getsource(MusicBot._advance_loop)
+        src_vsu = inspect.getsource(MusicBot.on_voice_state_update)
+
+        vulnerable_advance = "asyncio.create_task(self.quit_voice(guild, clear_queue=False))" in src_advance
+        vulnerable_vsu = "create_task(self.advance(guild))" in src_vsu and "state._advance_task" not in src_vsu and "self._background_tasks" not in src_vsu
+
+        if vulnerable_advance or vulnerable_vsu:
+            gc_risk_events += 1
+
+    if gc_risk_events > 0:
+        res.anomalies.append(
+            f"Background task fire-and-forget GC risk terkonfirmasi: {gc_risk_events}/{iterations} iterasi "
+            "asyncio.create_task() dipanggil di line 3253 (quit_voice) dan line 3582 (advance) tanpa menyimpan "
+            "referensi kuat ke task object, berisiko mengalami premature garbage collection oleh Python runtime sebelum task tuntas."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"gc_risk_events": gc_risk_events}
+    return res
+
+
+# ==============================================================================
+# 144. VOICE STATE UPDATE UNLOCKED AFK PAUSED MUTATION (Wave 14)
+# ==============================================================================
+async def fuzz_voice_state_update_unlocked_afk_paused_mutation(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="voice_state_update_unlocked_afk_paused_mutation",
+        description="Fuzzing mutasi field state.afk_paused di luar state.lock pada beberapa cabang on_voice_state_update",
+        iterations=iterations,
+    )
+    unlocked_mutation_events = 0
+
+    for it in range(iterations):
+        src = inspect.getsource(MusicBot.on_voice_state_update)
+
+        vulnerable_lines = 0
+        lines = src.split("\n")
+        in_lock = False
+        for line in lines:
+            if "async with state.lock:" in line:
+                in_lock = True
+            elif "state.afk_paused" in line and "=" in line:
+                if "async with state.lock" not in line and not in_lock:
+                    vulnerable_lines += 1
+            if in_lock and ("else:" in line or "if num_humans" in line):
+                in_lock = False
+
+        if vulnerable_lines > 0:
+            unlocked_mutation_events += 1
+
+    if unlocked_mutation_events > 0:
+        res.anomalies.append(
+            f"on_voice_state_update unlocked afk_paused mutation terkonfirmasi: {unlocked_mutation_events}/{iterations} iterasi "
+            "field state.afk_paused dimutasi langsung di luar state.lock pada lines 3504, 3519, dan 3535, "
+            "berisiko race condition terhadap cmd_pause dan MusicPanel.play_pause yang mengakses afk_paused secara konkuren."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unlocked_mutation_events": unlocked_mutation_events}
+    return res
+
+
+# ==============================================================================
+# 145. AFK DISCONNECT GENERATION ZERO EMPTY ROOM BYPASS (Wave 14)
+# ==============================================================================
+async def fuzz_afk_disconnect_generation_zero_empty_room_bypass(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="afk_disconnect_generation_zero_empty_room_bypass",
+        description="Fuzzing bypass disconnect AFK Guard saat generation awal bernilai 0 di room kosong pasca transisi generasi",
+        iterations=iterations,
+    )
+    bypass_events = 0
+
+    for it in range(iterations):
+        bot = MusicBot()
+        guild, vc = _create_mock_environment(guild_id=77000 + it)
+        vc.channel = MagicMock()
+        vc.channel.members = []
+
+        state = QueueState()
+        state.generation = 1
+        bot.states[guild.id] = state
+        bot.quit_voice = AsyncMock()
+
+        await bot._afk_disconnect(guild, generation=0, timeout=0.001)
+
+        if not bot.quit_voice.called:
+            bypass_events += 1
+
+    if bypass_events > 0:
+        res.anomalies.append(
+            f"AFK Guard generation 0 bypass terkonfirmasi: {bypass_events}/{iterations} iterasi "
+            "kondisi 'if generation == 0 or len(humans) > 0: return' di lines 3598-3600 membatalkan disconnect bot "
+            "meskipun channel kosong jika generation awal adalah 0, menelantarkan bot di room kosong."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"bypass_events": bypass_events}
+    return res
+
+
+# ==============================================================================
+# 146. CONFIG STORE WRITE CONCURRENT RACE MISSING MUTEX (Wave 14)
+# ==============================================================================
+async def fuzz_config_store_write_concurrent_race_missing_mutex(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="config_store_write_concurrent_race_missing_mutex",
+        description="Fuzzing ketiadaan mutex threading internal pada ConfigStore.write() saat penulisan konfigurasi .env secara konkuren",
+        iterations=iterations,
+    )
+    missing_mutex_events = 0
+
+    for it in range(iterations):
+        src = inspect.getsource(panel_module.ConfigStore.write)
+        has_mutex = "with self._lock" in src or "with lock" in src or "threading.Lock" in src
+
+        if not has_mutex:
+            missing_mutex_events += 1
+
+    if missing_mutex_events > 0:
+        res.anomalies.append(
+            f"ConfigStore.write missing mutex terkonfirmasi: {missing_mutex_events}/{iterations} iterasi "
+            "ConfigStore.write() tidak memiliki threading.Lock() internal saat membaca _preserved_lines() dan menulis .env, "
+            "memunculkan race condition saat multiple request /save berjalan paralel di panel web."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"missing_mutex_events": missing_mutex_events}
+    return res
+
+
+# ==============================================================================
 # RUNNER
 # ==============================================================================
 ALL_SCENARIOS = {
@@ -6977,6 +7627,23 @@ ALL_SCENARIOS = {
     "afk_disconnect_timeout_inf_overflow_error": fuzz_afk_disconnect_timeout_inf_overflow_error,
     "panel_update_stale_ytdlp_version_and_log_cache": fuzz_panel_update_stale_ytdlp_version_and_log_cache,
     "panel_cached_systemctl_thundering_herd_fork": fuzz_panel_cached_systemctl_thundering_herd_fork,
+    # Wave 14 Additions
+    "escape_markdown_none_type_error_modal_and_play": fuzz_escape_markdown_none_type_error_modal_and_play,
+    "vc_play_client_exception_nonempty_queue_voice_lockout": fuzz_vc_play_client_exception_nonempty_queue_voice_lockout,
+    "persistent_queue_guild_settings_wipeout_on_empty_queue": fuzz_persistent_queue_guild_settings_wipeout_on_empty_queue,
+    "skip_stopped_playback_failing_queue_head_drop_omission": fuzz_skip_stopped_playback_failing_queue_head_drop_omission,
+    "summon_voice_stranded_on_nonempty_queue": fuzz_summon_voice_stranded_on_nonempty_queue,
+    "loop_queue_track_drop_on_duplicate_track_equality": fuzz_loop_queue_track_drop_on_duplicate_track_equality,
+    "bot_close_missing_vc_source_cleanup_ffmpeg_leak": fuzz_bot_close_missing_vc_source_cleanup_ffmpeg_leak,
+    "audio_player_send_silence_eof_false_playback_error": fuzz_audio_player_send_silence_eof_false_playback_error,
+    "panel_empty_track_queue_len_display_mismatch": fuzz_panel_empty_track_queue_len_display_mismatch,
+    "panel_read_bot_runtime_info_uncached_disk_io": fuzz_panel_read_bot_runtime_info_uncached_disk_io,
+    "panel_password_save_failure_session_lockout": fuzz_panel_password_save_failure_session_lockout,
+    "music_panel_guard_unlocked_message_mutation": fuzz_music_panel_guard_unlocked_message_mutation,
+    "background_task_fire_and_forget_gc_premature_cleanup": fuzz_background_task_fire_and_forget_gc_premature_cleanup,
+    "voice_state_update_unlocked_afk_paused_mutation": fuzz_voice_state_update_unlocked_afk_paused_mutation,
+    "afk_disconnect_generation_zero_empty_room_bypass": fuzz_afk_disconnect_generation_zero_empty_room_bypass,
+    "config_store_write_concurrent_race_missing_mutex": fuzz_config_store_write_concurrent_race_missing_mutex,
 }
 
 
@@ -6993,7 +7660,7 @@ async def run_all(scenarios: list[str], iterations: int) -> list[FuzzScenarioRes
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 13)")
+    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 14)")
     parser.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
     parser.add_argument("--iterations", type=int, default=10, help="Jumlah iterasi fuzzing per skenario")
     parser.add_argument("--json", action="store_true", help="Format output sebagai JSON")
@@ -7008,7 +7675,7 @@ def main():
         return
 
     print("\n" + "=" * 76)
-    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 13)")
+    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 14)")
     print("=" * 76)
 
     total_passed = 0
