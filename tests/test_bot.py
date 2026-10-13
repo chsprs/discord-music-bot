@@ -2252,7 +2252,7 @@ class AFKGuardTests(unittest.TestCase):
                 self.assertTrue(state.afk_paused)
                 vc.pause.assert_called_once()
                 mock_refresh.assert_awaited_once_with(state)
-                self.assertEqual(mock_dump.call_count, 2)
+                self.assertEqual(mock_dump.call_count, 1)
                 if state.afk_task:
                     state.afk_task.cancel()
 
@@ -2292,7 +2292,7 @@ class AFKGuardTests(unittest.TestCase):
                 self.assertFalse(state.afk_paused)
                 vc.resume.assert_called_once()
                 mock_refresh.assert_awaited_once_with(state)
-                self.assertEqual(mock_dump.call_count, 2)
+                self.assertEqual(mock_dump.call_count, 1)
 
         asyncio.run(run_test())
 
@@ -5213,3 +5213,235 @@ class Wave10RemediationTests(unittest.TestCase):
             for _ in range(5):
                 panel_mod.read_bot_logs_cached(50, fresh=True)
             self.assertEqual(call_count, 1)
+
+    def test_wave11_panel_stale_guard_prevents_voice_connect(self):
+        """Wave 11: stale panel guard require_voice=True tidak menghubungkan voice sebelum validasi."""
+        bot = MusicBot()
+        guild = MagicMock(id=99801, voice_client=None)
+        state = QueueState()
+        active_msg = MagicMock(id=1111)
+        state.message = active_msg
+        bot.states[guild.id] = state
+
+        user_ch = MagicMock(id=9999)
+        perms = MagicMock(connect=True, speak=True)
+        user_ch.permissions_for.return_value = perms
+        user_ch.connect = AsyncMock()
+
+        stale_msg = MagicMock(id=2222)
+        interaction = MagicMock(guild=guild, message=stale_msg)
+        interaction.user = MagicMock()
+        interaction.user.voice = MagicMock(channel=user_ch)
+        interaction.response.is_done.return_value = False
+        interaction.response.send_message = AsyncMock()
+
+        panel = MusicPanel(bot)
+        allowed = asyncio.run(panel.guard(interaction, require_voice=True))
+        self.assertFalse(allowed)
+        user_ch.connect.assert_not_called()
+        self.assertIsNone(guild.voice_client)
+
+    def test_wave11_panel_skip_idle_resets_error_latch(self):
+        """Wave 11: panel skip saat idle dan queue ada lagu me-reset consecutive_playback_errors."""
+        bot = MusicBot()
+        guild = MagicMock(id=99802)
+        vc = MagicMock(channel=MagicMock(id=5555))
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.consecutive_playback_errors = 2
+        state.queue.append(Track("NextSong", "http://next", "user"))
+        bot.states[guild.id] = state
+
+        panel = MusicPanel(bot)
+        panel.guard = AsyncMock(return_value=True)
+
+        user_ch = MagicMock(id=5555)
+        interaction = MagicMock(guild=guild)
+        interaction.user = MagicMock()
+        interaction.user.voice = MagicMock(channel=user_ch)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        bot.advance = AsyncMock()
+
+        asyncio.run(panel.skip.callback(interaction))
+        self.assertEqual(state.consecutive_playback_errors, 0)
+        bot.advance.assert_called_once()
+
+    def test_wave11_afk_disconnect_clears_empty_task(self):
+        """Wave 11: _afk_disconnect membersihkan state.empty_task saat state.afk_task None."""
+        bot = MusicBot()
+        guild = MagicMock(id=99803)
+        guild.voice_client = MagicMock(channel=MagicMock(members=[MagicMock(bot=True)]))
+        state = QueueState()
+        state.generation = 1
+        bot.states[guild.id] = state
+        bot.quit_voice = AsyncMock()
+
+        async def _run():
+            task = asyncio.create_task(bot._empty_disconnect(guild, state.generation))
+            state.empty_task = task
+            state.afk_task = None
+            with patch("asyncio.sleep", AsyncMock()):
+                await task
+
+        asyncio.run(_run())
+        self.assertIsNone(state.empty_task)
+
+    def test_wave11_save_persistent_queue_chmod_0644(self):
+        """Wave 11: _save_persistent_queue menerapkan os.chmod 0644 pada berkas queue_state.json."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            q_path = os.path.join(tmpdir, "queue_state.json")
+            orig_umask = os.umask(0o077)
+            try:
+                bot = MusicBot()
+                guild = MagicMock(id=99804, voice_client=None)
+                state = QueueState()
+                state.queue.append(Track("T", "http://t", "u"))
+                bot.states[guild.id] = state
+
+                with patch("bot._persistent_queue_file", return_value=q_path):
+                    fut = bot._save_persistent_queue()
+                    if fut is not None:
+                        asyncio.run(fut)
+
+                self.assertTrue(os.path.exists(q_path))
+                mode = os.stat(q_path).st_mode & 0o777
+                self.assertEqual(mode, 0o644)
+            finally:
+                os.umask(orig_umask)
+
+    def test_wave11_cmd_musik_idle_schedule(self):
+        """Wave 11: /musik menjadwalkan _schedule_idle saat bot di voice dan antrean kosong."""
+        bot = MusicBot()
+        guild = MagicMock(id=99805)
+        vc = MagicMock(channel=MagicMock(id=7777))
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.queue.clear()
+        state.current = None
+        bot.states[guild.id] = state
+
+        interaction = MagicMock(guild=guild)
+        interaction.user = MagicMock(voice=MagicMock(channel=vc.channel))
+        txt_chan = MagicMock(id=8888)
+        txt_chan.send = AsyncMock(return_value=MagicMock(id=1234))
+        interaction.channel = txt_chan
+        interaction.channel_id = 8888
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        bot._schedule_idle = MagicMock()
+        asyncio.run(bot.summon(interaction))
+        bot._schedule_idle.assert_called_once()
+
+    def test_wave11_cmd_autoplay_stale_current_advances(self):
+        """Wave 11: cmd_autoplay memicu advance() saat bot idle di voice meskipun state.current non-None."""
+        bot = MusicBot()
+        guild = MagicMock(id=99806)
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.autoplay = False
+        state.current = Track("FinishedSong", "http://seed", "u")
+        state.queue.clear()
+        bot.states[guild.id] = state
+
+        interaction = MagicMock(guild=guild)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        bot.advance = AsyncMock()
+        bot.refresh = AsyncMock()
+
+        asyncio.run(bot.cmd_autoplay(interaction))
+        self.assertTrue(state.autoplay)
+        bot.advance.assert_called_once_with(guild)
+
+    def test_wave11_cmd_pause_idle_clears_current_and_schedules_idle(self):
+        """Wave 11: cmd_pause saat idle membersihkan stale current dan menjadwalkan idle disconnect."""
+        bot = MusicBot()
+        guild = MagicMock(id=99807)
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.current = Track("StaleSong", "http://stale", "u")
+        state.queue.clear()
+        state.consecutive_playback_errors = 2
+        bot.states[guild.id] = state
+
+        interaction = MagicMock(guild=guild)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        bot.refresh = AsyncMock()
+        bot._schedule_idle = MagicMock()
+
+        with patch("bot._check_same_voice", return_value=(True, "")):
+            asyncio.run(bot.cmd_pause(interaction))
+
+        self.assertIsNone(state.current)
+        bot._schedule_idle.assert_called_once()
+
+    def test_wave11_embed_formatting_backticks_and_empty_author(self):
+        """Wave 11: embed bot membersihkan backticks dari title dan menangani author kosong dengan aman."""
+        bot = MusicBot()
+        state = QueueState()
+        track = Track(title="Song with `inline code` in title", url="http://t", requester="user", author="")
+        state.current = track
+
+        embed = bot.embed(state)
+        self.assertNotIn("``", embed.description)
+        self.assertNotIn("`Song with `inline code`", embed.description)
+        for f in embed.fields:
+            if f.name == "🎙 Music Author":
+                self.assertNotEqual(f.value, "``")
+                self.assertIn("Unknown", f.value)
+
+    def test_wave11_voice_state_update_single_dump(self):
+        """Wave 11: on_voice_state_update memanggil dump_runtime_state paling banyak 1 kali."""
+        bot = MusicBot()
+        guild = MagicMock(id=99808)
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.channel.members = [MagicMock(bot=True)]
+        guild.voice_client = vc
+
+        state = QueueState()
+        bot.states[guild.id] = state
+        bot.refresh = AsyncMock()
+
+        dump_count = 0
+        def counting_dump(b):
+            nonlocal dump_count
+            dump_count += 1
+
+        member = MagicMock(bot=False, guild=guild)
+        before = MagicMock(channel=vc.channel)
+        after = MagicMock(channel=None)
+
+        with patch("bot.dump_runtime_state", side_effect=counting_dump):
+            asyncio.run(bot.on_voice_state_update(member, before, after))
+
+        self.assertEqual(dump_count, 1)
+
+    def test_wave11_panel_ytdlp_version_metadata(self):
+        """Wave 11: panel.ytdlp_version menggunakan importlib.metadata dan reload alih-alih sys.modules stale."""
+        import sys
+        import panel as panel_mod
+        old_mock = MagicMock(__version__="2020.01.01")
+        with patch.dict(sys.modules, {"yt_dlp.version": old_mock}):
+            ver = panel_mod.ytdlp_version()
+            self.assertNotEqual(ver, "2020.01.01")

@@ -330,10 +330,16 @@ def timer_state() -> str:
 
 def ytdlp_version() -> str:
     try:
-        import yt_dlp.version
-        return getattr(yt_dlp.version, '__version__', 'terpasang')
+        import importlib.metadata
+        return importlib.metadata.version('yt-dlp')
     except Exception:
-        return 'tidak diketahui'
+        try:
+            import importlib
+            import yt_dlp.version
+            importlib.reload(yt_dlp.version)
+            return getattr(yt_dlp.version, '__version__', 'terpasang')
+        except Exception:
+            return 'tidak diketahui'
 
 
 def read_last_update_log() -> str:
@@ -375,6 +381,7 @@ LOG_FRESH_DEBOUNCE_TTL = 1.0
 _log_cache: dict[str, tuple[float, str]] = {}
 _last_fresh_log_time: dict[str, float] = {}
 _log_cache_lock = threading.Lock()
+_log_fetch_lock = threading.Lock()
 
 
 def read_bot_logs_cached(lines: int = 35, fresh: bool = False) -> str:
@@ -389,13 +396,24 @@ def read_bot_logs_cached(lines: int = 35, fresh: bool = False) -> str:
             last_fresh = _last_fresh_log_time.get(key, 0.0)
             if fresh and (started - last_fresh < LOG_FRESH_DEBOUNCE_TTL):
                 return hit[1]
-    value = read_bot_logs(lines)
-    finished = time.monotonic()
-    with _log_cache_lock:
-        _log_cache[key] = (finished, value)
         if fresh:
-            _last_fresh_log_time[key] = finished
-    return value
+            _last_fresh_log_time[key] = started
+
+    with _log_fetch_lock:
+        with _log_cache_lock:
+            hit = _log_cache.get(key)
+            if hit is not None:
+                if not fresh and time.monotonic() - hit[0] < LOG_CACHE_TTL:
+                    return hit[1]
+                if fresh and _last_fresh_log_time.get(key, 0.0) > started:
+                    return hit[1]
+        value = read_bot_logs(lines)
+        finished = time.monotonic()
+        with _log_cache_lock:
+            _log_cache[key] = (finished, value)
+            if fresh:
+                _last_fresh_log_time[key] = finished
+        return value
 
 
 def listeners_active() -> bool:
