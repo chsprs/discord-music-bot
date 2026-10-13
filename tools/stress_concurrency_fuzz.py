@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 18).
+"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 19).
 
 Skenario Simulasi & Verifikasi:
 1. Burst skips & _advance_lock race condition (Wave 3)
@@ -239,6 +239,7 @@ import sys
 import tempfile
 import threading
 import time
+import math
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -9918,6 +9919,799 @@ async def fuzz_config_store_write_non_dict_validation(iterations: int = 5) -> Fu
     return res
 
 
+
+
+# ==============================================================================
+# 218. MUSIC PANEL SKIP MISSING IDLE SCHEDULE (Wave 19)
+# ==============================================================================
+async def fuzz_music_panel_skip_missing_idle_schedule(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="music_panel_skip_missing_idle_schedule",
+        description="Fuzzing MusicPanel.skip saat advance_queue=True tanpa penjadwalan _schedule_idle jika audio berhenti atau antrean kosong",
+        iterations=iterations,
+    )
+    missing_idle_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicPanel.skip)
+        part = src.partition("await self.bot.advance(interaction.guild)")
+        sub = part[2][:400]
+        vulnerable = "_schedule_idle" not in sub
+        if vulnerable:
+            missing_idle_events += 1
+
+    if missing_idle_events > 0:
+        res.anomalies.append(
+            f"MusicPanel.skip missing idle schedule terkonfirmasi: {missing_idle_events}/{iterations} iterasi. "
+            "MusicPanel.skip memanggil advance() saat advance_queue=True tanpa validasi ulang antrean kosong dan ketiadaan "
+            "penjadwalan _schedule_idle jika audio tidak berputar, menelantarkan voice client di channel tanpa idle timer."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"missing_idle_events": missing_idle_events}
+    return res
+
+
+# ==============================================================================
+# 219. CMD PLAY UNLOCKED STATE READS (Wave 19)
+# ==============================================================================
+async def fuzz_cmd_play_unlocked_state_reads(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_play_unlocked_state_reads",
+        description="Fuzzing pembacaan state.current, state.queue, dan state.generation di luar state.lock pada cmd_play",
+        iterations=iterations,
+    )
+    unlocked_read_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.cmd_play)
+        part1 = src.partition("if not await self._enqueue_tracks")
+        sub1 = part1[2].partition("return await interaction.followup.send")[0]
+        part2 = src.partition("except Exception as exc:")
+        sub2 = part2[2][:400]
+        vulnerable1 = "state.current" in sub1 and "async with state.lock:" not in sub1
+        vulnerable2 = "state.current" in sub2 and "async with state.lock:" not in sub2
+        if vulnerable1 or vulnerable2:
+            unlocked_read_events += 1
+
+    if unlocked_read_events > 0:
+        res.anomalies.append(
+            f"cmd_play unlocked state reads terkonfirmasi: {unlocked_read_events}/{iterations} iterasi. "
+            "Pemeriksaan state.current, state.queue, dan state.generation di cmd_play dilakukan di luar state.lock, "
+            "memicu race condition saat advance atau mutasi antrean konkuren."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unlocked_read_events": unlocked_read_events}
+    return res
+
+
+# ==============================================================================
+# 220. REFRESH DEAD INTEGER PANEL MESSAGE RETENTION (Wave 19)
+# ==============================================================================
+async def fuzz_refresh_dead_integer_panel_message_retention(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="refresh_dead_integer_panel_message_retention",
+        description="Fuzzing kegagalan fetch_message (404 NotFound) pada refresh() saat state.message int yang tidak menolkan state.message di dalam lock",
+        iterations=iterations,
+    )
+    dead_retention_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.refresh)
+        part = src.partition("msg = await ch.fetch_message(msg)")
+        sub = part[2].partition("if not (msg and hasattr(msg, 'edit')):")[0]
+        vulnerable = "state.message = None" not in sub
+        if vulnerable:
+            dead_retention_events += 1
+
+    if dead_retention_events > 0:
+        res.anomalies.append(
+            f"refresh dead integer panel message retention terkonfirmasi: {dead_retention_events}/{iterations} iterasi. "
+            "Kegagalan fetch_message (404 NotFound) pada refresh() saat state.message bertipe int tidak menolkan state.message "
+            "di dalam lock, membiarkan ID pesan mati berulang kali di-fetch di setiap refresh berikutnya."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"dead_retention_events": dead_retention_events}
+    return res
+
+
+# ==============================================================================
+# 221. REFRESH POST SLEEP SHUTDOWN OMISSION (Wave 19)
+# ==============================================================================
+async def fuzz_refresh_post_sleep_shutdown_omission(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="refresh_post_sleep_shutdown_omission",
+        description="Fuzzing ketiadaan validasi self._stopping / is_closed() pasca asyncio.sleep(0.5) pada loop refresh()",
+        iterations=iterations,
+    )
+    shutdown_omission_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.refresh)
+        part = src.partition("await asyncio.sleep(0.5)")
+        sub = part[2][:250]
+        vulnerable = "_stopping" not in sub and "is_closed" not in sub
+        if vulnerable:
+            shutdown_omission_events += 1
+
+    if shutdown_omission_events > 0:
+        res.anomalies.append(
+            f"refresh post-sleep shutdown omission terkonfirmasi: {shutdown_omission_events}/{iterations} iterasi. "
+            "refresh() tidak memvalidasi self._stopping / is_closed() pasca asyncio.sleep(0.5), memicu pemanggilan "
+            "API Discord pada ClientSession yang sedang ditutup saat shutdown."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"shutdown_omission_events": shutdown_omission_events}
+    return res
+
+
+# ==============================================================================
+# 222. TRACK TO DICT DURATION OVERFLOW ERROR (Wave 19)
+# ==============================================================================
+async def fuzz_track_to_dict_duration_overflow_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="track_to_dict_duration_overflow_error",
+        description="Fuzzing unhandled OverflowError/ValueError pada _track_to_dict dan _dict_to_track saat duration float inf/nan",
+        iterations=iterations,
+    )
+    overflow_events = 0
+    for _ in range(iterations):
+        t = Track(title="Inf Track", url="https://example.com/t", requester="u", duration=float('inf'))
+        try:
+            bot_module._track_to_dict(t)
+            vulnerable_to_dict = False
+        except (OverflowError, ValueError):
+            vulnerable_to_dict = True
+
+        data = {"title": "Inf Track", "url": "https://example.com/t", "duration": float('inf')}
+        try:
+            bot_module._dict_to_track(data)
+            vulnerable_from_dict = False
+        except OverflowError:
+            vulnerable_from_dict = True
+
+        if vulnerable_to_dict or vulnerable_from_dict:
+            overflow_events += 1
+
+    if overflow_events > 0:
+        res.anomalies.append(
+            f"track duration OverflowError terkonfirmasi: {overflow_events}/{iterations} iterasi. "
+            "_track_to_dict melempar unhandled OverflowError / ValueError saat duration bernilai non-finite float (NaN/Inf), "
+            "dan _dict_to_track tidak menangkap OverflowError pada int() conversion."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"overflow_events": overflow_events}
+    return res
+
+
+# ==============================================================================
+# 223. TRACKS FROM METADATA NON FINITE DURATION (Wave 19)
+# ==============================================================================
+async def fuzz_tracks_from_metadata_non_finite_duration(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="tracks_from_metadata_non_finite_duration",
+        description="Fuzzing penerimaan duration non-finite (NaN/Inf/negatif) ke objek Track pada _tracks_from_metadata",
+        iterations=iterations,
+    )
+    non_finite_events = 0
+    for _ in range(iterations):
+        mock_meta = {
+            "title": "Bad Dur",
+            "webpage_url": "https://www.youtube.com/watch?v=123",
+            "duration": float('nan'),
+        }
+        try:
+            tracks = bot_module._tracks_from_metadata(mock_meta, "u", "target")
+            vulnerable = not math.isfinite(tracks[0].duration) or tracks[0].duration < 0
+        except Exception:
+            vulnerable = True
+
+        if vulnerable:
+            non_finite_events += 1
+
+    if non_finite_events > 0:
+        res.anomalies.append(
+            f"_tracks_from_metadata non-finite duration terkonfirmasi: {non_finite_events}/{iterations} iterasi. "
+            "_tracks_from_metadata meloloskan nilai duration non-finite (NaN/Inf/negatif) ke objek Track tanpa sanitasi, "
+            "meracuni serialisasi persistent queue berikutnya."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"non_finite_events": non_finite_events}
+    return res
+
+
+# ==============================================================================
+# 224. CHECKED QUERY CASE SENSITIVE SCHEME (Wave 19)
+# ==============================================================================
+async def fuzz_checked_query_case_sensitive_scheme(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="checked_query_case_sensitive_scheme",
+        description="Fuzzing skema URL huruf kapital (misal HTTPS://) pada checked_query yang terbelokkan ke pencarian ytsearch1",
+        iterations=iterations,
+    )
+    case_penalty_events = 0
+    for _ in range(iterations):
+        q = "HTTPS://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        out = bot_module.checked_query(q)
+        vulnerable = out.startswith("ytsearch1:")
+        if vulnerable:
+            case_penalty_events += 1
+
+    if case_penalty_events > 0:
+        res.anomalies.append(
+            f"checked_query case-sensitive scheme penalty terkonfirmasi: {case_penalty_events}/{iterations} iterasi. "
+            "checked_query menggunakan query.startswith() case-sensitive sehingga skema huruf besar (HTTPS://) dibelokkan "
+            "menjadi query ytsearch1, memicu penalti latensi pencarian 3-5 detik."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"case_penalty_events": case_penalty_events}
+    return res
+
+
+# ==============================================================================
+# 225. SOURCE FOR MISSING DICT KEY GUARD (Wave 19)
+# ==============================================================================
+async def fuzz_source_for_missing_dict_key_guard(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="source_for_missing_dict_key_guard",
+        description="Fuzzing pemanggilan source_for dengan data bukan dict atau tanpa url valid yang melempar KeyError/TypeError",
+        iterations=iterations,
+    )
+    missing_guard_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(bot_module.source_for)
+        vulnerable = "isinstance(data, dict)" not in src or "not data.get('url')" not in src
+        if vulnerable:
+            missing_guard_events += 1
+
+    if missing_guard_events > 0:
+        res.anomalies.append(
+            f"source_for missing dictionary key guard terkonfirmasi: {missing_guard_events}/{iterations} iterasi. "
+            "source_for mengakses data['url'] secara langsung tanpa validasi isinstance dict dan ketersediaan non-empty url, "
+            "berisiko melempar KeyError atau TypeError ke subprocess FFmpeg."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"missing_guard_events": missing_guard_events}
+    return res
+
+
+# ==============================================================================
+# 226. ON VOICE STATE UPDATE DUPLICATE BACKGROUND TASK (Wave 19)
+# ==============================================================================
+async def fuzz_on_voice_state_update_duplicate_background_task(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="on_voice_state_update_duplicate_background_task",
+        description="Verifikasi pemanggilan self._background_tasks.add(task) redundan sebelum self._track_background_task(task) di on_voice_state_update",
+        iterations=iterations,
+    )
+    duplicate_task_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.on_voice_state_update)
+        part = src.partition("self.advance(guild)")
+        sub = part[2][:300]
+        vulnerable = "self._background_tasks.add(task)" in sub and "self._track_background_task(task)" in sub
+        if vulnerable:
+            duplicate_task_events += 1
+
+    if duplicate_task_events > 0:
+        res.anomalies.append(
+            f"on_voice_state_update duplicate background task terkonfirmasi: {duplicate_task_events}/{iterations} iterasi. "
+            "on_voice_state_update menambahkan task ke self._background_tasks secara redundan sebelum memanggil "
+            "self._track_background_task(task)."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"duplicate_task_events": duplicate_task_events}
+    return res
+
+
+# ==============================================================================
+# 227. TRACK BACKGROUND TASK MISSING EXCEPTION HANDLER (Wave 19)
+# ==============================================================================
+async def fuzz_track_background_task_missing_exception_handler(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="track_background_task_missing_exception_handler",
+        description="Verifikasi ketiadaan callback logging exception pada self._track_background_task(task)",
+        iterations=iterations,
+    )
+    missing_handler_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._track_background_task)
+        vulnerable = "exception" not in src
+        if vulnerable:
+            missing_handler_events += 1
+
+    if missing_handler_events > 0:
+        res.anomalies.append(
+            f"_track_background_task missing exception handler terkonfirmasi: {missing_handler_events}/{iterations} iterasi. "
+            "_track_background_task tidak mendaftarkan callback exception logger, menyebabkan unhandled exception pada "
+            "background task (misal quit_voice) dicatat sebagai warning 'exception was never retrieved'."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"missing_handler_events": missing_handler_events}
+    return res
+
+
+# ==============================================================================
+# 228. MUSIC PANEL SHUFFLE UNNECESSARY PERSISTENT QUEUE IO (Wave 19)
+# ==============================================================================
+async def fuzz_music_panel_shuffle_unnecessary_persistent_queue_io(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="music_panel_shuffle_unnecessary_persistent_queue_io",
+        description="Fuzzing pemanggilan _save_persistent_queue() tanpa syarat pada MusicPanel.shuffle saat queue < 2 lagu",
+        iterations=iterations,
+    )
+    unnecessary_io_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicPanel.shuffle)
+        part = src.partition("if len(state.queue) < 2:")
+        sub = part[2].partition("if too_few:")[0]
+        vulnerable = "self.bot._save_persistent_queue()" in sub and "not too_few" not in sub
+        if vulnerable:
+            unnecessary_io_events += 1
+
+    if unnecessary_io_events > 0:
+        res.anomalies.append(
+            f"MusicPanel.shuffle unnecessary eMMC write terkonfirmasi: {unnecessary_io_events}/{iterations} iterasi. "
+            "MusicPanel.shuffle tetap memanggil _save_persistent_queue() walau antrean kurang dari 2 lagu (no-op), "
+            "memboroskan siklus penulisan I/O eMMC STB ARM."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unnecessary_io_events": unnecessary_io_events}
+    return res
+
+
+# ==============================================================================
+# 229. SEARCH MODAL MISSING CHANNEL FALLBACK (Wave 19)
+# ==============================================================================
+async def fuzz_search_modal_missing_channel_fallback(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="search_modal_missing_channel_fallback",
+        description="Fuzzing ketiadaan fallback interaction.channel.id saat interaction.channel_id bernilai None pada SearchModal.on_submit",
+        iterations=iterations,
+    )
+    missing_fallback_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(SearchModal.on_submit)
+        part = src.partition("state = self.bot.states.setdefault(guild.id, QueueState())")
+        sub = part[2].partition("try:")[0]
+        vulnerable = "getattr(interaction, 'channel'" not in sub and "getattr(interaction.channel" not in sub
+        if vulnerable:
+            missing_fallback_events += 1
+
+    if missing_fallback_events > 0:
+        res.anomalies.append(
+            f"SearchModal.on_submit missing interaction.channel fallback terkonfirmasi: {missing_fallback_events}/{iterations} iterasi. "
+            "SearchModal.on_submit tidak memiliki fallback interaction.channel.id saat interaction.channel_id bernilai None, "
+            "berpotensi mengosongkan state.text_channel_id."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"missing_fallback_events": missing_fallback_events}
+    return res
+
+
+# ==============================================================================
+# 230. PLAYLIST VIEW MISSING ON TIMEOUT (Wave 19)
+# ==============================================================================
+async def fuzz_playlist_view_missing_on_timeout(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="playlist_view_missing_on_timeout",
+        description="Verifikasi ketiadaan handler on_timeout pada PlaylistView untuk mendisable tombol pasca 120 detik",
+        iterations=iterations,
+    )
+    missing_timeout_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(bot_module.PlaylistView)
+        vulnerable = "def on_timeout" not in src
+        if vulnerable:
+            missing_timeout_events += 1
+
+    if missing_timeout_events > 0:
+        res.anomalies.append(
+            f"PlaylistView missing on_timeout button disable handler terkonfirmasi: {missing_timeout_events}/{iterations} iterasi. "
+            "PlaylistView memiliki timeout=120 tetapi tidak mengimplementasikan on_timeout untuk mendisable tombol view, "
+            "membiarkan tombol mati secara hening setelah 2 menit."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"missing_timeout_events": missing_timeout_events}
+    return res
+
+
+# ==============================================================================
+# 231. ANNOUNCE NOW PLAYING PANEL MSG NONE SUPPRESSION (Wave 19)
+# ==============================================================================
+async def fuzz_announce_now_playing_panel_msg_none_suppression(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="announce_now_playing_panel_msg_none_suppression",
+        description="Fuzzing pembatalan pengiriman pengumuman now-playing jika panel_msg is None walau text channel valid tersedia",
+        iterations=iterations,
+    )
+    suppressed_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._announce_now_playing)
+        part = src.partition("if panel_msg is None:")
+        sub = part[2][:100]
+        vulnerable = "return" in sub
+        if vulnerable:
+            suppressed_events += 1
+
+    if suppressed_events > 0:
+        res.anomalies.append(
+            f"_announce_now_playing suppressed when panel_msg is None terkonfirmasi: {suppressed_events}/{iterations} iterasi. "
+            "_announce_now_playing membatalkan pengiriman pengumuman now-playing jika panel_msg is None, walau text channel valid "
+            "berhasil di-resolve dari text_channel_id."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"suppressed_events": suppressed_events}
+    return res
+
+
+# ==============================================================================
+# 232. FORMAT DURATION BOOLEAN TYPE CHECK (Wave 19)
+# ==============================================================================
+async def fuzz_format_duration_boolean_type_check(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="format_duration_boolean_type_check",
+        description="Fuzzing input boolean True pada format_duration yang mengembalikan '0m 1s' alih-alih 'Live / Unknown'",
+        iterations=iterations,
+    )
+    boolean_error_events = 0
+    for _ in range(iterations):
+        out = bot_module.format_duration(True)
+        vulnerable = out != "Live / Unknown"
+        if vulnerable:
+            boolean_error_events += 1
+
+    if boolean_error_events > 0:
+        res.anomalies.append(
+            f"format_duration boolean type check flaw terkonfirmasi: {boolean_error_events}/{iterations} iterasi. "
+            "format_duration menganggap input boolean True sebagai integer 1 (memformat '0m 1s' alih-alih 'Live / Unknown') "
+            "akibat ketiadaan guard not isinstance(seconds, bool)."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"boolean_error_events": boolean_error_events}
+    return res
+
+
+# ==============================================================================
+# 233. CMD PAUSE AND PANEL PAUSE UNLOCKED QUEUE CHECK (Wave 19)
+# ==============================================================================
+async def fuzz_cmd_pause_and_panel_pause_unlocked_queue_check(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_pause_and_panel_pause_unlocked_queue_check",
+        description="Fuzzing pengecekan elif state.queue di luar state.lock pada cmd_pause dan MusicPanel.pause",
+        iterations=iterations,
+    )
+    unlocked_queue_events = 0
+    for _ in range(iterations):
+        src_cmd = inspect.getsource(MusicBot.cmd_pause)
+        src_panel = inspect.getsource(MusicPanel.pause)
+        vulnerable_cmd = "if state and state.queue:" in src_cmd and "async with state.lock:" not in src_cmd.partition("if state and state.queue:")[0].splitlines()[-4:]
+        vulnerable_panel = "elif state.queue:" in src_panel and "async with state.lock:" not in src_panel.partition("elif state.queue:")[0].splitlines()[-4:]
+        if vulnerable_cmd or vulnerable_panel:
+            unlocked_queue_events += 1
+
+    if unlocked_queue_events > 0:
+        res.anomalies.append(
+            f"cmd_pause & MusicPanel.pause unlocked state.queue inspection terkonfirmasi: {unlocked_queue_events}/{iterations} iterasi. "
+            "Pengecekan elif state.queue pada cmd_pause dan MusicPanel.pause dilakukan di luar state.lock, rentan desinkronisasi "
+            "saat antrean dimutasi coroutine lain."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unlocked_queue_events": unlocked_queue_events}
+    return res
+
+
+# ==============================================================================
+# 234. STOP PLAYER AND QUIT VOICE UNSAFE GUILD ID (Wave 19)
+# ==============================================================================
+async def fuzz_stop_player_and_quit_voice_unsafe_guild_id(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="stop_player_and_quit_voice_unsafe_guild_id",
+        description="Fuzzing akses guild.id secara langsung tanpa getattr pada _stop_player dan quit_voice yang berisiko AttributeError jika guild None",
+        iterations=iterations,
+    )
+    unsafe_guild_events = 0
+    for _ in range(iterations):
+        src_stop = inspect.getsource(MusicBot._stop_player)
+        src_quit = inspect.getsource(MusicBot.quit_voice)
+        vulnerable_stop = "state = self.states.get(guild.id)" in src_stop
+        vulnerable_quit = "state = self.states.get(guild.id)" in src_quit
+        if vulnerable_stop or vulnerable_quit:
+            unsafe_guild_events += 1
+
+    if unsafe_guild_events > 0:
+        res.anomalies.append(
+            f"_stop_player & quit_voice unsafe guild.id access terkonfirmasi: {unsafe_guild_events}/{iterations} iterasi. "
+            "_stop_player dan quit_voice mengakses guild.id secara langsung tanpa getattr(guild, 'id', None), rentan "
+            "AttributeError jika guild bernilai None."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unsafe_guild_events": unsafe_guild_events}
+    return res
+
+
+# ==============================================================================
+# 235. PANEL LOGOUT CSRF MISSING SEC FETCH SITE (Wave 19)
+# ==============================================================================
+async def fuzz_panel_logout_csrf_missing_sec_fetch_site(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_logout_csrf_missing_sec_fetch_site",
+        description="Fuzzing kerentanan Cross-Site Logout CSRF pada GET /logout ketika header Sec-Fetch-Site tidak disertakan",
+        iterations=iterations,
+    )
+    csrf_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(panel_module.Handler._logout_get)
+        vulnerable = "Referer" not in src
+        if vulnerable:
+            csrf_events += 1
+
+    if csrf_events > 0:
+        res.anomalies.append(
+            f"GET /logout CSRF vulnerability terkonfirmasi: {csrf_events}/{iterations} iterasi. "
+            "GET /logout hanya memeriksa Sec-Fetch-Site tanpa validasi Referer jika header Sec-Fetch-Site tidak dikirim browser, "
+            "membuka celah cross-site logout CSRF."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"csrf_events": csrf_events}
+    return res
+
+
+# ==============================================================================
+# 236. PANEL FORMAT GUILDS OVERFLOW ERROR (Wave 19)
+# ==============================================================================
+async def fuzz_panel_format_guilds_overflow_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_format_guilds_overflow_error",
+        description="Fuzzing unhandled OverflowError pada format_guilds_html dan _page saat parsing integer dari float inf",
+        iterations=iterations,
+    )
+    overflow_events = 0
+    for _ in range(iterations):
+        mock_data = {
+            "guilds": [{
+                "name": "Inf Guild",
+                "member_count": float('inf'),
+                "connected": True,
+                "listener_count": float('inf'),
+                "queue_len": float('inf'),
+            }]
+        }
+        try:
+            panel_module.format_guilds_html(mock_data)
+            vulnerable = False
+        except OverflowError:
+            vulnerable = True
+
+        src_page = inspect.getsource(panel_module.Handler._page)
+        if "OverflowError" not in src_page:
+            vulnerable = True
+
+        if vulnerable:
+            overflow_events += 1
+
+    if overflow_events > 0:
+        res.anomalies.append(
+            f"format_guilds_html & _page OverflowError terkonfirmasi: {overflow_events}/{iterations} iterasi. "
+            "format_guilds_html dan _page menangkap (TypeError, ValueError) saat konversi int field runtime tanpa "
+            "menangkap OverflowError jika float inf dimasukkan."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"overflow_events": overflow_events}
+    return res
+
+
+# ==============================================================================
+# 237. PANEL CONFIG STORE READ UNICODE DECODE ERROR (Wave 19)
+# ==============================================================================
+async def fuzz_panel_config_store_read_unicode_decode_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_config_store_read_unicode_decode_error",
+        description="Fuzzing unhandled UnicodeDecodeError pada ConfigStore.read dan _preserved_lines saat .env berisi byte non-UTF-8",
+        iterations=iterations,
+    )
+    unicode_error_events = 0
+    for _ in range(iterations):
+        src_read = inspect.getsource(panel_module.ConfigStore.read)
+        src_lines = inspect.getsource(panel_module.ConfigStore._preserved_lines)
+        vulnerable = "errors='replace'" not in src_read or "errors='replace'" not in src_lines
+        if vulnerable:
+            unicode_error_events += 1
+
+    if unicode_error_events > 0:
+        res.anomalies.append(
+            f"ConfigStore.read & _preserved_lines UnicodeDecodeError terkonfirmasi: {unicode_error_events}/{iterations} iterasi. "
+            "ConfigStore.read dan _preserved_lines membaca .env tanpa errors='replace', rentan crash HTTP 500 UnicodeDecodeError "
+            "jika file mengandung byte non-UTF-8."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unicode_error_events": unicode_error_events}
+    return res
+
+
+# ==============================================================================
+# 238. PANEL UPDATE PASSWORD READ UNICODE DECODE ERROR (Wave 19)
+# ==============================================================================
+async def fuzz_panel_update_password_read_unicode_decode_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_update_password_read_unicode_decode_error",
+        description="Fuzzing unhandled UnicodeDecodeError pada pembacaan panel.env di update_panel_password",
+        iterations=iterations,
+    )
+    unicode_error_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(panel_module.update_panel_password)
+        part = src.partition("with open(target_path, 'r', encoding='utf-8')")
+        vulnerable = "errors='replace'" not in part[0] and "errors='replace'" not in part[1] and "errors='replace'" not in part[2][:100]
+        if vulnerable:
+            unicode_error_events += 1
+
+    if unicode_error_events > 0:
+        res.anomalies.append(
+            f"update_panel_password panel.env reading UnicodeDecodeError terkonfirmasi: {unicode_error_events}/{iterations} iterasi. "
+            "update_panel_password membaca panel.env tanpa errors='replace', rentan menghapus variabel env lain saat terjadi UnicodeDecodeError."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unicode_error_events": unicode_error_events}
+    return res
+
+
+# ==============================================================================
+# 239. PANEL SYSTEMCTL NO ASK PASSWORD OMISSION (Wave 19)
+# ==============================================================================
+async def fuzz_panel_systemctl_no_ask_password_omission(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_systemctl_no_ask_password_omission",
+        description="Verifikasi ketiadaan flag --no-ask-password pada pemanggilan subprocess systemctl di _service dan _run_update_inner",
+        iterations=iterations,
+    )
+    omission_events = 0
+    for _ in range(iterations):
+        src_svc = inspect.getsource(panel_module.Handler._service)
+        src_upd = inspect.getsource(panel_module._run_update_inner)
+        vulnerable_svc = "'--no-ask-password'" not in src_svc
+        vulnerable_upd = "'--no-ask-password'" not in src_upd
+        if vulnerable_svc or vulnerable_upd:
+            omission_events += 1
+
+    if omission_events > 0:
+        res.anomalies.append(
+            f"systemctl invocations missing --no-ask-password terkonfirmasi: {omission_events}/{iterations} iterasi. "
+            "Pemanggilan systemctl pada _service dan _run_update_inner tidak menyertakan flag --no-ask-password, "
+            "berisiko hang hingga 15 detik jika polkit meminta interaksi tty."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"omission_events": omission_events}
+    return res
+
+
+# ==============================================================================
+# 240. PANEL HOST OK STB HOSTNAME REJECTION (Wave 19)
+# ==============================================================================
+async def fuzz_panel_host_ok_stb_hostname_rejection(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_host_ok_stb_hostname_rejection",
+        description="Fuzzing penolakan hostname lokal STB (socket.gethostname()) dengan HTTP 403 pada _host_ok",
+        iterations=iterations,
+    )
+    rejection_events = 0
+    import socket
+    local_hn = socket.gethostname()
+    for _ in range(iterations):
+        mock_handler = MagicMock()
+        mock_handler._local_addresses = panel_module._local_addresses
+        res_ok = panel_module.Handler._host_ok(mock_handler, local_hn)
+        vulnerable = not res_ok
+        if vulnerable:
+            rejection_events += 1
+
+    if rejection_events > 0:
+        res.anomalies.append(
+            f"_host_ok hostname allowlist rejection terkonfirmasi: {rejection_events}/{iterations} iterasi. "
+            "_host_ok menolak hostname lokal STB (misal armbian atau crspy-stb) dengan HTTP 403 karena _local_addresses "
+            "hanya menyimpan alamat IP hasil resolusi."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"rejection_events": rejection_events}
+    return res
+
+
+# ==============================================================================
+# 241. PANEL UPDATE PASSWORD DIRECTORY FSYNC OMISSION (Wave 19)
+# ==============================================================================
+async def fuzz_panel_update_password_directory_fsync_omission(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_update_password_directory_fsync_omission",
+        description="Verifikasi ketiadaan fsync direktori induk pasca os.replace pada update_panel_password",
+        iterations=iterations,
+    )
+    omission_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(panel_module.update_panel_password)
+        part = src.partition("os.replace(tmp_path, target_path)")
+        sub = part[2][:300]
+        vulnerable = "O_DIRECTORY" not in src and "fsync" not in sub
+        if vulnerable:
+            omission_events += 1
+
+    if omission_events > 0:
+        res.anomalies.append(
+            f"update_panel_password directory fsync omission terkonfirmasi: {omission_events}/{iterations} iterasi. "
+            "update_panel_password melakukan os.replace pada panel.env tanpa melakukan fsync pada direktori induk, "
+            "berisiko kehilangan entri direktori saat listrik STB padam mendadak."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"omission_events": omission_events}
+    return res
+
+
 # ==============================================================================
 # RUNNER
 # ==============================================================================
@@ -10155,6 +10949,31 @@ ALL_SCENARIOS = {
     "panel_bot_invite_reverse_tabnabbing": fuzz_panel_bot_invite_reverse_tabnabbing,
     "panel_local_addresses_cache_mutation_leak": fuzz_panel_local_addresses_cache_mutation_leak,
     "config_store_write_non_dict_validation": fuzz_config_store_write_non_dict_validation,
+    # Wave 19 Additions
+    "music_panel_skip_missing_idle_schedule": fuzz_music_panel_skip_missing_idle_schedule,
+    "cmd_play_unlocked_state_reads": fuzz_cmd_play_unlocked_state_reads,
+    "refresh_dead_integer_panel_message_retention": fuzz_refresh_dead_integer_panel_message_retention,
+    "refresh_post_sleep_shutdown_omission": fuzz_refresh_post_sleep_shutdown_omission,
+    "track_to_dict_duration_overflow_error": fuzz_track_to_dict_duration_overflow_error,
+    "tracks_from_metadata_non_finite_duration": fuzz_tracks_from_metadata_non_finite_duration,
+    "checked_query_case_sensitive_scheme": fuzz_checked_query_case_sensitive_scheme,
+    "source_for_missing_dict_key_guard": fuzz_source_for_missing_dict_key_guard,
+    "on_voice_state_update_duplicate_background_task": fuzz_on_voice_state_update_duplicate_background_task,
+    "track_background_task_missing_exception_handler": fuzz_track_background_task_missing_exception_handler,
+    "music_panel_shuffle_unnecessary_persistent_queue_io": fuzz_music_panel_shuffle_unnecessary_persistent_queue_io,
+    "search_modal_missing_channel_fallback": fuzz_search_modal_missing_channel_fallback,
+    "playlist_view_missing_on_timeout": fuzz_playlist_view_missing_on_timeout,
+    "announce_now_playing_panel_msg_none_suppression": fuzz_announce_now_playing_panel_msg_none_suppression,
+    "format_duration_boolean_type_check": fuzz_format_duration_boolean_type_check,
+    "cmd_pause_and_panel_pause_unlocked_queue_check": fuzz_cmd_pause_and_panel_pause_unlocked_queue_check,
+    "stop_player_and_quit_voice_unsafe_guild_id": fuzz_stop_player_and_quit_voice_unsafe_guild_id,
+    "panel_logout_csrf_missing_sec_fetch_site": fuzz_panel_logout_csrf_missing_sec_fetch_site,
+    "panel_format_guilds_overflow_error": fuzz_panel_format_guilds_overflow_error,
+    "panel_config_store_read_unicode_decode_error": fuzz_panel_config_store_read_unicode_decode_error,
+    "panel_update_password_read_unicode_decode_error": fuzz_panel_update_password_read_unicode_decode_error,
+    "panel_systemctl_no_ask_password_omission": fuzz_panel_systemctl_no_ask_password_omission,
+    "panel_host_ok_stb_hostname_rejection": fuzz_panel_host_ok_stb_hostname_rejection,
+    "panel_update_password_directory_fsync_omission": fuzz_panel_update_password_directory_fsync_omission,
 }
 
 
@@ -10171,7 +10990,7 @@ async def run_all(scenarios: list[str], iterations: int) -> list[FuzzScenarioRes
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 18)")
+    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 19)")
     parser.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
     parser.add_argument("--iterations", type=int, default=10, help="Jumlah iterasi fuzzing per skenario")
     parser.add_argument("--json", action="store_true", help="Format output sebagai JSON")
@@ -10186,7 +11005,7 @@ def main():
         return
 
     print("\n" + "=" * 76)
-    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 18)")
+    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 19)")
     print("=" * 76)
 
     total_passed = 0

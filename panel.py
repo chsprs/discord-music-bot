@@ -42,7 +42,7 @@ def update_panel_password(new_password: str, env_path: Optional[str] = None) -> 
         found = False
         if os.path.exists(target_path):
             try:
-                with open(target_path, 'r', encoding='utf-8') as handle:
+                with open(target_path, 'r', encoding='utf-8', errors='replace') as handle:
                     for line in handle:
                         stripped = line.rstrip('\r\n')
                         if stripped.strip().startswith('PANEL_PASSWORD='):
@@ -69,6 +69,14 @@ def update_panel_password(new_password: str, env_path: Optional[str] = None) -> 
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_path, target_path)
+            try:
+                dfd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
         except OSError:
             if not closed and 'fd' in locals():
                 try:
@@ -149,7 +157,7 @@ class ConfigStore:
     def read(self) -> dict:
         data = {'token': '', 'guild': ''}
         try:
-            with open(self.path, 'r', encoding='utf-8') as handle:
+            with open(self.path, 'r', encoding='utf-8', errors='replace') as handle:
                 for line in handle:
                     line = line.strip()
                     if not line or line.startswith('#') or '=' not in line:
@@ -178,7 +186,7 @@ class ConfigStore:
         """
         kept: list[str] = []
         try:
-            with open(self.path, 'r', encoding='utf-8') as handle:
+            with open(self.path, 'r', encoding='utf-8', errors='replace') as handle:
                 for line in handle:
                     stripped = line.rstrip('\r\n')
                     body = stripped.strip()
@@ -521,7 +529,7 @@ def _run_update_inner() -> tuple[bool, str]:
             if listeners_active():
                 out += '\nAda pendengar aktif -> restart ditunda agar musik tidak terputus.'
             else:
-                restart_proc = subprocess.run(['systemctl', 'restart', SERVICE], timeout=15)
+                restart_proc = subprocess.run(['systemctl', '--no-ask-password', 'restart', SERVICE], timeout=15)
                 if restart_proc.returncode == 0:
                     out += '\nService discord-music.service berhasil dimulai ulang.'
                 else:
@@ -632,7 +640,7 @@ def format_guilds_html(info: dict) -> str:
         name = html.escape(str(g.get('name', 'Server Discord')))
         try:
             members = int(g.get('member_count', 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             members = 0
         connected = bool(g.get('connected', False))
         ch_name = html.escape(str(g.get('channel_name') or ''))
@@ -642,14 +650,14 @@ def format_guilds_html(info: dict) -> str:
         listeners = [html.escape(str(u)) for u in raw_listeners[:50]]
         try:
             listener_count = int(g.get('listener_count', len(listeners)) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             listener_count = len(listeners)
         is_playing = bool(g.get('is_playing', False))
         is_paused = bool(g.get('is_paused', False))
         track = html.escape(str(g.get('current_track') or ''))
         try:
             queue_len = int(g.get('queue_len', 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             queue_len = 0
 
         if connected:
@@ -969,7 +977,16 @@ class Handler(BaseHTTPRequestHandler):
             import ipaddress
             ip = ipaddress.ip_address(bare)
         except ValueError:
-            return bare in _local_addresses() or bare in {'localhost'}
+            import socket
+            try:
+                local_hn = socket.gethostname().strip().lower()
+            except Exception:
+                local_hn = ''
+            return (
+                bare in _local_addresses()
+                or bare in {'localhost'}
+                or (bool(local_hn) and (bare == local_hn or bare == f'{local_hn}.local'))
+            )
         except Exception:
             return False
         if ip.is_loopback:
@@ -1075,8 +1092,16 @@ class Handler(BaseHTTPRequestHandler):
     def _logout_get(self):
         if PASSWORD:
             fetch_site = (self.headers.get('Sec-Fetch-Site') or '').lower().strip()
-            if fetch_site and fetch_site not in ('same-origin', 'none', 'same-site'):
-                return self._redirect('/')
+            if fetch_site:
+                if fetch_site not in ('same-origin', 'none', 'same-site'):
+                    return self._redirect('/')
+            else:
+                referer = (self.headers.get('Referer') or '').strip()
+                host = (self.headers.get('Host') or '').strip()
+                if referer:
+                    ref_netloc = urllib.parse.urlsplit(referer).netloc
+                    if ref_netloc and ref_netloc != host:
+                        return self._redirect('/')
             self._revoke_session_from_cookie()
             cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
             return self._redirect('/login', {'Set-Cookie': cookie})
@@ -1247,15 +1272,15 @@ class Handler(BaseHTTPRequestHandler):
         runtime = read_bot_runtime_info()
         try:
             total_guilds = int(runtime.get('total_guilds', 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             total_guilds = 0
         try:
             active_voice = int(runtime.get('active_voice_count', 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             active_voice = 0
         try:
             total_listeners = int(runtime.get('total_listeners', 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             total_listeners = 0
         if runtime.get('status') == 'online':
             runtime_badge_class = 'on' if active_voice > 0 else 'badge'
@@ -1454,7 +1479,7 @@ class Handler(BaseHTTPRequestHandler):
             ok, detail = SERVICE_RUNNER(action)
         else:
             try:
-                result = subprocess.run(['systemctl', action, SERVICE],
+                result = subprocess.run(['systemctl', '--no-ask-password', action, SERVICE],
                                         capture_output=True, text=True, timeout=15)
             except Exception as exc:
                 self.log_exception('systemctl %s gagal: %s', action, exc)

@@ -5869,3 +5869,102 @@ class Wave10RemediationTests(unittest.TestCase):
         import panel as p
         src = inspect.getsource(p._cached_systemctl)
         self.assertIn("_systemctl_lock", src)
+
+
+class Wave19RemediationTests(unittest.TestCase):
+    def test_wave19_format_duration_boolean(self):
+        """Wave 19: format_duration mengembalikan Live / Unknown untuk input boolean."""
+        from bot import format_duration
+        self.assertEqual(format_duration(True), "Live / Unknown")
+        self.assertEqual(format_duration(False), "Live / Unknown")
+
+    def test_wave19_checked_query_uppercase_scheme(self):
+        """Wave 19: checked_query menangani skema URL huruf kapital tanpa penalti pencarian ytsearch1."""
+        from bot import checked_query
+        out = checked_query("HTTPS://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(out, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        out_http = checked_query("HTTP://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(out_http, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    def test_wave19_track_to_dict_overflow_safe(self):
+        """Wave 19: _track_to_dict dan _dict_to_track aman dari OverflowError float non-finite."""
+        from bot import Track, _track_to_dict, _dict_to_track
+        t = Track(title="Inf Track", url="https://example.com/t", requester="u", duration=float('inf'))
+        d = _track_to_dict(t)
+        self.assertEqual(d["duration"], 0)
+        t2 = _dict_to_track({"title": "Inf Track", "url": "https://example.com/t", "duration": float('inf')})
+        self.assertIsNotNone(t2)
+        self.assertEqual(t2.duration, 0)
+
+    def test_wave19_tracks_from_metadata_non_finite_duration(self):
+        """Wave 19: _tracks_from_metadata mensanitasi duration NaN/Inf menjadi 0."""
+        from bot import _tracks_from_metadata
+        meta = {
+            "title": "Song",
+            "webpage_url": "https://www.youtube.com/watch?v=123",
+            "duration": float("nan"),
+        }
+        tracks = _tracks_from_metadata(meta, "u", "target")
+        self.assertEqual(tracks[0].duration, 0)
+        self.assertEqual(tracks[0].duration_str, "Live / Unknown")
+
+    def test_wave19_source_for_missing_dict_guard(self):
+        """Wave 19: source_for memvalidasi tipe dict dan ketersediaan non-empty url."""
+        from bot import source_for
+        with self.assertRaises(ValueError):
+            source_for(None)
+        with self.assertRaises(ValueError):
+            source_for({})
+        with self.assertRaises(ValueError):
+            source_for({"url": ""})
+
+    def test_wave19_playlist_view_on_timeout(self):
+        """Wave 19: PlaylistView mengimplementasikan on_timeout untuk menonaktifkan tombol."""
+        from bot import PlaylistView
+        bot_mock = MagicMock()
+        view = PlaylistView(bot_mock)
+        asyncio.run(view.on_timeout())
+        self.assertTrue(all(item.disabled for item in view.children))
+
+    def test_wave19_panel_logout_csrf_referer(self):
+        """Wave 19: GET /logout memblokir permohonan logout dengan foreign Referer saat Sec-Fetch-Site kosong."""
+        import panel as p
+        orig_pw = p.PASSWORD
+        p.PASSWORD = "testpass"
+        try:
+            handler = p.Handler.__new__(p.Handler)
+            handler.headers = {
+                "Host": "127.0.0.1:9130",
+                "Referer": "http://evil.com/landing",
+                "Sec-Fetch-Site": "",
+            }
+            handler._redirect = MagicMock(return_value="redirect_home")
+            res = handler._logout_get()
+            self.assertEqual(res, "redirect_home")
+            handler._redirect.assert_called_with("/")
+        finally:
+            p.PASSWORD = orig_pw
+
+    def test_wave19_panel_format_guilds_overflow_error(self):
+        """Wave 19: format_guilds_html dan _page aman dari float inf OverflowError."""
+        import panel as p
+        mock_data = {
+            "guilds": [{
+                "name": "Inf Guild",
+                "member_count": float('inf'),
+                "connected": True,
+                "listener_count": float('inf'),
+                "queue_len": float('inf'),
+            }]
+        }
+        html_out = p.format_guilds_html(mock_data)
+        self.assertIn("Inf Guild", html_out)
+
+    def test_wave19_panel_host_ok_stb_hostname(self):
+        """Wave 19: _host_ok mengizinkan nama host lokal STB socket.gethostname()."""
+        import socket
+        import panel as p
+        local_hn = socket.gethostname()
+        handler = p.Handler.__new__(p.Handler)
+        self.assertTrue(handler._host_ok(local_hn))
+        self.assertTrue(handler._host_ok(f"{local_hn}:9130"))
