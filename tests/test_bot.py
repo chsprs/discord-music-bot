@@ -5445,3 +5445,238 @@ class Wave10RemediationTests(unittest.TestCase):
         with patch.dict(sys.modules, {"yt_dlp.version": old_mock}):
             ver = panel_mod.ytdlp_version()
             self.assertNotEqual(ver, "2020.01.01")
+
+    # =========================================================================
+    # WAVE 12 UNIT TESTS
+    # =========================================================================
+    def test_wave12_loop_track_empty_channel_preserves_current(self):
+        """Wave 12: _advance_loop mempertahankan state.current saat loop_mode=='track' di channel kosong."""
+        bot = MusicBot()
+        guild = MagicMock(id=99901, name="Guild99901")
+        vc = MagicMock()
+        vc.channel.members = [MagicMock(bot=True)]
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.loop_mode = "track"
+        track = Track("LoopSong", "http://loop", "user")
+        state.current = track
+        bot.states[guild.id] = state
+        bot._save_persistent_queue = MagicMock()
+        bot.refresh = AsyncMock()
+
+        asyncio.run(bot._advance_loop(guild, state, vc))
+        self.assertIs(state.current, track)
+
+    def test_wave12_idle_disconnect_boolean_precedence(self):
+        """Wave 12: idle_disconnect tidak memutuskan voice jika antrean lagu masih ada."""
+        bot = MusicBot()
+        guild = MagicMock(id=99902, name="Guild99902")
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.generation = 1
+        state.current = None
+        state.queue.append(Track("QueuedSong", "http://q", "user"))
+        state.consecutive_playback_errors = 0
+        bot.states[guild.id] = state
+        bot.quit_voice = AsyncMock()
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            asyncio.run(bot.idle_disconnect(guild, state.generation))
+        bot.quit_voice.assert_not_called()
+
+    def test_wave12_queue_full_stranded_voice_idle_scheduled(self):
+        """Wave 12: cmd_play dan SearchModal menjadwalkan _schedule_idle jika antrian penuh dan state idle."""
+        from bot import MAX_QUEUE
+        bot = MusicBot()
+        guild = MagicMock(id=99903, name="Guild99903")
+        mock_channel = MagicMock(id=555)
+        vc = MagicMock(channel=mock_channel)
+        vc.is_connected.return_value = True
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.current = None
+        state.queue.clear()
+        bot.states[guild.id] = state
+        bot._schedule_idle = MagicMock()
+
+        interaction = MagicMock(guild=guild, channel_id=123)
+        interaction.user.voice = MagicMock(channel=mock_channel)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch("bot.extract_tracks", new=AsyncMock(return_value=[Track("T", "http://t", "u")] * (MAX_QUEUE + 1))):
+            asyncio.run(bot.cmd_play(interaction, "http://full"))
+        bot._schedule_idle.assert_called_once()
+
+    def test_wave12_search_modal_queue_full_idle_scheduled(self):
+        """Wave 12: SearchModal.on_submit menjadwalkan _schedule_idle jika antrian penuh."""
+        from bot import MAX_QUEUE
+        bot = MusicBot()
+        guild = MagicMock(id=99904, name="Guild99904")
+        mock_channel = MagicMock(id=555)
+        vc = MagicMock(channel=mock_channel)
+        vc.is_connected.return_value = True
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.current = None
+        state.queue.clear()
+        bot.states[guild.id] = state
+        bot._schedule_idle = MagicMock()
+
+        modal = SearchModal(bot)
+        modal.query = MagicMock()
+        interaction = MagicMock(guild=guild, channel_id=123)
+        interaction.user.voice = MagicMock(channel=mock_channel)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch("bot.extract_tracks", new=AsyncMock(return_value=[Track("T", "http://t", "u")] * (MAX_QUEUE + 1))):
+            asyncio.run(modal.on_submit(interaction))
+        bot._schedule_idle.assert_called_once()
+
+    def test_wave12_music_panel_pause_unlocked_mutation(self):
+        """Wave 12: MusicPanel.pause mereset error dan idle schedule di dalam state.lock."""
+        import inspect
+        src = inspect.getsource(MusicPanel.pause)
+        self.assertIn("async with state.lock:", src)
+        lines = src.split("\n")
+        for i, line in enumerate(lines):
+            if "state.current = None" in line:
+                preceding = "\n".join(lines[max(0, i - 6):i])
+                self.assertIn("async with state.lock:", preceding)
+            if "state.consecutive_playback_errors = 0" in line:
+                preceding = "\n".join(lines[max(0, i - 4):i])
+                self.assertIn("async with state.lock:", preceding)
+
+    def test_wave12_guild_remove_voice_client_quit(self):
+        """Wave 12: on_guild_remove memanggil quit_voice(guild, clear_queue=True)."""
+        bot = MusicBot()
+        guild = MagicMock(id=99905)
+        bot.quit_voice = AsyncMock()
+        bot._save_persistent_queue = MagicMock()
+
+        asyncio.run(bot.on_guild_remove(guild))
+        bot.quit_voice.assert_awaited_once_with(guild, clear_queue=True)
+
+    def test_wave12_enqueue_tracks_playing_inside_lock(self):
+        """Wave 12: _enqueue_tracks mengevaluasi vc.is_playing di dalam state.lock."""
+        import inspect
+        src = inspect.getsource(MusicBot._enqueue_tracks)
+        playing_pos = src.find("playing = bool(")
+        lock_pos = src.find("async with state.lock:")
+        self.assertGreater(playing_pos, lock_pos)
+
+    def test_wave12_close_saves_queue_after_deleting_panels(self):
+        """Wave 12: close() menyimpan antrian persistent setelah _delete_all_panels()."""
+        import inspect
+        src = inspect.getsource(MusicBot.close)
+        del_pos = src.find("self._delete_all_panels()")
+        self.assertIn("self._save_persistent_queue()", src[del_pos:])
+
+    def test_wave12_refresh_handles_integer_message_id(self):
+        """Wave 12: refresh() dapat menangani message ID berupa integer pasca restart."""
+        bot = MusicBot()
+        state = QueueState()
+        state.message = 999999
+        state.text_channel_id = 888888
+        channel = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.edit = AsyncMock()
+        channel.fetch_message = AsyncMock(return_value=mock_msg)
+        bot.get_channel = MagicMock(return_value=channel)
+
+        async def _run():
+            await bot.refresh(state)
+            await asyncio.sleep(0.6)
+
+        asyncio.run(_run())
+        channel.fetch_message.assert_awaited_once_with(999999)
+        self.assertIs(state.message, mock_msg)
+
+    def test_wave12_cmd_skip_advancing_inside_lock(self):
+        """Wave 12: cmd_skip dan MusicPanel.skip mengecek state._advancing di dalam state.lock."""
+        import inspect
+        src_cmd = inspect.getsource(MusicBot.cmd_skip)
+        src_panel = inspect.getsource(MusicPanel.skip)
+        self.assertGreater(src_cmd.find("state._advancing > 0"), src_cmd.find("async with state.lock:"))
+        self.assertGreater(src_panel.find("state._advancing > 0"), src_panel.find("async with state.lock:"))
+
+    def test_wave12_vc_play_client_exception_schedules_idle(self):
+        """Wave 12: ClientException pada vc.play menjadwalkan _schedule_idle jika connected dan idle."""
+        bot = MusicBot()
+        guild = MagicMock(id=99906)
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        state = QueueState()
+        state.queue.append(Track("Song", "http://s", "u"))
+        bot.states[guild.id] = state
+        vc.play.side_effect = discord.ClientException("Simulated driver busy")
+        bot._schedule_idle = MagicMock()
+
+        mock_source = MagicMock()
+        with patch("bot.extract", return_value={"url": "http://s", "title": "Song"}), \
+             patch("bot.run_extract", new=AsyncMock(return_value={"url": "http://s", "title": "Song"})), \
+             patch("bot.source_for", return_value=mock_source):
+            asyncio.run(bot._advance_loop(guild, state, vc))
+
+        bot._schedule_idle.assert_called_once()
+
+    def test_wave12_announce_now_playing_cancellation_shield(self):
+        """Wave 12: _announce_now_playing melindungi channel.send dengan asyncio.shield."""
+        import inspect
+        src = inspect.getsource(MusicBot._announce_now_playing)
+        self.assertIn("asyncio.shield", src)
+        self.assertIn("asyncio.CancelledError", src)
+
+    def test_wave12_change_volume_nan_rejected(self):
+        """Wave 12: change_volume menolak float NaN dengan pesan error."""
+        bot = MusicBot()
+        guild = MagicMock(id=99907)
+        interaction = MagicMock(guild=guild)
+        interaction.response.is_done.return_value = False
+        interaction.response.send_message = AsyncMock()
+
+        asyncio.run(bot.change_volume(interaction, float("nan")))
+        interaction.response.send_message.assert_awaited_once_with("Volume tidak valid.", ephemeral=True)
+
+    def test_wave12_tracks_from_metadata_missing_id_watch_none(self):
+        """Wave 12: _tracks_from_metadata tidak menghasilkan 'watch?v=None' bila ID dan URL hilang."""
+        from bot import _tracks_from_metadata
+        data = {
+            "_type": "playlist",
+            "entries": [{"title": "Corrupted Entry"}]
+        }
+        tracks = _tracks_from_metadata(data, "user", "https://youtube.com/target")
+        self.assertEqual(len(tracks), 1)
+        self.assertNotIn("watch?v=None", tracks[0].url)
+        self.assertEqual(tracks[0].url, "https://youtube.com/target")
+
+    def test_wave12_back_idle_mutation_inside_lock(self):
+        """Wave 12: cmd_back dan MusicPanel.back tidak memutasi state.current di luar lock pada cabang idle."""
+        import inspect
+        src_cmd = inspect.getsource(MusicBot.cmd_back)
+        src_panel = inspect.getsource(MusicPanel.back)
+        self.assertNotIn("state.current = None", src_cmd.split("if not had_prev:")[1])
+        self.assertNotIn("state.current = None", src_panel.split("if not had_prev:")[1])
+
+    def test_wave12_panel_ytdlp_version_and_update_log_cached(self):
+        """Wave 12: panel.ytdlp_version dan read_last_update_log memiliki caching terkonfirmasi."""
+        import inspect
+        import panel as p
+        src_v = inspect.getsource(p.ytdlp_version)
+        src_l = inspect.getsource(p.read_last_update_log)
+        self.assertIn("_ytdlp_version_cache", src_v)
+        self.assertIn("_update_log_cache", src_l)

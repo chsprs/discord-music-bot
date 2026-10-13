@@ -3,6 +3,7 @@ import asyncio
 import gc
 import json
 import logging
+import math
 import os
 import queue
 import random
@@ -705,7 +706,10 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
             stable_url = entry.get('webpage_url') or entry.get('url')
             if not stable_url or not stable_url.startswith('http'):
                 vid_id = entry.get('id') or stable_url
-                stable_url = f'https://www.youtube.com/watch?v={vid_id}'
+                if vid_id:
+                    stable_url = f'https://www.youtube.com/watch?v={vid_id}'
+                else:
+                    stable_url = target
             stream_url = None
             stream_ts = 0.0
             u = entry.get('url')
@@ -1237,6 +1241,8 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
         try:
             tracks = await extract_tracks(str(self.query), interaction.user.mention)
             if not await self.bot._enqueue_tracks(guild, tracks):
+                if not state.current and not state.queue:
+                    self.bot._schedule_idle(guild, state.generation)
                 return await interaction.followup.send(f'Antrian penuh (maks {MAX_QUEUE} lagu).', ephemeral=True)
             if len(tracks) == 1:
                 msg = f'Ditambahkan: **{discord.utils.escape_markdown(tracks[0].title)}**'
@@ -1501,9 +1507,15 @@ class MusicPanel(discord.ui.View):
             return await interaction.followup.send('Kamu harus di voice channel yang sama dengan bot.', ephemeral=True)
         # Semua mutasi di dalam lock; semua await di luar lock agar followup.send
         # yang lambat tidak memblokir advance()/enqueue.
+        schedule_idle = False
+        gen = 0
         async with state.lock:
             if not state.history and not state.current:
                 had_prev = False
+                if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
+                    state.current = None
+                    gen = state.generation
+                    schedule_idle = True
             else:
                 had_prev = True
                 if state.history:
@@ -1516,9 +1528,8 @@ class MusicPanel(discord.ui.View):
                     state.queue.appendleft(state.current)
                     state.current = None
         if not had_prev:
-            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
-                state.current = None
-                self.bot._schedule_idle(interaction.guild, state.generation)
+            if schedule_idle:
+                self.bot._schedule_idle(interaction.guild, gen)
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self.bot._stop_player(interaction.guild)
         await self.bot.advance(interaction.guild)
@@ -1547,18 +1558,21 @@ class MusicPanel(discord.ui.View):
             vc.pause()
             text = 'Dijeda.'
         elif vc.is_paused():
-            state.consecutive_playback_errors = 0
+            async with state.lock:
+                state.consecutive_playback_errors = 0
             vc.resume()
             text = 'Dilanjutkan.'
         elif state.queue:
-            state.consecutive_playback_errors = 0
+            async with state.lock:
+                state.consecutive_playback_errors = 0
             await self.bot.advance(interaction.guild)
             text = 'Melanjutkan pemutaran antrian lagu.'
         else:
             text = 'Tidak ada lagu aktif atau antrian kosong.'
             if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
-                state.current = None
-                self.bot._schedule_idle(interaction.guild, state.generation)
+                async with state.lock:
+                    state.current = None
+                    self.bot._schedule_idle(interaction.guild, state.generation)
         await interaction.followup.send(text, ephemeral=True)
         await self.bot.refresh(state)
 
@@ -1589,48 +1603,34 @@ class MusicPanel(discord.ui.View):
             await self.bot.advance(interaction.guild)
             # removed # removed # removed self.bot._save_persistent_queue()
             text = 'Dilewati.'
-        elif state._advancing > 0:
+        else:
             # M4: belum ada audio yang berputar tetapi advance() sedang
             # mengekstraksi. Rekam permintaan skip; advance() yang sedang jalan
             # akan membuang track itu alih-alih memutarnya.
             skip_recorded = False
+            advance_queue = False
             async with state.lock:
                 if state._advancing > 0:
                     state._skip_pending = True
                     skip_recorded = True
-            if skip_recorded:
-                text = 'Dilewati.'
-            elif state.queue:
-                async with state.lock:
+                elif state.queue:
                     state.consecutive_playback_errors = 0
                     if state.current:
                         state.history.append(state.current)
                         if len(state.history) > 20:
                             state.history.popleft()
                         state.current = None
+                    advance_queue = True
+                elif not (vc and (vc.is_playing() or vc.is_paused())):
+                    state.current = None
+                    self.bot._schedule_idle(interaction.guild, state.generation)
+            if skip_recorded:
+                text = 'Dilewati.'
+            elif advance_queue:
                 await self.bot.advance(interaction.guild)
                 text = 'Memutar lagu berikutnya dari antrian.'
             else:
                 text = 'Tidak ada lagu aktif.'
-                if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
-                    state.current = None
-                    self.bot._schedule_idle(interaction.guild, state.generation)
-        elif state.queue:
-            async with state.lock:
-                state.consecutive_playback_errors = 0
-                if state.current:
-                    state.history.append(state.current)
-                    if len(state.history) > 20:
-                        state.history.popleft()
-                    state.current = None
-            await self.bot.advance(interaction.guild)
-            # removed self.bot._save_persistent_queue()
-            text = 'Memutar lagu berikutnya dari antrian.'
-        else:
-            text = 'Tidak ada lagu aktif.'
-            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
-                state.current = None
-                self.bot._schedule_idle(interaction.guild, state.generation)
         await interaction.followup.send(text, ephemeral=True)
 
     @discord.ui.button(label='Up', emoji='🔊', style=discord.ButtonStyle.secondary, custom_id='music:up', row=0)
@@ -1978,22 +1978,23 @@ class MusicBot(discord.Client):
     async def _enqueue_tracks(self, guild: discord.Guild, tracks: list[Track]) -> bool:
         """Tambah track dengan cap total; return False bila penuh."""
         state = self.states.setdefault(guild.id, QueueState())
-        vc = guild.voice_client
-        playing = bool(vc and (vc.is_playing() or vc.is_paused()))
         async with state.lock:
             if len(state.queue) + len(tracks) > MAX_QUEUE:
                 return False
             state.queue.extend(tracks)
             state.consecutive_playback_errors = 0
+            vc = guild.voice_client
+            playing = bool(vc and (vc.is_playing() or vc.is_paused()))
             # Keputusan memutar ditentukan oleh kondisi voice client nyata, bukan
             # hanya state.current. Kalau tidak ada yang benar-benar berputar,
             # state.current dianggap basi (mis. sisa track yang gagal diputar
             # atau koneksi voice putus diam-diam) agar antrian tidak macet.
             if not playing and state.current is not None:
-                state.history.append(state.current)
-                if len(state.history) > 20:
-                    state.history.popleft()
-                state.current = None
+                if state.loop_mode != 'track':
+                    state.history.append(state.current)
+                    if len(state.history) > 20:
+                        state.history.popleft()
+                    state.current = None
             need_advance = not playing
         self._save_persistent_queue()
         if need_advance and vc and not vc.is_playing() and not vc.is_paused():
@@ -2102,6 +2103,10 @@ class MusicBot(discord.Client):
         dump_runtime_state(self)
         if hasattr(self, '_synced_guilds') and isinstance(self._synced_guilds, set):
             self._synced_guilds.discard(getattr(guild, 'id', None))
+        try:
+            await self.quit_voice(guild, clear_queue=True)
+        except Exception:
+            pass
         state = self.states.pop(guild.id, None)
         if state:
             for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task, state.announce_task):
@@ -2289,6 +2294,15 @@ class MusicBot(discord.Client):
             await self._delete_all_panels()
         except Exception:
             pass
+        try:
+            fut = self._save_persistent_queue()
+            if fut is not None and hasattr(fut, '__await__'):
+                try:
+                    await fut
+                except Exception:
+                    pass
+        except Exception as exc:
+            log.debug('Gagal menyimpan persistent queue pasca hapus panel: %s', exc)
         for view in list(getattr(self, 'persistent_views', [])):
             try:
                 view.stop()
@@ -2340,6 +2354,9 @@ class MusicBot(discord.Client):
         try:
             tracks = await extract_tracks(lagu, interaction.user.mention)
             if not await self._enqueue_tracks(interaction.guild, tracks):
+                state = self.states.setdefault(interaction.guild.id, QueueState())
+                if not state.current and not state.queue:
+                    self._schedule_idle(interaction.guild, state.generation)
                 return await interaction.followup.send(f'Antrian penuh (maks {MAX_QUEUE} lagu).', ephemeral=True)
             state = self.states[interaction.guild.id]
             if len(tracks) == 1:
@@ -2399,11 +2416,13 @@ class MusicBot(discord.Client):
         # M4: advance() sedang ekstraksi dan belum ada audio yang berputar ->
         # rekam skip; advance() yang jalan akan membuang track head.
         vc = interaction.guild.voice_client
-        if state._advancing > 0 and not (vc and (vc.is_playing() or vc.is_paused())):
-            async with state.lock:
-                if state._advancing > 0:
-                    state._skip_pending = True
-                    return await interaction.followup.send('Lagu dilewati.', ephemeral=True)
+        skip_recorded = False
+        async with state.lock:
+            if state._advancing > 0 and not (vc and (vc.is_playing() or vc.is_paused())):
+                state._skip_pending = True
+                skip_recorded = True
+        if skip_recorded:
+            return await interaction.followup.send('Lagu dilewati.', ephemeral=True)
         await self._stop_player(interaction.guild)
         async with state.lock:
             if state.current:
@@ -2430,6 +2449,8 @@ class MusicBot(discord.Client):
             return await interaction.followup.send('Mohon tunggu sebentar sebelum menekan back lagi.', ephemeral=True)
         state._last_back_time = now
         had_prev = False
+        schedule_idle = False
+        gen = 0
         async with state.lock:
             if state.history:
                 prev = state.history.pop()
@@ -2442,11 +2463,16 @@ class MusicBot(discord.Client):
                 state.queue.appendleft(state.current)
                 state.current = None
                 had_prev = True
+            else:
+                had_prev = False
+                vc = interaction.guild.voice_client if interaction.guild else None
+                if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
+                    state.current = None
+                    gen = state.generation
+                    schedule_idle = True
         if not had_prev:
-            vc = interaction.guild.voice_client if interaction.guild else None
-            if not (vc and (vc.is_playing() or vc.is_paused())) and not state.queue:
-                state.current = None
-                self._schedule_idle(interaction.guild, state.generation)
+            if schedule_idle:
+                self._schedule_idle(interaction.guild, gen)
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self._stop_player(interaction.guild)
         await self.advance(interaction.guild)
@@ -2695,6 +2721,11 @@ class MusicBot(discord.Client):
     async def change_volume(self, interaction: discord.Interaction, target_vol: float):
         if not interaction.guild:
             return await interaction.followup.send('Hanya di server.', ephemeral=True)
+        if not math.isfinite(target_vol):
+            msg = 'Volume tidak valid.'
+            if interaction.response.is_done():
+                return await interaction.followup.send(msg, ephemeral=True)
+            return await interaction.response.send_message(msg, ephemeral=True)
         state = self.states.setdefault(interaction.guild.id, QueueState())
         async with state.lock:
             state.volume = round(max(0.0, min(target_vol, 2.0)), 2)
@@ -2868,6 +2899,14 @@ class MusicBot(discord.Client):
                 state._refresh_pending = False
                 await asyncio.sleep(0.5)
                 msg = state.message
+                if isinstance(msg, int) and getattr(state, 'text_channel_id', None):
+                    ch = self.get_channel(state.text_channel_id)
+                    if ch and hasattr(ch, 'fetch_message'):
+                        try:
+                            msg = await ch.fetch_message(msg)
+                            state.message = msg
+                        except Exception:
+                            msg = None
                 if not (msg and hasattr(msg, 'edit')):
                     return
                 try:
@@ -3171,6 +3210,8 @@ class MusicBot(discord.Client):
                         log.error('vc.play gagal: %s', exc)
                         if 'Not connected to voice' in str(exc) or not getattr(vc, 'is_connected', lambda: False)():
                             asyncio.create_task(self.quit_voice(guild, clear_queue=False))
+                        elif not (vc.is_playing() or vc.is_paused()):
+                            self._schedule_idle(guild, state.generation)
                         # L2: TOCTOU — player lain menang balapan di sela await.
                         # Jangan salahkan track ini (bukan kegagalan stream).
                         try:
@@ -3254,10 +3295,11 @@ class MusicBot(discord.Client):
                 state._skip_armed = False
                 state._skip_pending = False
                 if state.current is not None:
-                    state.history.append(state.current)
-                    if len(state.history) > 20:
-                        state.history.popleft()
-                    state.current = None
+                    if state.loop_mode != 'track':
+                        state.history.append(state.current)
+                        if len(state.history) > 20:
+                            state.history.popleft()
+                        state.current = None
             self._save_persistent_queue()
             schedule_idle = (
                 state.current is None
@@ -3293,8 +3335,10 @@ class MusicBot(discord.Client):
         try:
             if channel is None:
                 return
-            state.now_message = await channel.send(
-                f'Now playing: **{discord.utils.escape_markdown(track.title)}**')
+            state.now_message = await asyncio.shield(channel.send(
+                f'Now playing: **{discord.utils.escape_markdown(track.title)}**'))
+        except asyncio.CancelledError:
+            raise
         except discord.HTTPException:
             state.now_message = None
         except Exception:
@@ -3359,8 +3403,14 @@ class MusicBot(discord.Client):
             async with state.lock:
                 cb_tripped = getattr(state, 'consecutive_playback_errors', 0) >= MAX_TRACK_RETRIES
                 vc = getattr(guild, 'voice_client', None)
-                not_playing = not (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)())
-                if state.generation == generation and state.current is None and (not state.queue or cb_tripped or not_playing) and vc:
+                playing_fn = getattr(vc, 'is_playing', None)
+                paused_fn = getattr(vc, 'is_paused', None)
+                playing_val = playing_fn() if callable(playing_fn) else False
+                paused_val = paused_fn() if callable(paused_fn) else False
+                is_p = playing_val if isinstance(playing_val, bool) else False
+                is_pz = paused_val if isinstance(paused_val, bool) else False
+                not_playing = not (is_p or is_pz)
+                if state.generation == generation and state.current is None and (not state.queue or cb_tripped) and not_playing and vc:
                     should_quit = True
             if should_quit:
                 log.info('Idle 3 menit tanpa antrian aktif di guild %s, bot keluar.', guild.name)

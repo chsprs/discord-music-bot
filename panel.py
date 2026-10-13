@@ -328,24 +328,52 @@ def timer_state() -> str:
 
 
 
+_ytdlp_version_cache: tuple[float, str] | None = None
+_ytdlp_version_lock = threading.Lock()
+YTDLP_VERSION_CACHE_TTL = 30.0
+
+
 def ytdlp_version() -> str:
+    global _ytdlp_version_cache
+    now = time.monotonic()
+    with _ytdlp_version_lock:
+        if _ytdlp_version_cache is not None and now - _ytdlp_version_cache[0] < YTDLP_VERSION_CACHE_TTL:
+            return _ytdlp_version_cache[1]
+    val = 'tidak diketahui'
     try:
         import importlib.metadata
-        return importlib.metadata.version('yt-dlp')
+        val = importlib.metadata.version('yt-dlp')
     except Exception:
         try:
             import importlib
             import yt_dlp.version
             importlib.reload(yt_dlp.version)
-            return getattr(yt_dlp.version, '__version__', 'terpasang')
+            val = getattr(yt_dlp.version, '__version__', 'terpasang')
         except Exception:
-            return 'tidak diketahui'
+            val = 'tidak diketahui'
+    with _ytdlp_version_lock:
+        _ytdlp_version_cache = (time.monotonic(), val)
+    return val
+
+
+_update_log_cache: tuple[float, float, str] | None = None
+_update_log_lock = threading.Lock()
+UPDATE_LOG_CACHE_TTL = 2.0
 
 
 def read_last_update_log() -> str:
-    global _last_update_output
+    global _last_update_output, _update_log_cache
+    now = time.monotonic()
+    with _update_log_lock:
+        if _update_log_cache is not None and now - _update_log_cache[1] < UPDATE_LOG_CACHE_TTL:
+            return _update_log_cache[2]
     try:
         if os.path.exists(UPDATE_LOG_PATH):
+            mtime = os.path.getmtime(UPDATE_LOG_PATH)
+            with _update_log_lock:
+                if _update_log_cache is not None and _update_log_cache[0] == mtime:
+                    _update_log_cache = (mtime, now, _update_log_cache[2])
+                    return _update_log_cache[2]
             size = os.path.getsize(UPDATE_LOG_PATH)
             with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
                 if size > 65536:
@@ -353,11 +381,16 @@ def read_last_update_log() -> str:
                     handle.readline()
                 content = handle.read()[-65536:].strip()
                 if content:
+                    with _update_log_lock:
+                        _update_log_cache = (mtime, now, content)
                     return content
     except Exception:
         pass
     with _lock:
-        return _last_update_output or ''
+        fallback = _last_update_output or ''
+    with _update_log_lock:
+        _update_log_cache = (0.0, now, fallback)
+    return fallback
 
 
 def read_bot_logs(lines: int = 35) -> str:
