@@ -200,7 +200,8 @@ class ConfigStore:
     def write(self, values: dict) -> None:
         with self._lock:
             for value in values.values():
-                if '\n' in value or '\r' in value:
+                val_str = str(value) if value is not None else ''
+                if '\n' in val_str or '\r' in val_str:
                     raise ValueError('Nilai tidak boleh mengandung baris baru.')
 
             preserved = self._preserved_lines()
@@ -350,6 +351,8 @@ def ytdlp_version() -> str:
             return _ytdlp_version_cache[1]
     val = 'tidak diketahui'
     try:
+        import importlib
+        importlib.invalidate_caches()
         import importlib.metadata
         val = importlib.metadata.version('yt-dlp')
     except Exception:
@@ -518,21 +521,22 @@ def _run_update_inner() -> tuple[bool, str]:
                 else:
                     out += f'\nGagal merestart service, return code: {restart_proc.returncode}'
                     ok = False
-        if os.path.exists(UPDATE_LOG_PATH):
-            try:
-                with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
-                    handle.seek(0, 2)
-                    size = handle.tell()
-                    handle.seek(max(0, size - 65536))
-                    if size > 65536:
-                        handle.readline()
-                    file_content = handle.read()[-65536:].strip()
-                if file_content:
-                    with _lock:
-                        _last_update_output = file_content
-                    return ok, file_content
-            except Exception:
-                pass
+        if ok and cmd == [update_script]:
+            if os.path.exists(UPDATE_LOG_PATH):
+                try:
+                    with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
+                        handle.seek(0, 2)
+                        size = handle.tell()
+                        handle.seek(max(0, size - 65536))
+                        if size > 65536:
+                            handle.readline()
+                        file_content = handle.read()[-65536:].strip()
+                    if file_content:
+                        with _lock:
+                            _last_update_output = file_content
+                        return ok, file_content
+                except Exception:
+                    pass
         log_content = f'[{timestamp}] Exit code: {proc.returncode}\n{out}'
         with _lock:
             _last_update_output = log_content
@@ -1400,6 +1404,11 @@ class Handler(BaseHTTPRequestHandler):
             _last_fresh_log_time.clear()
         with _ytdlp_version_lock:
             _ytdlp_version_cache = None
+        try:
+            import importlib
+            importlib.invalidate_caches()
+        except Exception:
+            pass
         with _update_log_lock:
             _update_log_cache = None
         with _runtime_info_lock:

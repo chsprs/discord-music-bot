@@ -817,12 +817,14 @@ async def fetch_recommendations(history_titles: list[str], exclude_urls: set[str
     sudah pernah diputar (exclude_urls) supaya AutoPlay tidak mengulang lagu.
     """
     seen: set[str] = set(exclude_urls or set())
+    seen_seeds: set[str] = set()
 
     # --- Prioritas 1: YouTube Mix dari seed URL (terbaru dulu) ---
     for seed_url in reversed(seed_urls or []):
         video_id = extract_video_id(seed_url)
-        if not video_id:
+        if not video_id or video_id in seen_seeds:
             continue
+        seen_seeds.add(video_id)
         mix_tracks = await fetch_youtube_mix(video_id, seen, requester)
         candidates: list[Track] = []
         for track in mix_tracks:
@@ -996,6 +998,11 @@ class BufferedAudioSource(discord.AudioSource):
             while not self.stop_event.is_set():
                 data = self.source.read()
                 if not data:
+                    proc = getattr(self.source, '_process', None)
+                    if proc and hasattr(proc, 'poll'):
+                        ret = proc.poll()
+                        if ret not in (None, 0) and not self.stop_event.is_set():
+                            self._current_error = RuntimeError(f"FFmpeg process exited with code {ret}")
                     self._enqueue(None)
                     break
                 if not self._enqueue(data):
@@ -1238,6 +1245,8 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         vc = guild.voice_client
+        if vc and not getattr(vc, 'is_connected', lambda: True)():
+            vc.channel = None
         if not vc or getattr(vc, 'channel', None) is None:
             try:
                 perms = voice.channel.permissions_for(interaction.guild.me) if interaction.guild.me else None
@@ -1425,6 +1434,8 @@ class MusicPanel(discord.ui.View):
 
         vc = interaction.guild.voice_client
         vc_channel_id = getattr(getattr(vc, 'channel', None), 'id', None)
+        if vc and not getattr(vc, 'is_connected', lambda: True)():
+            vc_channel_id = None
         if not vc or vc_channel_id is None:
             # Tombol non-playback (volume/shuffle/loop/playlist) jangan auto-connect (M10).
             if require_voice:
@@ -1904,6 +1915,9 @@ class MusicBot(discord.Client):
                     return
 
                 try:
+                    with lock:
+                        if seq < getattr(self, '_queue_last_seq', 0):
+                            return
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
                     try:
@@ -1911,10 +1925,9 @@ class MusicBot(discord.Client):
                             json.dump(payload, f)
                         os.chmod(tmp_path, 0o644)
                         with lock:
-                            if seq < getattr(self, '_queue_last_seq', 0):
-                                return
-                            self._queue_last_seq = seq
-                            os.replace(tmp_path, path)
+                            if seq >= getattr(self, '_queue_last_seq', 0):
+                                self._queue_last_seq = seq
+                                os.replace(tmp_path, path)
                     finally:
                         if os.path.exists(tmp_path):
                             try:
@@ -2396,6 +2409,8 @@ class MusicBot(discord.Client):
         await interaction.response.defer(thinking=True)
         vc = interaction.guild.voice_client
         vc_channel_id = getattr(getattr(vc, 'channel', None), 'id', None)
+        if vc and not getattr(vc, 'is_connected', lambda: True)():
+            vc_channel_id = None
         if not vc or vc_channel_id is None:
             try:
                 perms = voice.channel.permissions_for(interaction.guild.me) if interaction.guild.me else None
@@ -2518,7 +2533,7 @@ class MusicBot(discord.Client):
         if not ok:
             return await interaction.followup.send(msg, ephemeral=True)
         state = self.states.get(interaction.guild.id)
-        if not state or (not state.history and not state.current):
+        if not state:
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         now = time.monotonic()
         if now - getattr(state, '_last_back_time', 0.0) < 0.5:
@@ -2692,7 +2707,7 @@ class MusicBot(discord.Client):
         ok, msg = _check_same_voice(interaction)
         if not ok:
             vc = interaction.guild.voice_client if interaction.guild else None
-            if not vc:
+            if not vc or not getattr(vc, 'is_connected', lambda: True)():
                 await self.quit_voice(interaction.guild, clear_queue=True)
                 return await interaction.followup.send('Musik dihentikan, antrian direset, dan bot keluar voice.', ephemeral=True)
             return await interaction.followup.send(msg, ephemeral=True)
@@ -2706,7 +2721,7 @@ class MusicBot(discord.Client):
         ok, msg = _check_same_voice(interaction)
         if not ok:
             vc = interaction.guild.voice_client if interaction.guild else None
-            if not vc:
+            if not vc or not getattr(vc, 'is_connected', lambda: True)():
                 await self.quit_voice(interaction.guild, clear_queue=True)
                 return await interaction.followup.send('Bot keluar dari voice channel, antrian direset, dan cache dibersihkan.', ephemeral=True)
             return await interaction.followup.send(msg, ephemeral=True)
@@ -2885,6 +2900,8 @@ class MusicBot(discord.Client):
         await interaction.response.defer(ephemeral=True, thinking=True)
         vc = interaction.guild.voice_client
         vc_channel_id = getattr(getattr(vc, 'channel', None), 'id', None)
+        if vc and not getattr(vc, 'is_connected', lambda: True)():
+            vc_channel_id = None
         if not vc or vc_channel_id is None:
             try:
                 perms = voice.channel.permissions_for(interaction.guild.me) if interaction.guild.me else None
@@ -2929,26 +2946,22 @@ class MusicBot(discord.Client):
         if channel is None and getattr(interaction, 'channel_id', None) and hasattr(self, 'get_channel'):
             channel = self.get_channel(interaction.channel_id)
 
-        if not channel or not hasattr(channel, 'send'):
-            if vc and getattr(vc, 'is_connected', lambda: False)() and not (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)()):
-                if state.queue and state.current is None:
-                    await self.advance(interaction.guild)
-                elif not state.queue and state.current is None:
-                    self._schedule_idle(interaction.guild, state.generation)
-            return await interaction.followup.send('Tidak dapat menemukan text channel untuk menampilkan panel.', ephemeral=True)
-
         try:
-            new_msg = await channel.send(embed=self.embed(state), view=MusicPanel(self))
-            async with state.lock:
-                state.message = new_msg
-                if hasattr(channel, 'id'):
-                    state.text_channel_id = channel.id
-            await interaction.followup.send('Panel musik aktif di channel ini.', ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send('Bot butuh izin Send Messages + Embed Links di channel ini.', ephemeral=True)
-        except Exception:
-            log.exception('Gagal mengirim panel musik')
-            await interaction.followup.send('Gagal memunculkan panel. Coba lagi.', ephemeral=True)
+            if not channel or not hasattr(channel, 'send'):
+                return await interaction.followup.send('Tidak dapat menemukan text channel untuk menampilkan panel.', ephemeral=True)
+
+            try:
+                new_msg = await channel.send(embed=self.embed(state), view=MusicPanel(self))
+                async with state.lock:
+                    state.message = new_msg
+                    if hasattr(channel, 'id'):
+                        state.text_channel_id = channel.id
+                await interaction.followup.send('Panel musik aktif di channel ini.', ephemeral=True)
+            except discord.Forbidden:
+                await interaction.followup.send('Bot butuh izin Send Messages + Embed Links di channel ini.', ephemeral=True)
+            except Exception:
+                log.exception('Gagal mengirim panel musik')
+                await interaction.followup.send('Gagal memunculkan panel. Coba lagi.', ephemeral=True)
         finally:
             if vc and getattr(vc, 'is_connected', lambda: False)() and not (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)()):
                 if state.queue and state.current is None:
@@ -3203,6 +3216,8 @@ class MusicBot(discord.Client):
                 if isinstance(data, dict) and (data.get('is_live') or data.get('live_status') == 'is_live'):
                     log.warning('Live stream dilewati: %s', next_track.title)
                     async with state.lock:
+                        if state.current is next_track:
+                            state.current = None
                         if state.queue:
                             if state.queue[0] is next_track:
                                 state.queue.popleft()
@@ -3267,7 +3282,7 @@ class MusicBot(discord.Client):
                                             'Circuit breaker aktif, pemutaran dihentikan agar antrian aman.',
                                             st.consecutive_playback_errors, guild.name
                                         )
-                                        if st.current and (not st.queue or st.queue[0] is not st.current):
+                                        if st.current and not any(t is st.current for t in st.queue) and (not st.queue or st.queue[0] is not st.current):
                                             st.queue.appendleft(st.current)
                                         st.current = None
                                 if circuit_broken:
@@ -3343,12 +3358,13 @@ class MusicBot(discord.Client):
                                 idx = next((i for i, t in enumerate(state.queue) if t is next_track), None)
                                 if idx is not None:
                                     del state.queue[idx]
-                        if state.current and state.current is not next_track:
-                            state.history.append(state.current)
-                            if len(state.history) > 20:
-                                state.history.popleft()
+                        if state.current:
                             if state.loop_mode == 'queue':
                                 state.queue.append(state.current)
+                            if state.current is not next_track:
+                                state.history.append(state.current)
+                                if len(state.history) > 20:
+                                    state.history.popleft()
                         state.current = next_track
                 self._save_persistent_queue()
                 await self.refresh(state)
@@ -3439,7 +3455,8 @@ class MusicBot(discord.Client):
             else:
                 await self._safe_delete_msg(old, channel=channel, guild=guild)
             async with state.lock:
-                state.now_message = None
+                if state.now_message is old:
+                    state.now_message = None
         if panel_msg is None:
             return
         try:
@@ -3451,6 +3468,15 @@ class MusicBot(discord.Client):
             async with state.lock:
                 state.now_message = sent_msg
         except asyncio.CancelledError:
+            def _cleanup_sent(f):
+                if not f.cancelled():
+                    try:
+                        m = f.result()
+                        if m:
+                            asyncio.ensure_future(self._safe_delete_msg(m, guild=guild))
+                    except Exception:
+                        pass
+            msg_fut.add_done_callback(_cleanup_sent)
             raise
         except discord.HTTPException:
             async with state.lock:
@@ -3543,6 +3569,8 @@ class MusicBot(discord.Client):
                     pass
 
     async def on_voice_state_update(self, member, before, after):
+        if getattr(self, '_stopping', False) or self.is_closed():
+            return
         guild = getattr(member, 'guild', None)
         if not guild:
             return
