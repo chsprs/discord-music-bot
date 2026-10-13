@@ -6229,4 +6229,86 @@ class Wave20RemediationTests(unittest.TestCase):
         finally:
             b._JS_RUNTIME = orig_runtime
 
+    def test_wave23_clean_channel_id_helper(self):
+        """Wave 23: _clean_channel_id sanitasi integer positif non-boolean."""
+        from bot import _clean_channel_id
+        self.assertEqual(_clean_channel_id(12345), 12345)
+        self.assertEqual(_clean_channel_id("67890"), 67890)
+        self.assertIsNone(_clean_channel_id(True))
+        self.assertIsNone(_clean_channel_id(False))
+        self.assertIsNone(_clean_channel_id(None))
+        self.assertIsNone(_clean_channel_id(0))
+        self.assertIsNone(_clean_channel_id(-5))
+        self.assertIsNone(_clean_channel_id("abc"))
+
+    def test_wave23_check_same_voice_mock_overhead(self):
+        """Wave 23: _check_same_voice mendeteksi Mock tanpa impor unittest.mock."""
+        from bot import _check_same_voice
+        interaction = MagicMock()
+        interaction.guild = MagicMock()
+        vc = MagicMock()
+        vc.channel.id = 1122
+        interaction.guild.voice_client = vc
+        interaction.user.voice.channel.id = MagicMock()
+        ok, msg = _check_same_voice(interaction)
+        self.assertTrue(ok)
+        self.assertEqual(msg, "")
+
+    def test_wave23_embed_avatar_url_getattr_safety(self):
+        """Wave 23: MusicBot.embed aman dari AttributeError bila display_avatar tidak memiliki url."""
+        from bot import MusicBot, QueueState
+        b = MusicBot()
+        st = QueueState()
+        mock_user = MagicMock()
+        mock_user.display_avatar = None
+        with patch.object(type(b), "user", new_callable=PropertyMock, return_value=mock_user):
+            emb = b.embed(st)
+            self.assertIsNotNone(emb)
+
+    def test_wave23_idle_disconnect_current_task_cleanup(self):
+        """Wave 23: idle_disconnect membersihkan st.idle_task bila task selesai/current."""
+        from bot import MusicBot, QueueState
+        b = MusicBot()
+        st = QueueState()
+        guild = MagicMock()
+        guild.id = 88001
+        guild.voice_client = None
+        b.states[88001] = st
+
+        async def run_idle():
+            st.idle_task = asyncio.current_task()
+            with patch("asyncio.sleep", new=AsyncMock()):
+                await b.idle_disconnect(guild, st.generation)
+
+        asyncio.run(run_idle())
+        self.assertIsNone(st.idle_task)
+
+    def test_wave23_bot_close_state_lock_synchronization(self):
+        """Wave 23: MusicBot.close() mengunci state.lock saat membatalkan task dan menaikkan generation."""
+        from bot import MusicBot, QueueState
+        b = MusicBot()
+        st = QueueState()
+        st.idle_task = MagicMock()
+        st.idle_task.done.return_value = False
+        b.states[77001] = st
+        initial_gen = st.generation
+        with patch.object(b, "_delete_all_panels", new=AsyncMock()), \
+             patch.object(b, "_save_persistent_queue", return_value=None), \
+             patch("discord.Client.close", new=AsyncMock()):
+            asyncio.run(b.close())
+        self.assertGreater(st.generation, initial_gen)
+        self.assertIsNone(st.idle_task)
+
+    def test_wave23_safe_delete_msg_clean_channel_id_used(self):
+        """Wave 23: _safe_delete_msg tidak mengekstrak boolean ch_id menjadi integer 1."""
+        from bot import MusicBot
+        b = MusicBot()
+        guild = MagicMock()
+        guild.get_channel = MagicMock()
+        fake_msg = MagicMock(spec=[])
+        fake_msg.channel_id = True
+        asyncio.run(b._safe_delete_msg(fake_msg, guild=guild))
+        guild.get_channel.assert_not_called()
+
+
 

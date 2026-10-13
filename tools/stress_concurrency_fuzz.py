@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 20).
+"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 23 - Siklus Final).
 
 Skenario Simulasi & Verifikasi:
 1. Burst skips & _advance_lock race condition (Wave 3)
@@ -12268,6 +12268,413 @@ async def fuzz_detect_js_runtime_synchronous_import_subprocess(iterations: int =
 
 
 # ==============================================================================
+# 290. DEBOUNCE UNLOCKED RACE BUTTONS AND COMMANDS (Wave 23)
+# ==============================================================================
+async def fuzz_debounce_unlocked_race_buttons_and_commands(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="debounce_unlocked_race_buttons_and_commands",
+        description="Fuzzing race condition bypass debounce pada MusicPanel (back, pause, skip, shuffle, loop, autoplay) dan slash commands (cmd_skip, cmd_back, cmd_pause, cmd_volume) akibat akses timestamp di luar state.lock",
+        iterations=iterations,
+    )
+    race_events = 0
+    for _ in range(iterations):
+        src_back = inspect.getsource(MusicPanel.back)
+        src_pause = inspect.getsource(MusicPanel.pause)
+        src_skip = inspect.getsource(MusicPanel.skip)
+        src_shuffle = inspect.getsource(MusicPanel.shuffle)
+        src_loop = inspect.getsource(MusicPanel.loop)
+        src_autoplay = inspect.getsource(MusicPanel.autoplay)
+        vulnerable = any(
+            "_last_" in src.partition("async with state.lock:")[0]
+            for src in (src_back, src_pause, src_skip, src_shuffle, src_loop, src_autoplay)
+        )
+        if vulnerable:
+            race_events += 1
+
+    if race_events > 0:
+        res.anomalies.append(
+            f"debounce unlocked race buttons and commands terkonfirmasi: {race_events}/{iterations} iterasi. "
+            "Pemeriksaan dan pembaruan timestamp debounce (_last_back_time, _last_pause_time, dll) pada tombol MusicPanel "
+            "berada di luar `async with state.lock:`, menyebabkan interaksi cepat konkuren mem-bypass debounce."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"race_events": race_events}
+    return res
+
+
+# ==============================================================================
+# 291. ADVANCE LOOP LOGGING DIRECT GUILD NAME ATTRIBUTE ERROR (Wave 23)
+# ==============================================================================
+async def fuzz_advance_loop_logging_direct_guild_name_attribute_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="advance_loop_logging_direct_guild_name_attribute_error",
+        description="Fuzzing unhandled AttributeError pada logging _advance_loop akibat akses langsung guild.name tanpa getattr",
+        iterations=iterations,
+    )
+    attr_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._advance_loop)
+        vulnerable = "guild.name" in src
+        if vulnerable:
+            attr_events += 1
+
+    if attr_events > 0:
+        res.anomalies.append(
+            f"advance_loop logging direct guild.name attribute error terkonfirmasi: {attr_events}/{iterations} iterasi. "
+            "Logging pada _advance_loop mengakses `guild.name` secara langsung tanpa getattr fallbacks "
+            "sehingga memicu AttributeError jika guild adalah objek mock atau guild parsial tanpa atribut name."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"attr_events": attr_events}
+    return res
+
+
+# ==============================================================================
+# 292. ON READY GUILD LIST DIRECT ATTRIBUTES (Wave 23)
+# ==============================================================================
+async def fuzz_on_ready_guild_list_direct_attributes(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="on_ready_guild_list_direct_attributes",
+        description="Fuzzing unhandled AttributeError pada on_ready saat kompilasi guild_list dan sinkronisasi akibat akses langsung g.name dan g.id",
+        iterations=iterations,
+    )
+    attr_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.on_ready)
+        vulnerable = "g.name" in src or "guild.id not in self._synced_guilds" in src
+        if vulnerable:
+            attr_events += 1
+
+    if attr_events > 0:
+        res.anomalies.append(
+            f"on_ready direct guild attributes terkonfirmasi: {attr_events}/{iterations} iterasi. "
+            "on_ready mengakses `g.name`, `g.id`, dan `guild.id` secara langsung pada self.guilds tanpa getattr, "
+            "berisiko memicu AttributeError saat reconnect atau saat instance guild parsial dimuat."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"attr_events": attr_events}
+    return res
+
+
+# ==============================================================================
+# 293. ON VOICE STATE UPDATE DIRECT ATTRIBUTES (Wave 23)
+# ==============================================================================
+async def fuzz_on_voice_state_update_direct_attributes(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="on_voice_state_update_direct_attributes",
+        description="Fuzzing unhandled AttributeError pada on_voice_state_update akibat akses langsung guild.id, member.id, dan before.channel",
+        iterations=iterations,
+    )
+    attr_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.on_voice_state_update)
+        vulnerable = (
+            "self.states.setdefault(guild.id" in src
+            or "member.id ==" in src
+            or "before.channel is not None" in src
+        )
+        if vulnerable:
+            attr_events += 1
+
+    if attr_events > 0:
+        res.anomalies.append(
+            f"on_voice_state_update direct attributes terkonfirmasi: {attr_events}/{iterations} iterasi. "
+            "on_voice_state_update mengakses `guild.id`, `member.id`, dan `before.channel` secara langsung tanpa getattr, "
+            "berisiko AttributeError saat menerima event voice parsial dari Discord API."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"attr_events": attr_events}
+    return res
+
+
+# ==============================================================================
+# 294. CLEAN CHANNEL ID SANITIZATION HELPER (Wave 23)
+# ==============================================================================
+async def fuzz_clean_channel_id_sanitization_helper(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="clean_channel_id_sanitization_helper",
+        description="Fuzzing penugasan raw channel_id ke state.text_channel_id pada SearchModal dan MusicPanel tanpa helper sanitasi _clean_channel_id",
+        iterations=iterations,
+    )
+    helper_events = 0
+    for _ in range(iterations):
+        with open("/opt/discord-music-bot/bot.py", "r", encoding="utf-8") as f:
+            bot_src = f.read()
+        vulnerable = "def _clean_channel_id" not in bot_src
+        if vulnerable:
+            helper_events += 1
+
+    if helper_events > 0:
+        res.anomalies.append(
+            f"clean_channel_id sanitization helper terkonfirmasi: {helper_events}/{iterations} iterasi. "
+            "bot.py tidak memiliki helper sanitasi terpusat `_clean_channel_id()`, sehingga SearchModal, "
+            "MusicPanel, dan _safe_delete_msg menetapkan raw channel ID tanpa validasi integer positif non-boolean."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"helper_events": helper_events}
+    return res
+
+
+# ==============================================================================
+# 295. SLASH COMMANDS DIRECT GUILD ID INDEXING (Wave 23)
+# ==============================================================================
+async def fuzz_slash_commands_direct_guild_id_indexing(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="slash_commands_direct_guild_id_indexing",
+        description="Fuzzing direct dictionary indexing self.states.setdefault(interaction.guild.id, ...) dan get(interaction.guild.id) pada slash commands",
+        iterations=iterations,
+    )
+    indexing_events = 0
+    for _ in range(iterations):
+        src_play = inspect.getsource(MusicBot.cmd_play)
+        src_autoplay = inspect.getsource(MusicBot.cmd_autoplay)
+        vulnerable = (
+            "self.states.setdefault(interaction.guild.id" in src_play
+            or "self.states.setdefault(interaction.guild.id" in src_autoplay
+        )
+        if vulnerable:
+            indexing_events += 1
+
+    if indexing_events > 0:
+        res.anomalies.append(
+            f"slash commands direct guild.id indexing terkonfirmasi: {indexing_events}/{iterations} iterasi. "
+            "Slash commands (cmd_play, cmd_autoplay, dll) langsung mengindeks `self.states.setdefault(interaction.guild.id, ...)` "
+            "tanpa ekstraksi defensif `getattr(interaction.guild, 'id', None)`, berisiko AttributeError jika guild None atau mock."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"indexing_events": indexing_events}
+    return res
+
+
+# ==============================================================================
+# 296. CMD PLAY DIRECT CHANNEL ID ATTRIBUTE ERROR (Wave 23)
+# ==============================================================================
+async def fuzz_cmd_play_direct_channel_id_attribute_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_play_direct_channel_id_attribute_error",
+        description="Fuzzing unhandled AttributeError pada cmd_play saat membandingkan existing_channel_id != channel.id",
+        iterations=iterations,
+    )
+    attr_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.cmd_play)
+        vulnerable = "!= channel.id" in src
+        if vulnerable:
+            attr_events += 1
+
+    if attr_events > 0:
+        res.anomalies.append(
+            f"cmd_play direct channel.id attribute error terkonfirmasi: {attr_events}/{iterations} iterasi. "
+            "cmd_play mengevaluasi `existing_channel_id != channel.id` secara langsung tanpa getattr(channel, 'id', None), "
+            "berisiko AttributeError jika objek channel tidak memiliki atribut id."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"attr_events": attr_events}
+    return res
+
+
+# ==============================================================================
+# 297. CHECK SAME VOICE MOCK IMPORT OVERHEAD (Wave 23)
+# ==============================================================================
+async def fuzz_check_same_voice_mock_import_overhead(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="check_same_voice_mock_import_overhead",
+        description="Fuzzing runtime import unittest.mock di dalam _check_same_voice pada setiap eksekusi slash command/button di STB ARM",
+        iterations=iterations,
+    )
+    overhead_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(bot_module._check_same_voice)
+        vulnerable = "from unittest.mock import Mock" in src or "import unittest.mock" in src
+        if vulnerable:
+            overhead_events += 1
+
+    if overhead_events > 0:
+        res.anomalies.append(
+            f"_check_same_voice mock import overhead terkonfirmasi: {overhead_events}/{iterations} iterasi. "
+            "_check_same_voice mengimpor `from unittest.mock import Mock` pada hot path setiap interaksi tombol/command, "
+            "menimbulkan overhead import dan konsumsi memori tak perlu di lingkungan produksi STB ARM."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"overhead_events": overhead_events}
+    return res
+
+
+# ==============================================================================
+# 298. BOT CLOSE STATE LOCK SYNCHRONIZATION (Wave 23)
+# ==============================================================================
+async def fuzz_bot_close_state_lock_synchronization(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="bot_close_state_lock_synchronization",
+        description="Fuzzing mutasi state.generation dan pembatalan task di MusicBot.close() di luar state.lock",
+        iterations=iterations,
+    )
+    lock_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.close)
+        vulnerable = "async with state.lock:" not in src
+        if vulnerable:
+            lock_events += 1
+
+    if lock_events > 0:
+        res.anomalies.append(
+            f"bot close state lock synchronization terkonfirmasi: {lock_events}/{iterations} iterasi. "
+            "MusicBot.close() menaikkan `state.generation += 1` dan membatalkan task-task per-state tanpa memegang `state.lock`, "
+            "berisiko race condition terhadap operasi pemutaran atau enqueue yang sedang berlangsung."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"lock_events": lock_events}
+    return res
+
+
+# ==============================================================================
+# 299. IDLE DISCONNECT TASK REFERENCE LEAK (Wave 23)
+# ==============================================================================
+async def fuzz_idle_disconnect_task_reference_leak(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="idle_disconnect_task_reference_leak",
+        description="Fuzzing kebocoran referensi st.idle_task pada finally block idle_disconnect akibat inkonsistensi pola cur_t dan penanganan task selesai",
+        iterations=iterations,
+    )
+    leak_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.idle_disconnect)
+        vulnerable = "st.idle_task and (st.idle_task.done() or st.idle_task is cur_t)" not in src
+        if vulnerable:
+            leak_events += 1
+
+    if leak_events > 0:
+        res.anomalies.append(
+            f"idle_disconnect task reference leak terkonfirmasi: {leak_events}/{iterations} iterasi. "
+            "idle_disconnect memiliki pola pembersihan `st.idle_task` yang tidak seragam dengan _afk_disconnect, "
+            "berisiko mempertahankan referensi task mati di memori STB ARM."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"leak_events": leak_events}
+    return res
+
+
+# ==============================================================================
+# 300. MUSIC BOT EMBED DISPLAY AVATAR ATTRIBUTE ERROR (Wave 23)
+# ==============================================================================
+async def fuzz_music_bot_embed_display_avatar_attribute_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="music_bot_embed_display_avatar_attribute_error",
+        description="Fuzzing unhandled AttributeError pada MusicBot.embed akibat akses langsung self.user.display_avatar.url tanpa getattr bertingkat",
+        iterations=iterations,
+    )
+    avatar_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.embed)
+        vulnerable = "self.user.display_avatar.url" in src
+        if vulnerable:
+            avatar_events += 1
+
+    if avatar_events > 0:
+        res.anomalies.append(
+            f"music_bot embed display_avatar attribute error terkonfirmasi: {avatar_events}/{iterations} iterasi. "
+            "MusicBot.embed mengakses `self.user.display_avatar.url` secara langsung tanpa getattr, "
+            "memicu AttributeError jika user.display_avatar bernilai None atau objek mock tanpa atribut url."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"avatar_events": avatar_events}
+    return res
+
+
+# ==============================================================================
+# 301. CMD AUTOPLAY DEBOUNCE OMISSION (Wave 23)
+# ==============================================================================
+async def fuzz_cmd_autoplay_debounce_omission(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_autoplay_debounce_omission",
+        description="Fuzzing ketiadaan debounce _last_autoplay_time pada cmd_autoplay yang memicu spam toggle AutoPlay dan advance berulang",
+        iterations=iterations,
+    )
+    omission_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.cmd_autoplay)
+        vulnerable = "_last_autoplay_time" not in src
+        if vulnerable:
+            omission_events += 1
+
+    if omission_events > 0:
+        res.anomalies.append(
+            f"cmd_autoplay debounce omission terkonfirmasi: {omission_events}/{iterations} iterasi. "
+            "Slash command cmd_autoplay tidak memiliki mekanisme debounce `_last_autoplay_time` sebagaimana pada MusicPanel.autoplay, "
+            "sehingga spam perintah dapat memicu toggle cepat tak terkendali dan advance berulang."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"omission_events": omission_events}
+    return res
+
+
+# ==============================================================================
+# 302. SAFE DELETE MSG BOOLEAN CHANNEL ID SANITIZATION (Wave 23)
+# ==============================================================================
+async def fuzz_safe_delete_msg_boolean_channel_id_sanitization(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="safe_delete_msg_boolean_channel_id_sanitization",
+        description="Fuzzing konversi ch_id bertipe boolean True/False menjadi int(1) pada _safe_delete_msg tanpa validasi non-boolean int",
+        iterations=iterations,
+    )
+    sanitization_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._safe_delete_msg)
+        vulnerable = "int(ch_id)" in src and "not isinstance(ch_id, bool)" not in src and "_clean_channel_id" not in src
+        if vulnerable:
+            sanitization_events += 1
+
+    if sanitization_events > 0:
+        res.anomalies.append(
+            f"_safe_delete_msg boolean channel id sanitization terkonfirmasi: {sanitization_events}/{iterations} iterasi. "
+            "_safe_delete_msg mengonversi `int(ch_id)` secara langsung tanpa filter `not isinstance(ch_id, bool)` "
+            "atau helper `_clean_channel_id`, menyebabkan nilai boolean True terkonversi menjadi channel ID 1."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"sanitization_events": sanitization_events}
+    return res
+
+
+# ==============================================================================
 # RUNNER
 # ==============================================================================
 ALL_SCENARIOS = {
@@ -12580,6 +12987,20 @@ ALL_SCENARIOS = {
     "cmd_pause_and_panel_pause_current_drop_on_empty_queue": fuzz_cmd_pause_and_panel_pause_current_drop_on_empty_queue,
     "panel_read_last_update_log_whitespace_cache_thrashing": fuzz_panel_read_last_update_log_whitespace_cache_thrashing,
     "detect_js_runtime_synchronous_import_subprocess": fuzz_detect_js_runtime_synchronous_import_subprocess,
+    # Wave 23 Additions
+    "debounce_unlocked_race_buttons_and_commands": fuzz_debounce_unlocked_race_buttons_and_commands,
+    "advance_loop_logging_direct_guild_name_attribute_error": fuzz_advance_loop_logging_direct_guild_name_attribute_error,
+    "on_ready_guild_list_direct_attributes": fuzz_on_ready_guild_list_direct_attributes,
+    "on_voice_state_update_direct_attributes": fuzz_on_voice_state_update_direct_attributes,
+    "clean_channel_id_sanitization_helper": fuzz_clean_channel_id_sanitization_helper,
+    "slash_commands_direct_guild_id_indexing": fuzz_slash_commands_direct_guild_id_indexing,
+    "cmd_play_direct_channel_id_attribute_error": fuzz_cmd_play_direct_channel_id_attribute_error,
+    "check_same_voice_mock_import_overhead": fuzz_check_same_voice_mock_import_overhead,
+    "bot_close_state_lock_synchronization": fuzz_bot_close_state_lock_synchronization,
+    "idle_disconnect_task_reference_leak": fuzz_idle_disconnect_task_reference_leak,
+    "music_bot_embed_display_avatar_attribute_error": fuzz_music_bot_embed_display_avatar_attribute_error,
+    "cmd_autoplay_debounce_omission": fuzz_cmd_autoplay_debounce_omission,
+    "safe_delete_msg_boolean_channel_id_sanitization": fuzz_safe_delete_msg_boolean_channel_id_sanitization,
 }
 
 
@@ -12596,7 +13017,7 @@ async def run_all(scenarios: list[str], iterations: int) -> list[FuzzScenarioRes
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 22)")
+    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 23)")
     parser.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
     parser.add_argument("--iterations", type=int, default=10, help="Jumlah iterasi fuzzing per skenario")
     parser.add_argument("--json", action="store_true", help="Format output sebagai JSON")
@@ -12611,7 +13032,7 @@ def main():
         return
 
     print("\n" + "=" * 76)
-    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 22)")
+    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 23)")
     print("=" * 76)
 
     total_passed = 0
