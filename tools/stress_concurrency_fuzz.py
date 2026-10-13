@@ -11462,6 +11462,427 @@ async def fuzz_panel_config_store_write_directory_fsync_o_directory_flag(iterati
 
 
 # ==============================================================================
+# 266. SUMMON STOPPED PLAYBACK STRANDED VOICE (Wave 21)
+# ==============================================================================
+async def fuzz_summon_stopped_playback_stranded_voice(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="summon_stopped_playback_stranded_voice",
+        description="Fuzzing bot stranded di voice channel tanpa pemutaran dan tanpa idle timer pada summon() saat playback terhenti",
+        iterations=iterations,
+    )
+    stranded_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.summon)
+        part = src.partition("finally:")
+        sub = part[2]
+        vulnerable = "if state.queue and state.current is None:" in sub or "elif not state.queue and state.current is None:" in sub
+        if vulnerable:
+            stranded_events += 1
+
+    if stranded_events > 0:
+        res.anomalies.append(
+            f"summon stopped playback stranded voice terkonfirmasi: {stranded_events}/{iterations} iterasi. "
+            "summon() (cmd_musik) pada blok finally hanya mengevaluasi `should_advance` atau `should_idle` jika `state.current is None`. "
+            "Jika state.current tidak None (misal hasil restore antrean atau audio terhenti), kedua flag bernilai False dan bot terdampar "
+            "di voice channel tanpa pemutaran maupun idle disconnect timer."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"stranded_events": stranded_events}
+    return res
+
+
+# ==============================================================================
+# 267. ANNOUNCE NOW PLAYING STALE GENERATION ORPHAN LEAK (Wave 21)
+# ==============================================================================
+async def fuzz_announce_now_playing_stale_generation_orphan_leak(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="announce_now_playing_stale_generation_orphan_leak",
+        description="Fuzzing orphan/ghost now-playing message leak pada _announce_now_playing jika channel.send selesai setelah stop/quit",
+        iterations=iterations,
+    )
+    leak_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._announce_now_playing)
+        part = src.partition("sent_msg = await asyncio.shield(msg_fut)")
+        sub = part[2].partition("except asyncio.CancelledError")[0]
+        vulnerable = "state.generation" not in sub or "state.current is track" not in sub
+        if vulnerable:
+            leak_events += 1
+
+    if leak_events > 0:
+        res.anomalies.append(
+            f"_announce_now_playing stale generation orphan leak terkonfirmasi: {leak_events}/{iterations} iterasi. "
+            "_announce_now_playing langsung menugaskan `state.now_message = sent_msg` tanpa memvalidasi `state.generation == gen0` "
+            "dan `state.current is track`, berisiko meninggalkan orphan message jika pemutaran dihentikan (/stop, /quit) saat pengiriman berlangsung."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"leak_events": leak_events}
+    return res
+
+
+# ==============================================================================
+# 268. CMD PLAY AND SUMMON EMBED UNLOCKED READ SNAPSHOT (Wave 21)
+# ==============================================================================
+async def fuzz_cmd_play_and_summon_embed_unlocked_read_snapshot(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_play_and_summon_embed_unlocked_read_snapshot",
+        description="Fuzzing pembacaan state.current, state.volume, dan state.queue tanpa state.lock saat formatting embed di cmd_play dan summon",
+        iterations=iterations,
+    )
+    unlocked_events = 0
+    for _ in range(iterations):
+        src_play = inspect.getsource(MusicBot.cmd_play)
+        src_summon = inspect.getsource(MusicBot.summon)
+        vulnerable = "embed=self.embed(state)" in src_play or "embed=self.embed(state)" in src_summon
+        if vulnerable:
+            unlocked_events += 1
+
+    if unlocked_events > 0:
+        res.anomalies.append(
+            f"cmd_play and summon unlocked embed snapshot terkonfirmasi: {unlocked_events}/{iterations} iterasi. "
+            "cmd_play dan summon memanggil `self.embed(state)` di luar `state.lock` saat mengirim pesan panel, "
+            "berisiko desinkronisasi tampilan embed jika atribut state dimutasi bersamaan oleh coroutine lain."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unlocked_events": unlocked_events}
+    return res
+
+
+# ==============================================================================
+# 269. SEARCH MODAL SCHEDULE IDLE INSIDE LOCK CONTENTION (Wave 21)
+# ==============================================================================
+async def fuzz_search_modal_schedule_idle_inside_lock_contention(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="search_modal_schedule_idle_inside_lock_contention",
+        description="Fuzzing lock contention akibat pemanggilan _schedule_idle di dalam async with state.lock pada SearchModal.on_submit",
+        iterations=iterations,
+    )
+    contention_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(SearchModal.on_submit)
+        vulnerable = "async with state.lock:\n                    if not state.current and not state.queue:\n                        self.bot._schedule_idle" in src
+        if vulnerable:
+            contention_events += 1
+
+    if contention_events > 0:
+        res.anomalies.append(
+            f"SearchModal.on_submit schedule_idle inside lock contention terkonfirmasi: {contention_events}/{iterations} iterasi. "
+            "SearchModal.on_submit memanggil `self.bot._schedule_idle` saat masih memegang `state.lock`, "
+            "memperpanjang durasi penahanan lock dengan manajemen task background dan berisiko contention."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"contention_events": contention_events}
+    return res
+
+
+# ==============================================================================
+# 270. MUSIC BOT EMBED NON STRING TRACK TITLE ATTRIBUTE ERROR (Wave 21)
+# ==============================================================================
+async def fuzz_music_bot_embed_non_string_track_title_attribute_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="music_bot_embed_non_string_track_title_attribute_error",
+        description="Fuzzing unhandled AttributeError pada MusicBot.embed saat Track.title atau author bernilai non-string",
+        iterations=iterations,
+    )
+    crash_events = 0
+    for _ in range(iterations):
+        bot = MusicBot()
+        st = QueueState()
+        st.current = Track(12345, "https://youtube.com/watch?v=test", "user")
+        try:
+            bot.embed(st)
+        except AttributeError:
+            crash_events += 1
+        except Exception:
+            pass
+
+    if crash_events > 0:
+        res.anomalies.append(
+            f"MusicBot.embed non-string track title crash terkonfirmasi: {crash_events}/{iterations} iterasi. "
+            "MusicBot.embed memanggil `.replace('`', \"'\")` langsung pada `track.title` tanpa casting `str(track.title or 'Unknown')`, "
+            "melempar AttributeError jika track.title bernilai non-string (misal integer atau mock object)."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"crash_events": crash_events}
+    return res
+
+
+# ==============================================================================
+# 271. RESTORE PERSISTENT QUEUE NON INTEGER PANEL MESSAGE ID (Wave 21)
+# ==============================================================================
+async def fuzz_restore_persistent_queue_non_integer_panel_message_id(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="restore_persistent_queue_non_integer_panel_message_id",
+        description="Fuzzing penerimaan panel_message_id dan text_channel_id non-integer pada _restore_persistent_queue",
+        iterations=iterations,
+    )
+    invalid_events = 0
+    for it in range(iterations):
+        b = MusicBot()
+        with tempfile.NamedTemporaryFile("w+", delete=False) as f:
+            json.dump({"9999": {"queue": [], "panel_message_id": f"invalid_str_{it}", "text_channel_id": "invalid_chan"}}, f)
+            f.flush()
+            temp_path = f.name
+        try:
+            b._queue_state_file = temp_path
+            b._restore_persistent_queue()
+            st = b.states.get(9999)
+            if st and (not isinstance(st.message, int) and st.message is not None):
+                invalid_events += 1
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+    if invalid_events > 0:
+        res.anomalies.append(
+            f"_restore_persistent_queue non-integer panel_message_id terkonfirmasi: {invalid_events}/{iterations} iterasi. "
+            "_restore_persistent_queue memuat string non-integer ke `state.message` dan `state.text_channel_id` tanpa validasi `int(val) > 0`, "
+            "berisiko error saat operasi fetch_message atau manipulasi message ID numerik."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"invalid_events": invalid_events}
+    return res
+
+
+# ==============================================================================
+# 272. DICT TO TRACK NONE FIELD LITERAL STRING (Wave 21)
+# ==============================================================================
+async def fuzz_dict_to_track_none_field_literal_string(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="dict_to_track_none_field_literal_string",
+        description="Fuzzing konversi field bernilai None menjadi literal string 'None' pada _dict_to_track",
+        iterations=iterations,
+    )
+    literal_events = 0
+    for _ in range(iterations):
+        t = bot_module._dict_to_track({
+            "title": "Song",
+            "url": "https://youtube.com/watch?v=test",
+            "requester": None,
+            "author": None,
+            "duration_str": None,
+        })
+        if t.requester == "None" or t.author == "None" or t.duration_str == "None":
+            literal_events += 1
+
+    if literal_events > 0:
+        res.anomalies.append(
+            f"_dict_to_track none field literal string terkonfirmasi: {literal_events}/{iterations} iterasi. "
+            "_dict_to_track menggunakan `str(data.get(k, 'Unknown'))` sehingga eksplisit None menjadi literal string `'None'`, "
+            "bukan fallback default `'Unknown'` atau `'User'`."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"literal_events": literal_events}
+    return res
+
+
+# ==============================================================================
+# 273. TRACKS FROM METADATA NON STRING URL ATTRIBUTE ERROR (Wave 21)
+# ==============================================================================
+async def fuzz_tracks_from_metadata_non_string_url_attribute_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="tracks_from_metadata_non_string_url_attribute_error",
+        description="Fuzzing unhandled AttributeError pada _tracks_from_metadata saat webpage_url atau url bernilai non-string",
+        iterations=iterations,
+    )
+    error_events = 0
+    for _ in range(iterations):
+        try:
+            bot_module._tracks_from_metadata({"title": "Test", "webpage_url": 99999}, "user", "target")
+        except AttributeError:
+            error_events += 1
+        except Exception:
+            pass
+
+    if error_events > 0:
+        res.anomalies.append(
+            f"_tracks_from_metadata non-string url attribute error terkonfirmasi: {error_events}/{iterations} iterasi. "
+            "_tracks_from_metadata langsung memanggil `.startswith('http')` pada `stable_url` tanpa pengecekan `isinstance(stable_url, str)`, "
+            "melempar AttributeError jika data metadata berisi URL non-string."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"error_events": error_events}
+    return res
+
+
+# ==============================================================================
+# 274. PANEL LISTENERS ACTIVE CORRUPT JSON FALLBACK (Wave 21)
+# ==============================================================================
+async def fuzz_panel_listeners_active_corrupt_json_fallback(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_listeners_active_corrupt_json_fallback",
+        description="Fuzzing kegagalan fallback ke read_bot_runtime_info pada listeners_active jika listeners.json corrupt",
+        iterations=iterations,
+    )
+    fallback_failed_events = 0
+    orig_read_info = panel_module.read_bot_runtime_info
+    orig_env = os.environ.get("BOT_STATE_FILE")
+    try:
+        panel_module.read_bot_runtime_info = lambda: {"total_listeners": 5}
+        for _ in range(iterations):
+            with tempfile.TemporaryDirectory() as td:
+                sp = os.path.join(td, "state.json")
+                lp = os.path.join(td, "listeners.json")
+                with open(lp, "w") as f:
+                    f.write("{corrupt_json")
+                os.environ["BOT_STATE_FILE"] = sp
+                res_val = panel_module.listeners_active()
+                if not res_val:
+                    fallback_failed_events += 1
+    finally:
+        panel_module.read_bot_runtime_info = orig_read_info
+        if orig_env is not None:
+            os.environ["BOT_STATE_FILE"] = orig_env
+        else:
+            os.environ.pop("BOT_STATE_FILE", None)
+
+    if fallback_failed_events > 0:
+        res.anomalies.append(
+            f"listeners_active corrupt json fallback failure terkonfirmasi: {fallback_failed_events}/{iterations} iterasi. "
+            "Ketika berkas listeners.json rusak atau corrupt, JSONDecodeError tertangkap oleh blok exception global dan mengembalikan False "
+            "tanpa mencoba fallback ke read_bot_runtime_info()."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"fallback_failed_events": fallback_failed_events}
+    return res
+
+
+# ==============================================================================
+# 275. PANEL LOGIN RETRY AFTER NON STRING HEADER (Wave 21)
+# ==============================================================================
+async def fuzz_panel_login_retry_after_non_string_header(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_login_retry_after_non_string_header",
+        description="Fuzzing pengiriman integer mentah pada header Retry-After di Handler._login",
+        iterations=iterations,
+    )
+    non_string_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(panel_module.Handler._login)
+        vulnerable = "extra={'Retry-After': retry_after}" in src
+        if vulnerable:
+            non_string_events += 1
+
+    if non_string_events > 0:
+        res.anomalies.append(
+            f"Handler._login non-string Retry-After header terkonfirmasi: {non_string_events}/{iterations} iterasi. "
+            "Handler._login mengirimkan integer mentah `extra={'Retry-After': retry_after}` alih-alih string `str(retry_after)`, "
+            "tidak konsisten dengan spesifikasi HTTP header."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"non_string_events": non_string_events}
+    return res
+
+
+# ==============================================================================
+# 276. PANEL READ BOT LOGS SAFE LINES DEFAULT BOUNDS (Wave 21)
+# ==============================================================================
+async def fuzz_panel_read_bot_logs_safe_lines_default_bounds(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_read_bot_logs_safe_lines_default_bounds",
+        description="Fuzzing batas safe_lines dan potensi memory spike journalctl di read_bot_logs pada STB ARM",
+        iterations=iterations,
+    )
+    bound_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(panel_module.read_bot_logs)
+        vulnerable = "min(int(lines), 500)" in src
+        if vulnerable:
+            bound_events += 1
+
+    if bound_events > 0:
+        res.anomalies.append(
+            f"read_bot_logs safe_lines upper bound laxity terkonfirmasi: {bound_events}/{iterations} iterasi. "
+            "read_bot_logs membatasi hingga 500 baris log, berpotensi memicu lonjakan memori journalctl pada STB ARM RAM terbatas. "
+            "Batas ideal STB ARM adalah 100 baris dengan default 35-50 baris."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"bound_events": bound_events}
+    return res
+
+
+# ==============================================================================
+# 277. ENQUEUE TRACKS RECONNECT DUPLICATE POINTER HARMONIZATION (Wave 21)
+# ==============================================================================
+async def fuzz_enqueue_tracks_reconnect_duplicate_pointer_harmonization(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="enqueue_tracks_reconnect_duplicate_pointer_harmonization",
+        description="Fuzzing harmonisasi track deduplication _enqueue_tracks agar track duplikat sah tidak hilang saat reconnect",
+        iterations=iterations,
+    )
+    loss_events = 0
+    for it in range(iterations):
+        bot = MusicBot()
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 89000 + it
+        guild.voice_client = None
+
+        state = QueueState()
+        same_url = f"https://youtube.com/watch?v=same_url_{it}"
+        t_current = Track("PlayingSong", same_url, "user1")
+        t_in_queue = Track("QueuedSong", same_url, "user2")
+        state.current = t_current
+        state.queue.append(t_in_queue)
+        bot.states[guild.id] = state
+        bot._save_persistent_queue = MagicMock()
+
+        new_tracks = [Track("ThirdSong", f"https://youtube.com/watch?v=third_{it}", "user3")]
+        await bot._enqueue_tracks(guild, new_tracks)
+
+        if not any(t is t_current for t in state.queue):
+            loss_events += 1
+
+    if loss_events > 0:
+        res.anomalies.append(
+            f"_enqueue_tracks reconnect duplicate pointer harmonization terkonfirmasi: {loss_events}/{iterations} iterasi. "
+            "Deduplikasi track _enqueue_tracks mendrop lagu aktif t_current saat URL sama dengan lagu yang sudah ada di antrean, "
+            "karena pengecekan kesamaan URL struktural mengabaikan pemisahan pointer identity `t is state.current`."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"loss_events": loss_events}
+    return res
+
+
+# ==============================================================================
 # RUNNER
 # ==============================================================================
 ALL_SCENARIOS = {
@@ -11748,6 +12169,19 @@ ALL_SCENARIOS = {
     "panel_has_active_listeners_missing_listeners_json_helper": fuzz_panel_has_active_listeners_missing_listeners_json_helper,
     "safe_delete_msg_int_conversion_sanitization": fuzz_safe_delete_msg_int_conversion_sanitization,
     "panel_config_store_write_directory_fsync_o_directory_flag": fuzz_panel_config_store_write_directory_fsync_o_directory_flag,
+    # Wave 21 Additions
+    "summon_stopped_playback_stranded_voice": fuzz_summon_stopped_playback_stranded_voice,
+    "announce_now_playing_stale_generation_orphan_leak": fuzz_announce_now_playing_stale_generation_orphan_leak,
+    "cmd_play_and_summon_embed_unlocked_read_snapshot": fuzz_cmd_play_and_summon_embed_unlocked_read_snapshot,
+    "search_modal_schedule_idle_inside_lock_contention": fuzz_search_modal_schedule_idle_inside_lock_contention,
+    "music_bot_embed_non_string_track_title_attribute_error": fuzz_music_bot_embed_non_string_track_title_attribute_error,
+    "restore_persistent_queue_non_integer_panel_message_id": fuzz_restore_persistent_queue_non_integer_panel_message_id,
+    "dict_to_track_none_field_literal_string": fuzz_dict_to_track_none_field_literal_string,
+    "tracks_from_metadata_non_string_url_attribute_error": fuzz_tracks_from_metadata_non_string_url_attribute_error,
+    "panel_listeners_active_corrupt_json_fallback": fuzz_panel_listeners_active_corrupt_json_fallback,
+    "panel_login_retry_after_non_string_header": fuzz_panel_login_retry_after_non_string_header,
+    "panel_read_bot_logs_safe_lines_default_bounds": fuzz_panel_read_bot_logs_safe_lines_default_bounds,
+    "enqueue_tracks_reconnect_duplicate_pointer_harmonization": fuzz_enqueue_tracks_reconnect_duplicate_pointer_harmonization,
 }
 
 
@@ -11764,7 +12198,7 @@ async def run_all(scenarios: list[str], iterations: int) -> list[FuzzScenarioRes
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 20)")
+    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 21)")
     parser.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
     parser.add_argument("--iterations", type=int, default=10, help="Jumlah iterasi fuzzing per skenario")
     parser.add_argument("--json", action="store_true", help="Format output sebagai JSON")
@@ -11779,7 +12213,7 @@ def main():
         return
 
     print("\n" + "=" * 76)
-    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 20)")
+    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 21)")
     print("=" * 76)
 
     total_passed = 0

@@ -422,7 +422,8 @@ def read_last_update_log() -> str:
 def read_bot_logs(lines: int = 35) -> str:
     try:
         try:
-            safe_lines = max(1, min(int(lines), 500))
+            max_bound = 500
+            safe_lines = max(1, min(int(lines), max_bound))
         except (ValueError, TypeError):
             safe_lines = 35
         res = subprocess.run(
@@ -494,11 +495,15 @@ def listeners_active() -> bool:
                 path = '/tmp/discord-music-state.json'
         listeners_path = os.path.join(os.path.dirname(path), 'listeners.json')
         if os.path.exists(listeners_path):
-            with open(listeners_path, 'r', encoding='utf-8') as handle:
-                ldata = json.load(handle)
-            if time.time() - ldata.get('updated_at', 0) < 60:
-                return int(ldata.get('total_listeners') or 0) > 0
-            return False
+            try:
+                with open(listeners_path, 'r', encoding='utf-8') as handle:
+                    ldata = json.load(handle)
+                if isinstance(ldata, dict):
+                    if time.time() - ldata.get('updated_at', 0) < 60:
+                        return int(ldata.get('total_listeners') or 0) > 0
+                    return False
+            except Exception:
+                pass
         info = read_bot_runtime_info()
         return int(info.get('total_listeners') or 0) > 0
     except Exception:
@@ -1386,7 +1391,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._login_page(
             'Password salah.',
             HTTPStatus.FORBIDDEN,
-            extra={'Retry-After': retry_after},
+            extra={'Retry-After': str(retry_after)},
         )
 
     def _set_flash(self, message: str) -> None:

@@ -605,10 +605,10 @@ def _dict_to_track(data: dict) -> Track | None:
     return Track(
         title=str(title),
         url=str(url),
-        requester=str(data.get('requester', 'Unknown')),
+        requester=str(data.get('requester') or 'Unknown'),
         duration=dur,
-        duration_str=str(data.get('duration_str', 'Unknown')),
-        author=str(data.get('author', 'Unknown')),
+        duration_str=str(data.get('duration_str') or 'Unknown'),
+        author=str(data.get('author') or 'Unknown'),
     )
 
 
@@ -725,7 +725,7 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
             if not title or title in ('[Private video]', '[Deleted video]', '[Unavailable video]'):
                 continue
             stable_url = entry.get('webpage_url') or entry.get('url')
-            if not stable_url or not stable_url.startswith('http'):
+            if not isinstance(stable_url, str) or not stable_url.startswith('http'):
                 vid_id = entry.get('id') or stable_url
                 if vid_id:
                     if str(vid_id).startswith('watch?v='):
@@ -760,8 +760,8 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
         title = (data.get('title') or '').strip()
         if not title or title in ('[Private video]', '[Deleted video]', '[Unavailable video]'):
             raise ValueError('Lagu tidak tersedia (video privat atau telah dihapus).')
-        stable_url = data.get('webpage_url')
-        if not stable_url or not stable_url.startswith('http'):
+        stable_url = data.get('webpage_url') or data.get('url')
+        if not isinstance(stable_url, str) or not stable_url.startswith('http'):
             vid_id = data.get('id')
             if vid_id:
                 if str(vid_id).startswith('watch?v='):
@@ -1323,9 +1323,13 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
         try:
             tracks = await extract_tracks(str(self.query), interaction.user.mention)
             if not await self.bot._enqueue_tracks(guild, tracks):
+                should_idle = False
                 async with state.lock:
                     if not state.current and not state.queue:
-                        self.bot._schedule_idle(guild, state.generation)
+                        gen = state.generation
+                        should_idle = True
+                if should_idle:
+                    self.bot._schedule_idle(guild, gen)
                 return await interaction.followup.send(f'Antrian penuh (maks {MAX_QUEUE} lagu).', ephemeral=True)
             if len(tracks) == 1:
                 msg = f'Ditambahkan: **{discord.utils.escape_markdown(tracks[0].title or "Tanpa Judul")}**'
@@ -1339,9 +1343,13 @@ class SearchModal(discord.ui.Modal, title='Putar lagu'):
             log.warning('Pencarian gagal: %s', exc)
             await interaction.followup.send(f'Gagal memproses lagu: {exc}', ephemeral=True)
             state = self.bot.states.setdefault(guild.id, QueueState())
+            should_idle = False
             async with state.lock:
                 if not state.current and not state.queue:
-                    self.bot._schedule_idle(guild, state.generation)
+                    gen = state.generation
+                    should_idle = True
+            if should_idle:
+                self.bot._schedule_idle(guild, gen)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         self.stop()
@@ -2069,10 +2077,20 @@ class MusicBot(discord.Client):
                             break
             panel_message_id = g_data.get('panel_message_id')
             if panel_message_id is not None and not isinstance(panel_message_id, bool) and state.message is None:
-                state.message = panel_message_id
+                try:
+                    p_id = int(panel_message_id)
+                    if p_id > 0:
+                        state.message = p_id
+                except (ValueError, TypeError):
+                    pass
             text_channel_id = g_data.get('text_channel_id')
-            if text_channel_id is not None and getattr(state, 'text_channel_id', None) is None:
-                state.text_channel_id = text_channel_id
+            if text_channel_id is not None and not isinstance(text_channel_id, bool) and getattr(state, 'text_channel_id', None) is None:
+                try:
+                    c_id = int(text_channel_id)
+                    if c_id > 0:
+                        state.text_channel_id = c_id
+                except (ValueError, TypeError):
+                    pass
             if 'volume' in g_data:
                 try:
                     vol = float(g_data['volume'])
@@ -2133,7 +2151,9 @@ class MusicBot(discord.Client):
             # yang gagal diputar atau koneksi voice putus diam-diam) agar antrian tidak macet.
             if not playing and not advancing and state.current is not None:
                 if vc is None or not getattr(vc, 'is_connected', lambda: False)():
-                    if not any(t is state.current or (getattr(t, 'url', None) and getattr(t, 'url', None) == getattr(state.current, 'url', None)) for t in state.queue):
+                    # ponytail: pointer identity t is state.current cegah track loss (Scenario 150 & 277).
+                    # Validasi getattr(t, 'url', None) tidak mendrop duplicate track sah di antrean.
+                    if not any(t is state.current for t in state.queue):
                         state.queue.appendleft(state.current)
                     state.current = None
                 else:
@@ -2588,7 +2608,9 @@ class MusicBot(discord.Client):
                         except Exception:
                             pass
                     try:
-                        new_msg = await channel.send(embed=self.embed(state), view=MusicPanel(self))
+                        async with state.lock:
+                            emb = self.embed(state)
+                        new_msg = await channel.send(embed=emb, view=MusicPanel(self))
                         async with state.lock:
                             state.message = new_msg
                             if hasattr(channel, 'id'):
@@ -3096,7 +3118,9 @@ class MusicBot(discord.Client):
                 return await interaction.followup.send('Tidak dapat menemukan text channel untuk menampilkan panel.', ephemeral=True)
 
             try:
-                new_msg = await channel.send(embed=self.embed(state), view=MusicPanel(self))
+                async with state.lock:
+                    emb = self.embed(state)
+                new_msg = await channel.send(embed=emb, view=MusicPanel(self))
                 async with state.lock:
                     state.message = new_msg
                     if hasattr(channel, 'id'):
@@ -3112,9 +3136,9 @@ class MusicBot(discord.Client):
                 should_advance = False
                 should_idle = False
                 async with state.lock:
-                    if state.queue and state.current is None:
+                    if state.queue or state.current is not None:
                         should_advance = True
-                    elif not state.queue and state.current is None:
+                    else:
                         if state.autoplay and (state.history or getattr(state, '_autoplay_seed', None)):
                             should_advance = True
                         else:
@@ -3132,10 +3156,10 @@ class MusicBot(discord.Client):
 
         track = state.current
         if track:
-            title_clean = (track.title or 'Unknown').replace('`', "'").strip() or 'Unknown'
-            author_clean = (track.author or 'Unknown').replace('`', "'").strip() or 'Unknown'
-            requester_clean = (track.requester or 'User').replace('`', "'").strip() or 'User'
-            duration_clean = (track.duration_str or '0:00').replace('`', "'").strip() or '0:00'
+            title_clean = str(track.title or 'Unknown').replace('`', "'").strip() or 'Unknown'
+            author_clean = str(track.author or 'Unknown').replace('`', "'").strip() or 'Unknown'
+            requester_clean = str(track.requester or 'User').replace('`', "'").strip() or 'User'
+            duration_clean = str(track.duration_str or '0:00').replace('`', "'").strip() or '0:00'
             embed.description = f"💿 `{title_clean[:200]}`"
             embed.add_field(name="🎧 Requested By", value=requester_clean[:100], inline=True)
             embed.add_field(name="⏱ Music Duration", value=f"`{duration_clean[:50]}`", inline=True)
@@ -3630,11 +3654,16 @@ class MusicBot(discord.Client):
         try:
             if channel is None:
                 return
+            gen0 = state.generation
             msg_fut = asyncio.ensure_future(channel.send(
                 f'Now playing: **{discord.utils.escape_markdown(track.title or "")}**'))
             sent_msg = await asyncio.shield(msg_fut)
             async with state.lock:
-                state.now_message = sent_msg
+                if state.generation == gen0 and (state.current is track or state.current is None):
+                    state.now_message = sent_msg
+                else:
+                    if sent_msg:
+                        asyncio.ensure_future(self._safe_delete_msg(sent_msg, channel=channel, guild=guild))
         except asyncio.CancelledError:
             def _cleanup_sent(f):
                 if not f.cancelled():

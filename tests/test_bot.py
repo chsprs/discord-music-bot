@@ -6046,7 +6046,7 @@ class Wave20RemediationTests(unittest.TestCase):
         asyncio.run(bot.on_guild_remove(fake_guild))
 
     def test_wave20_enqueue_tracks_structural_equality(self):
-        """Wave 20: _enqueue_tracks mendeduplikasi state.current berdasarkan URL saat voice client terputus."""
+        """Wave 20/21: _enqueue_tracks harmonisasi pointer identity untuk melestarikan track duplikat sah (Wave 21)."""
         from bot import MusicBot, Track, QueueState
         bot = MusicBot()
         guild = MagicMock(id=999, voice_client=None)
@@ -6059,6 +6059,93 @@ class Wave20RemediationTests(unittest.TestCase):
         new_track = Track(title="Song B", url="https://youtube.com/watch?v=new2", requester="u")
         asyncio.run(bot._enqueue_tracks(guild, [new_track]))
         self.assertIsNone(state.current)
-        # t1 should not be prepended as a duplicate since t2 with identical url is already in queue
-        self.assertEqual(len([t for t in state.queue if t.url == "https://youtube.com/watch?v=dup1"]), 1)
+        # Harmonized Wave 21: t1 dilestarikan via pointer identity t is state.current (Scenario 150 & 277)
+        self.assertEqual(len([t for t in state.queue if t.url == "https://youtube.com/watch?v=dup1"]), 2)
+        self.assertTrue(any(t is t1 for t in state.queue))
+
+    def test_wave21_dict_to_track_none_fields(self):
+        """Wave 21: _dict_to_track fallback default saat field requester/author bernilai None."""
+        from bot import _dict_to_track
+        t = _dict_to_track({
+            "title": "Song",
+            "url": "https://youtube.com/watch?v=test",
+            "requester": None,
+            "author": None,
+            "duration_str": None,
+        })
+        self.assertIsNotNone(t)
+        self.assertEqual(t.requester, "Unknown")
+        self.assertEqual(t.author, "Unknown")
+        self.assertEqual(t.duration_str, "Unknown")
+
+    def test_wave21_tracks_from_metadata_non_string_url(self):
+        """Wave 21: _tracks_from_metadata aman saat url bernilai non-string."""
+        from bot import _tracks_from_metadata
+        tracks = _tracks_from_metadata({"title": "Test", "webpage_url": 99999, "id": "watch?v=xyz123"}, "user", "target")
+        self.assertEqual(len(tracks), 1)
+        self.assertIn("xyz123", tracks[0].url)
+
+    def test_wave21_restore_persistent_queue_invalid_msg_id(self):
+        """Wave 21: _restore_persistent_queue abaikan panel_message_id non-integer."""
+        from bot import MusicBot
+        b = MusicBot()
+        with tempfile.NamedTemporaryFile("w+", delete=False) as f:
+            json.dump({"9999": {"queue": [], "panel_message_id": "invalid_msg", "text_channel_id": "invalid_ch"}}, f)
+            f.flush()
+            temp_path = f.name
+        try:
+            b._queue_state_file = temp_path
+            b._restore_persistent_queue()
+            st = b.states.get(9999)
+            self.assertIsNotNone(st)
+            self.assertIsNone(st.message)
+            self.assertIsNone(st.text_channel_id)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_wave21_embed_non_string_track_title(self):
+        """Wave 21: MusicBot.embed tidak crash saat track.title bernilai non-string."""
+        from bot import MusicBot, Track, QueueState
+        b = MusicBot()
+        st = QueueState()
+        st.current = Track(12345, "https://youtube.com/watch?v=test", "user")
+        emb = b.embed(st)
+        self.assertIn("12345", emb.description)
+
+    def test_wave21_panel_listeners_active_corrupt_json(self):
+        """Wave 21: listeners_active fallback ke runtime info saat listeners.json corrupt."""
+        import panel as p
+        orig_read_info = p.read_bot_runtime_info
+        orig_env = os.environ.get("BOT_STATE_FILE")
+        try:
+            p.read_bot_runtime_info = lambda: {"total_listeners": 5}
+            with tempfile.TemporaryDirectory() as td:
+                sp = os.path.join(td, "state.json")
+                lp = os.path.join(td, "listeners.json")
+                with open(lp, "w") as f:
+                    f.write("{corrupt_json")
+                os.environ["BOT_STATE_FILE"] = sp
+                self.assertTrue(p.listeners_active())
+        finally:
+            p.read_bot_runtime_info = orig_read_info
+            if orig_env is not None:
+                os.environ["BOT_STATE_FILE"] = orig_env
+            else:
+                os.environ.pop("BOT_STATE_FILE", None)
+
+    def test_wave21_panel_login_retry_after_str_header(self):
+        """Wave 21: Handler._login mengirim header Retry-After bertipe string."""
+        import panel as p
+        h = p.Handler.__new__(p.Handler)
+        h.client_address = ("127.0.0.1", 12345)
+        h._login_page = MagicMock()
+        with patch.object(p, "PASSWORD", "correct_pass"), \
+             patch("panel.reserve_login_attempt", return_value=(True, 3)):
+            h._login({"password": "wrong_pass"})
+            self.assertTrue(h._login_page.called)
+            extra = h._login_page.call_args[1].get("extra", {})
+            self.assertIsInstance(extra.get("Retry-After"), str)
+            self.assertEqual(extra.get("Retry-After"), "3")
+
 
