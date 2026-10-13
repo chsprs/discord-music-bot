@@ -28,65 +28,67 @@ CONFIG_PATH = os.environ.get('BOT_CONFIG', '/opt/discord-music-bot/.env')
 UPDATE_LOG_PATH = os.environ.get('UPDATE_LOG', '/opt/discord-music-bot/last_update.log')
 PANEL_ENV_PATH = os.environ.get('PANEL_ENV', '/opt/discord-music-panel.env')
 PASSWORD = os.environ.get('PANEL_PASSWORD', '')
+_password_lock = threading.Lock()
 
 
 def update_panel_password(new_password: str, env_path: Optional[str] = None) -> None:
     """Perbarui PANEL_PASSWORD di berkas panel.env dan variabel global PASSWORD."""
     global PASSWORD
-    if '\n' in new_password or '\r' in new_password:
-        raise ValueError('Password tidak boleh mengandung baris baru.')
-    target_path = env_path or os.environ.get('PANEL_ENV', PANEL_ENV_PATH)
-    lines: list[str] = []
-    found = False
-    if os.path.exists(target_path):
+    with _password_lock:
+        if '\n' in new_password or '\r' in new_password:
+            raise ValueError('Password tidak boleh mengandung baris baru.')
+        target_path = env_path or os.environ.get('PANEL_ENV', PANEL_ENV_PATH)
+        lines: list[str] = []
+        found = False
+        if os.path.exists(target_path):
+            try:
+                with open(target_path, 'r', encoding='utf-8') as handle:
+                    for line in handle:
+                        stripped = line.rstrip('\r\n')
+                        if stripped.strip().startswith('PANEL_PASSWORD='):
+                            lines.append(f'PANEL_PASSWORD={new_password}')
+                            found = True
+                        else:
+                            lines.append(stripped)
+            except Exception:
+                pass
+        if not found:
+            lines.append(f'PANEL_PASSWORD={new_password}')
+        body = '\n'.join(lines).strip() + '\n'
+
+        directory = os.path.dirname(target_path) or '.'
+        os.makedirs(directory, exist_ok=True)
+        tmp_path = None
+        closed = False
         try:
-            with open(target_path, 'r', encoding='utf-8') as handle:
-                for line in handle:
-                    stripped = line.rstrip('\r\n')
-                    if stripped.strip().startswith('PANEL_PASSWORD='):
-                        lines.append(f'PANEL_PASSWORD={new_password}')
-                        found = True
-                    else:
-                        lines.append(stripped)
-        except Exception:
-            pass
-    if not found:
-        lines.append(f'PANEL_PASSWORD={new_password}')
-    body = '\n'.join(lines).strip() + '\n'
+            fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.panel.env.', suffix='.tmp')
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                closed = True
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, target_path)
+        except OSError:
+            if not closed and 'fd' in locals():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            # Fallback jika direktori induk read-only (ProtectSystem=strict): tulis in-place
+            with open(target_path, 'w', encoding='utf-8') as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
 
-    directory = os.path.dirname(target_path) or '.'
-    os.makedirs(directory, exist_ok=True)
-    tmp_path = None
-    closed = False
-    try:
-        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.panel.env.', suffix='.tmp')
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-            closed = True
-            handle.write(body)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, target_path)
-    except OSError:
-        if not closed and 'fd' in locals():
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        # Fallback jika direktori induk read-only (ProtectSystem=strict): tulis in-place
-        with open(target_path, 'w', encoding='utf-8') as handle:
-            handle.write(body)
-            handle.flush()
-            os.fsync(handle.fileno())
-
-    PASSWORD = new_password
-    with _lock:
-        _sessions.clear()
+        PASSWORD = new_password
+        with _lock:
+            _sessions.clear()
 COOKIE = 'music_session'
 STORE = None
 UPDATE_RUNNER: Optional[Callable[[], tuple[bool, str]]] = None
@@ -126,10 +128,11 @@ class ConfigStore:
 
     MANAGED = ('DISCORD_TOKEN', 'DISCORD_GUILD_ID')
     HEADER = '# Dikelola panel musik. Jangan commit berkas ini.'
+    _write_lock = threading.Lock()
 
     def __init__(self, path: str):
         self.path = path
-        self._lock = threading.Lock()
+        self._lock = self._write_lock
 
     @staticmethod
     def _key_of(body: str) -> str:
@@ -289,7 +292,10 @@ def _revoke_session(token: str) -> None:
 
 
 def store() -> ConfigStore:
-    return STORE if STORE is not None else ConfigStore(CONFIG_PATH)
+    global STORE
+    if STORE is None:
+        STORE = ConfigStore(CONFIG_PATH)
+    return STORE
 
 
 _systemctl_lock = threading.Lock()
@@ -578,6 +584,8 @@ def read_bot_runtime_info() -> dict:
     try:
         if mtime is not None:
             if os.path.getsize(path) > 1048576:
+                with _runtime_info_lock:
+                    _runtime_info_cache = (path, mtime, now, default_info)
                 return default_info
             with open(path, 'r', encoding='utf-8') as handle:
                 data = json.load(handle)
@@ -586,8 +594,13 @@ def read_bot_runtime_info() -> dict:
                 with _runtime_info_lock:
                     _runtime_info_cache = (path, mtime, now, data)
                 return data
+            else:
+                with _runtime_info_lock:
+                    _runtime_info_cache = (path, mtime, now, default_info)
+                return default_info
     except Exception:
-        pass
+        with _runtime_info_lock:
+            _runtime_info_cache = (path, mtime, now, default_info)
     return default_info
 
 
@@ -1445,15 +1458,18 @@ def build_server(host: str, port: int) -> Server:
     return Server((host, port), Handler)
 
 
+LOCAL_ADDR_TTL = 60.0
 _local_addr_cache: set[str] | None = None
+_local_addr_cache_ts: float = 0.0
 _local_addr_lock = threading.Lock()
 
 
 def _local_addresses() -> set[str]:
     """Semua alamat IP lokal yang mungkin dipakai klien untuk menjangkau panel."""
-    global _local_addr_cache
+    global _local_addr_cache, _local_addr_cache_ts
     with _local_addr_lock:
-        if _local_addr_cache is not None:
+        now = time.monotonic()
+        if _local_addr_cache is not None and (now - _local_addr_cache_ts) < LOCAL_ADDR_TTL:
             return _local_addr_cache
         import socket
         found: set[str] = set()
@@ -1482,6 +1498,7 @@ def _local_addresses() -> set[str]:
             pass
 
         _local_addr_cache = {a for a in found if a}
+        _local_addr_cache_ts = now
         return _local_addr_cache
 
 

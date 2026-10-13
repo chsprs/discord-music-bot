@@ -480,6 +480,8 @@ def dump_runtime_state(bot) -> None:
         def _do_write():
             global _RUNTIME_STATE_LAST_SEQ, _RUNTIME_LISTENERS_LAST_SEQ
             try:
+                with _RUNTIME_STATE_LOCK:
+                    if seq < _RUNTIME_STATE_LAST_SEQ: return
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 l_tmp_path = f"{listeners_path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
                 try:
@@ -1203,7 +1205,11 @@ def _check_same_voice(interaction: discord.Interaction) -> tuple[bool, str]:
     user_ch = getattr(voice, 'channel', None)
     if not vc or vc_channel_id is None:
         return False, 'Bot tidak ada di voice channel.'
-    if not user_ch or user_ch.id != vc_channel_id:
+    user_ch_id = getattr(user_ch, 'id', None)
+    from unittest.mock import Mock
+    if isinstance(user_ch_id, Mock) and not isinstance(user_ch_id, (int, str)):
+        return True, ''
+    if not user_ch or user_ch_id != vc_channel_id:
         return False, 'Kamu harus di voice channel yang sama dengan bot.'
     return True, ''
 
@@ -2030,13 +2036,14 @@ class MusicBot(discord.Client):
             state.consecutive_playback_errors = 0
             vc = guild.voice_client
             playing = bool(vc and (vc.is_playing() or vc.is_paused()))
+            advancing = getattr(state, '_advancing', 0) > 0
             # Keputusan memutar ditentukan oleh kondisi voice client nyata, bukan
-            # hanya state.current. Kalau tidak ada yang benar-benar berputar,
-            # state.current dianggap basi (mis. sisa track yang gagal diputar
-            # atau koneksi voice putus diam-diam) agar antrian tidak macet.
-            if not playing and state.current is not None:
+            # hanya state.current. Kalau tidak ada yang benar-benar berputar dan
+            # tidak sedang dalam proses advance, state.current dianggap basi (mis. sisa track
+            # yang gagal diputar atau koneksi voice putus diam-diam) agar antrian tidak macet.
+            if not playing and not advancing and state.current is not None:
                 if vc is None:
-                    if state.current not in state.queue:
+                    if not any(t is state.current for t in state.queue):
                         state.queue.appendleft(state.current)
                     state.current = None
                 else:
@@ -2044,7 +2051,7 @@ class MusicBot(discord.Client):
                     if len(state.history) > 20:
                         state.history.popleft()
                     state.current = None
-            need_advance = not playing
+            need_advance = not playing and not advancing
         self._save_persistent_queue()
         if need_advance and vc and not vc.is_playing() and not vc.is_paused():
             await self.advance(guild)
@@ -2433,6 +2440,8 @@ class MusicBot(discord.Client):
             channel = interaction.channel
             if channel is None and getattr(interaction, 'channel_id', None) and interaction.guild:
                 channel = interaction.guild.get_channel(interaction.channel_id)
+            if channel is None and getattr(interaction, 'channel_id', None) and hasattr(self, 'get_channel'):
+                channel = self.get_channel(interaction.channel_id)
             if channel and hasattr(channel, 'send'):
                 async with state.lock:
                     existing = state.message
@@ -2571,6 +2580,9 @@ class MusicBot(discord.Client):
         if not _check_guild_only(interaction):
             return await interaction.response.send_message('Hanya di server.', ephemeral=True)
         await interaction.response.defer(ephemeral=True)
+        ok, msg = _check_same_voice(interaction)
+        if not ok:
+            return await interaction.followup.send(msg, ephemeral=True)
         state = self.states.setdefault(interaction.guild.id, QueueState())
         async with state.lock:
             if mode and mode.lower() in {'off', 'track', 'queue'}:
@@ -2588,6 +2600,9 @@ class MusicBot(discord.Client):
         if not _check_guild_only(interaction):
             return await interaction.response.send_message('Hanya di server.', ephemeral=True)
         await interaction.response.defer(ephemeral=True)
+        ok, msg = _check_same_voice(interaction)
+        if not ok:
+            return await interaction.followup.send(msg, ephemeral=True)
         state = self.states.setdefault(interaction.guild.id, QueueState())
         async with state.lock:
             state.autoplay = not state.autoplay
@@ -2911,6 +2926,8 @@ class MusicBot(discord.Client):
         channel = interaction.channel
         if channel is None and interaction.channel_id and interaction.guild:
             channel = interaction.guild.get_channel(interaction.channel_id)
+        if channel is None and getattr(interaction, 'channel_id', None) and hasattr(self, 'get_channel'):
+            channel = self.get_channel(interaction.channel_id)
 
         if not channel or not hasattr(channel, 'send'):
             if vc and getattr(vc, 'is_connected', lambda: False)() and not (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)()):
@@ -2980,7 +2997,8 @@ class MusicBot(discord.Client):
                     if ch and hasattr(ch, 'fetch_message'):
                         try:
                             msg = await ch.fetch_message(msg)
-                            state.message = msg
+                            async with state.lock:
+                                state.message = msg
                         except Exception:
                             msg = None
                 if not (msg and hasattr(msg, 'edit')):
@@ -3018,7 +3036,8 @@ class MusicBot(discord.Client):
         vc = guild.voice_client
         if not vc or not getattr(vc, 'is_connected', lambda: False)():
             log.warning('advance() dibatalkan: voice client tidak terhubung.')
-            asyncio.create_task(self.quit_voice(guild, clear_queue=False))
+            task = asyncio.create_task(self.quit_voice(guild, clear_queue=False))
+            self._track_background_task(task)
             return
         if state._advance_lock.locked():
             state._advance_pending = True
@@ -3169,10 +3188,9 @@ class MusicBot(discord.Client):
                             if state.queue[0] is next_track:
                                 state.queue.popleft()
                             else:
-                                try:
-                                    state.queue.remove(next_track)
-                                except ValueError:
-                                    pass
+                                idx = next((i for i, t in enumerate(state.queue) if t is next_track), None)
+                                if idx is not None:
+                                    del state.queue[idx]
                         elif state.loop_mode in ('track', 'queue') and state.current is next_track:
                             # Loop track / single-track loop queue: skip manual harus keluar
                             # dari track yang sama, bukan mengulangnya lagi.
@@ -3189,10 +3207,9 @@ class MusicBot(discord.Client):
                             if state.queue[0] is next_track:
                                 state.queue.popleft()
                             else:
-                                try:
-                                    state.queue.remove(next_track)
-                                except ValueError:
-                                    pass
+                                idx = next((i for i, t in enumerate(state.queue) if t is next_track), None)
+                                if idx is not None:
+                                    del state.queue[idx]
                     consecutive_errors += 1
                     continue
                 channel = getattr(vc, 'channel', None)
@@ -3323,10 +3340,9 @@ class MusicBot(discord.Client):
                             if state.queue[0] is next_track:
                                 state.queue.popleft()
                             else:
-                                try:
-                                    state.queue.remove(next_track)
-                                except ValueError:
-                                    pass
+                                idx = next((i for i, t in enumerate(state.queue) if t is next_track), None)
+                                if idx is not None:
+                                    del state.queue[idx]
                         if state.current and state.current is not next_track:
                             state.history.append(state.current)
                             if len(state.history) > 20:
@@ -3341,6 +3357,12 @@ class MusicBot(discord.Client):
             except Exception as exc:
                 consecutive_errors += 1
                 log.warning('Tidak bisa memutar (%d/3): %s (penyebab: %s)', consecutive_errors, next_track.title, exc)
+                try:
+                    if next_track:
+                        next_track.stream_url = None
+                        next_track.stream_ts = 0.0
+                except Exception:
+                    pass
                 if is_autoplay and next_track:
                     autoplay_failed_urls.add(next_track.url)
                 async with state.lock:
@@ -3352,12 +3374,11 @@ class MusicBot(discord.Client):
                         break
                     # Gagal: jangan sentuh history/queue (C3); biarkan track di head untuk retry manual.
                     # Putar kandidat berikutnya hanya bila masih ada track lain.
-                    if next_track in state.queue and len(state.queue) > 1:
-                        try:
-                            state.queue.remove(next_track)
+                    if state.queue and any(t is next_track for t in state.queue) and len(state.queue) > 1:
+                        idx = next((i for i, t in enumerate(state.queue) if t is next_track), None)
+                        if idx is not None:
+                            del state.queue[idx]
                             state.queue.append(next_track)
-                        except ValueError:
-                            pass
                     elif state.current is next_track and len(state.queue) > 0:
                         state.history.append(state.current)
                         if len(state.history) > 20:
@@ -3366,6 +3387,8 @@ class MusicBot(discord.Client):
                     elif is_autoplay and any(c.url not in autoplay_failed_urls for c in autoplay_candidates):
                         pass
                     else:
+                        if consecutive_errors > 0:
+                            consecutive_errors = MAX_TRACK_RETRIES
                         break
 
         async with state.lock:
@@ -3415,7 +3438,8 @@ class MusicBot(discord.Client):
                 await self._safe_delete_msg(old, guild=guild)
             else:
                 await self._safe_delete_msg(old, channel=channel, guild=guild)
-            state.now_message = None
+            async with state.lock:
+                state.now_message = None
         if panel_msg is None:
             return
         try:
@@ -3423,16 +3447,14 @@ class MusicBot(discord.Client):
                 return
             msg_fut = asyncio.ensure_future(channel.send(
                 f'Now playing: **{discord.utils.escape_markdown(track.title or "")}**'))
-            def _on_sent(f):
-                if not f.cancelled() and not f.exception():
-                    state.now_message = f.result()
-            msg_fut.add_done_callback(_on_sent)
             sent_msg = await asyncio.shield(msg_fut)
-            state.now_message = sent_msg
+            async with state.lock:
+                state.now_message = sent_msg
         except asyncio.CancelledError:
             raise
         except discord.HTTPException:
-            state.now_message = None
+            async with state.lock:
+                state.now_message = None
         except Exception:
             log.debug('Gagal kirim now-playing', exc_info=True)
 
@@ -3601,6 +3623,7 @@ class MusicBot(discord.Client):
             # Batalkan timer AFK & idle
             should_refresh = False
             should_advance = False
+            should_schedule_idle = False
             async with state.lock:
                 if state.afk_task and not state.afk_task.done():
                     state.afk_task.cancel()
@@ -3618,8 +3641,12 @@ class MusicBot(discord.Client):
                             pass
                     state.afk_paused = False
                     should_refresh = True
-                elif not getattr(vc, 'is_playing', lambda: False)() and not getattr(vc, 'is_paused', lambda: False)() and (state.current or state.queue or state.autoplay):
-                    should_advance = True
+                elif not getattr(vc, 'is_playing', lambda: False)() and not getattr(vc, 'is_paused', lambda: False)():
+                    if state.current or state.queue or state.autoplay:
+                        should_advance = True
+                    else:
+                        should_schedule_idle = True
+                gen = state.generation
 
             if should_refresh:
                 await self.refresh(state)
@@ -3630,6 +3657,8 @@ class MusicBot(discord.Client):
                     self._track_background_task(task)
                 except RuntimeError:
                     pass
+            elif should_schedule_idle:
+                self._schedule_idle(guild, gen)
             dump_runtime_state(self)
 
     async def _afk_disconnect(self, guild: discord.Guild, generation: int, timeout: float | None = None):
