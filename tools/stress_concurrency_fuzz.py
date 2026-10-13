@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 17).
+"""Stress Testing & Concurrency Fuzzing Script for Discord Music Bot (Wave 18).
 
 Skenario Simulasi & Verifikasi:
 1. Burst skips & _advance_lock race condition (Wave 3)
@@ -196,6 +196,29 @@ Skenario Simulasi & Verifikasi:
 192. Wasteful dump_runtime_state disk I/O in on_voice_state_update when bot is not in voice (Wave 17)
 193. Cross-Site Logout CSRF vulnerability on GET/POST /logout without origin or nonce validation (Wave 17)
 194. Unhandled TypeError / AttributeError in format_guilds_html when guilds elements are not dicts (Wave 17)
+195. close() missing self._stopping = True initialization on shutdown (Wave 18)
+196. close() missing state.generation += 1 and self._background_tasks cancellation leak (Wave 18)
+197. _after_dispatch sleep shutdown race without self._stopping / is_closed() check (Wave 18)
+198. cmd_play/summon wrong channel deletion on integer panel message ID (Wave 18)
+199. _safe_delete_msg channel parameter priority inversion over msg.channel (Wave 18)
+200. quit_voice cold cache resolution leak and single channel resolution (Wave 18)
+201. refresh() unlocked state.message = None mutation race on exception (Wave 18)
+202. _delete_all_panels unlocked state.message and now_message mutation (Wave 18)
+203. cmd_shuffle unlocked queue len check without lock revalidation (Wave 18)
+204. cmd_skip missing _schedule_idle when queue is empty and audio stopped (Wave 18)
+205. cmd_loop unvalidated mode fallback automatically triggering cycle toggle (Wave 18)
+206. is_connected fallback lambda: True flaw in cmd_play, stop, quit, modal (Wave 18)
+207. SearchModal direct vc.channel = None mutation corrupting VoiceClient (Wave 18)
+208. _state_exporter_loop missing self._stopping check during shutdown (Wave 18)
+209. on_guild_remove redundant dump_runtime_state eMMC flash write cycle waste (Wave 18)
+210. source_for volume NaN/Inf sanitization omission producing distorted stream (Wave 18)
+211. _restore_persistent_queue infinite volume flaw due to not (vol != vol) (Wave 18)
+212. _restore_persistent_queue boolean panel_message_id restore flaw (Wave 18)
+213. update_panel_password fallback in-place write missing os.chmod 0600 (Wave 18)
+214. read_last_update_log & _run_update_inner unhandled UnicodeDecodeError risk (Wave 18)
+215. panel external bot invite target="_blank" reverse tabnabbing vulnerability (Wave 18)
+216. _local_addresses internal cache set mutation leak without set() copy (Wave 18)
+217. ConfigStore.write unhandled AttributeError on non-dict argument values (Wave 18)
 
 Usage:
     ./venv/bin/python tools/stress_concurrency_fuzz.py
@@ -9195,6 +9218,707 @@ async def fuzz_panel_format_guilds_html_malformed_type_error(iterations: int = 5
 
 
 # ==============================================================================
+# 195. CLOSE MISSING STOPPING FLAG (Wave 18)
+# ==============================================================================
+async def fuzz_close_missing_stopping_flag(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="close_missing_stopping_flag",
+        description="Fuzzing ketiadaan inisialisasi self._stopping = True di awal bot.close() yang membiarkan task latar belakang aktif",
+        iterations=iterations,
+    )
+    stopping_missing_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.close)
+        first_lines = src[:300]
+        vulnerable = "self._stopping = True" not in first_lines
+        if vulnerable:
+            stopping_missing_events += 1
+
+    if stopping_missing_events > 0:
+        res.anomalies.append(
+            f"bot.close() missing self._stopping flag terkonfirmasi: {stopping_missing_events}/{iterations} iterasi. "
+            "self._stopping = True hanya disetel pada _handle_signal, sehingga pemanggilan bot.close() langsung "
+            "(misal saat shutdown internal atau exception) tidak menandai bot sedang berhenti dan membiarkan "
+            "dump_runtime_state menulis ulang state.json pasca dump_runtime_state_offline."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"stopping_missing_events": stopping_missing_events}
+    return res
+
+
+# ==============================================================================
+# 196. CLOSE GENERATION BUMP AND BACKGROUND TASKS LEAK (Wave 18)
+# ==============================================================================
+async def fuzz_close_generation_bump_and_background_tasks_leak(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="close_generation_bump_and_background_tasks_leak",
+        description="Fuzzing ketiadaan bump state.generation dan pembatalan self._background_tasks pada bot.close()",
+        iterations=iterations,
+    )
+    leak_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.close)
+        vulnerable = "state.generation += 1" not in src or "self._background_tasks" not in src
+        if vulnerable:
+            leak_events += 1
+
+    if leak_events > 0:
+        res.anomalies.append(
+            f"bot.close() generation bump and background task leak terkonfirmasi: {leak_events}/{iterations} iterasi. "
+            "close() tidak menaikkan state.generation (state.generation += 1) untuk membatalkan callback usang, "
+            "dan tidak membatalkan tasks di self._background_tasks, memicu advance pasca shutdown."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"leak_events": leak_events}
+    return res
+
+
+# ==============================================================================
+# 197. AFTER DISPATCH SLEEP SHUTDOWN RACE (Wave 18)
+# ==============================================================================
+async def fuzz_after_dispatch_sleep_shutdown_race(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="after_dispatch_sleep_shutdown_race",
+        description="Fuzzing race condition pada _after_dispatch pasca asyncio.sleep(1.0) saat bot sedang shutdown",
+        iterations=iterations,
+    )
+    race_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._advance_loop)
+        part = src.partition("await asyncio.sleep(1.0)")
+        sub = part[2][:300]
+        vulnerable = "self._stopping" not in sub and "is_closed" not in sub
+        if vulnerable:
+            race_events += 1
+
+    if race_events > 0:
+        res.anomalies.append(
+            f"_after_dispatch sleep shutdown race terkonfirmasi: {race_events}/{iterations} iterasi. "
+            "Setelah jeda 1 detik pasca playback error, _after_dispatch tidak memeriksa self._stopping / self.is_closed(), "
+            "memicu finished() dan advance() pada bot yang sedang tutup."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"race_events": race_events}
+    return res
+
+
+# ==============================================================================
+# 198. CMD PLAY SUMMON OLD PANEL CHANNEL MISMATCH (Wave 18)
+# ==============================================================================
+async def fuzz_cmd_play_summon_old_panel_channel_mismatch(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_play_summon_old_panel_channel_mismatch",
+        description="Fuzzing pemaksaan channel baru pada penghapusan panel lama integer ID di cmd_play dan summon",
+        iterations=iterations,
+    )
+    mismatch_events = 0
+    for _ in range(iterations):
+        src_play = inspect.getsource(MusicBot.cmd_play)
+        src_summon = inspect.getsource(MusicBot.summon)
+        vulnerable_play = "await self._safe_delete_msg(existing, channel=channel" in src_play
+        vulnerable_summon = "await self._safe_delete_msg(old_msg, channel=channel" in src_summon
+        if vulnerable_play or vulnerable_summon:
+            mismatch_events += 1
+
+    if mismatch_events > 0:
+        res.anomalies.append(
+            f"cmd_play/summon wrong channel deletion terkonfirmasi: {mismatch_events}/{iterations} iterasi. "
+            "Penghapusan panel lama pada cmd_play & summon memaksakan channel baru (channel=channel) untuk pesan "
+            "integer ID, menghasilkan Discord 404 Unknown Message dan meninggalkan panel lama di channel sebelumnya."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"mismatch_events": mismatch_events}
+    return res
+
+
+# ==============================================================================
+# 199. SAFE DELETE MSG PARAM CHANNEL PRIORITY INVERSION (Wave 18)
+# ==============================================================================
+async def fuzz_safe_delete_msg_param_channel_priority_inversion(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="safe_delete_msg_param_channel_priority_inversion",
+        description="Fuzzing inversi prioritas parameter channel dibanding channel asli pesan pada _safe_delete_msg",
+        iterations=iterations,
+    )
+    inversion_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._safe_delete_msg)
+        vulnerable = "target_channel = channel or getattr(msg, 'channel', None)" in src
+        if vulnerable:
+            inversion_events += 1
+
+    if inversion_events > 0:
+        res.anomalies.append(
+            f"_safe_delete_msg channel priority inversion terkonfirmasi: {inversion_events}/{iterations} iterasi. "
+            "_safe_delete_msg memprioritaskan parameter channel dibanding channel asli pesan (getattr(msg, 'channel', None)), "
+            "berisiko salah target channel penghapusan."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"inversion_events": inversion_events}
+    return res
+
+
+# ==============================================================================
+# 200. QUIT VOICE COLD CACHE CHANNEL RESOLUTION (Wave 18)
+# ==============================================================================
+async def fuzz_quit_voice_cold_cache_channel_resolution(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="quit_voice_cold_cache_channel_resolution",
+        description="Fuzzing ketiadaan fallback self.get_channel pada quit_voice dan resolusi channel ganda old_now_message",
+        iterations=iterations,
+    )
+    cold_cache_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.quit_voice)
+        part = src.partition("ch = getattr(old_message, 'channel', None)")
+        sub = part[2].partition("await self._safe_delete_msg(old_now_message")[0]
+        vulnerable = "self.get_channel" not in sub
+        if vulnerable:
+            cold_cache_events += 1
+
+    if cold_cache_events > 0:
+        res.anomalies.append(
+            f"quit_voice cold cache resolution leak terkonfirmasi: {cold_cache_events}/{iterations} iterasi. "
+            "quit_voice tidak memiliki fallback self.get_channel(state.text_channel_id) saat cache guild dingin, "
+            "dan menyamakan channel old_now_message dengan old_message."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"cold_cache_events": cold_cache_events}
+    return res
+
+
+# ==============================================================================
+# 201. REFRESH UNLOCKED STATE MESSAGE MUTATION (Wave 18)
+# ==============================================================================
+async def fuzz_refresh_unlocked_state_message_mutation(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="refresh_unlocked_state_message_mutation",
+        description="Fuzzing mutasi state.message = None di luar state.lock pada refresh() saat terjadi exception",
+        iterations=iterations,
+    )
+    unlocked_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.refresh)
+        part = src.partition("except discord.HTTPException as err:")
+        sub = part[2][:600]
+        vulnerable = "async with state.lock:" not in sub
+        if vulnerable:
+            unlocked_events += 1
+
+    if unlocked_events > 0:
+        res.anomalies.append(
+            f"refresh unlocked state.message mutation terkonfirmasi: {unlocked_events}/{iterations} iterasi. "
+            "Mutasi state.message = None pada refresh() dilakukan tanpa async with state.lock, memicu race condition "
+            "yang menghapus state.message baru dari coroutine lain."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unlocked_events": unlocked_events}
+    return res
+
+
+# ==============================================================================
+# 202. DELETE ALL PANELS UNLOCKED STATE MUTATION (Wave 18)
+# ==============================================================================
+async def fuzz_delete_all_panels_unlocked_state_mutation(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="delete_all_panels_unlocked_state_mutation",
+        description="Fuzzing mutasi state.message dan state.now_message di luar state.lock pada _delete_all_panels()",
+        iterations=iterations,
+    )
+    unlocked_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._delete_all_panels)
+        vulnerable = "async with state.lock:" not in src
+        if vulnerable:
+            unlocked_events += 1
+
+    if unlocked_events > 0:
+        res.anomalies.append(
+            f"_delete_all_panels unlocked mutation terkonfirmasi: {unlocked_events}/{iterations} iterasi. "
+            "Mutasi state.message = None dan now_message = None di _delete_all_panels dilakukan di luar state.lock."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unlocked_events": unlocked_events}
+    return res
+
+
+# ==============================================================================
+# 203. CMD SHUFFLE UNLOCKED QUEUE LEN CHECK (Wave 18)
+# ==============================================================================
+async def fuzz_cmd_shuffle_unlocked_queue_len_check(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_shuffle_unlocked_queue_len_check",
+        description="Fuzzing pengecekan len(state.queue) < 2 di luar lock tanpa validasi ulang di dalam state.lock pada cmd_shuffle",
+        iterations=iterations,
+    )
+    unlocked_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.cmd_shuffle)
+        lock_part = src.partition("async with state.lock:")[2]
+        vulnerable = "len(state.queue) < 2" not in lock_part
+        if vulnerable:
+            unlocked_events += 1
+
+    if unlocked_events > 0:
+        res.anomalies.append(
+            f"cmd_shuffle unlocked queue len check terkonfirmasi: {unlocked_events}/{iterations} iterasi. "
+            "Pengecekan len(state.queue) < 2 pada cmd_shuffle dilakukan di luar state.lock tanpa validasi ulang "
+            "di dalam lock, memicu respons misleading jika antrean berkurang konkuren."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"unlocked_events": unlocked_events}
+    return res
+
+
+# ==============================================================================
+# 204. CMD SKIP MISSING IDLE SCHEDULE (Wave 18)
+# ==============================================================================
+async def fuzz_cmd_skip_missing_idle_schedule(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_skip_missing_idle_schedule",
+        description="Fuzzing ketiadaan penjadwalan _schedule_idle pada cmd_skip saat antrean kosong dan audio berhenti",
+        iterations=iterations,
+    )
+    missing_idle_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.cmd_skip)
+        vulnerable = "_schedule_idle" not in src
+        if vulnerable:
+            missing_idle_events += 1
+
+    if missing_idle_events > 0:
+        res.anomalies.append(
+            f"cmd_skip missing idle schedule terkonfirmasi: {missing_idle_events}/{iterations} iterasi. "
+            "Ketiadaan penjadwalan _schedule_idle pada cmd_skip saat antrean kosong dan audio berhenti, "
+            "menelantarkan bot di voice tanpa idle timer."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"missing_idle_events": missing_idle_events}
+    return res
+
+
+# ==============================================================================
+# 205. CMD LOOP UNVALIDATED MODE FALLBACK (Wave 18)
+# ==============================================================================
+async def fuzz_cmd_loop_unvalidated_mode_fallback(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="cmd_loop_unvalidated_mode_fallback",
+        description="Fuzzing kegagalan validasi nilai mode pada cmd_loop yang otomatis memicu cycle toggle jika mode tidak dikenal",
+        iterations=iterations,
+    )
+    fallback_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.cmd_loop)
+        part = src.partition("if mode and mode.lower() in {'off', 'track', 'queue'}:")
+        sub = part[2][:150]
+        vulnerable = "else:" in sub and "cycle =" in sub
+        if vulnerable:
+            fallback_events += 1
+
+    if fallback_events > 0:
+        res.anomalies.append(
+            f"cmd_loop unvalidated mode fallback terkonfirmasi: {fallback_events}/{iterations} iterasi. "
+            "Nilai mode tidak valid pada cmd_loop tidak ditolak melainkan otomatis memicu cycle toggle."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"fallback_events": fallback_events}
+    return res
+
+
+# ==============================================================================
+# 206. IS CONNECTED FALLBACK LAMBDA TRUE FLAW (Wave 18)
+# ==============================================================================
+async def fuzz_is_connected_fallback_lambda_true_flaw(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="is_connected_fallback_lambda_true_flaw",
+        description="Fuzzing cacat fallback lambda: True pada getattr(vc, 'is_connected') di cmd_play, cmd_stop, cmd_quit, dan SearchModal",
+        iterations=iterations,
+    )
+    flaw_events = 0
+    for _ in range(iterations):
+        src_stop = inspect.getsource(MusicBot.cmd_stop)
+        src_quit = inspect.getsource(MusicBot.cmd_quit)
+        src_play = inspect.getsource(MusicBot.cmd_play)
+        vulnerable = (
+            "getattr(vc, 'is_connected', lambda: True)" in src_stop
+            or "getattr(vc, 'is_connected', lambda: True)" in src_quit
+            or "getattr(vc, 'is_connected', lambda: True)" in src_play
+        )
+        if vulnerable:
+            flaw_events += 1
+
+    if flaw_events > 0:
+        res.anomalies.append(
+            f"is_connected fallback lambda: True terkonfirmasi: {flaw_events}/{iterations} iterasi. "
+            "Fallback lambda: True pada getattr(vc, 'is_connected') menganggap voice client terhubung saat atribut hilang/rusak."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"flaw_events": flaw_events}
+    return res
+
+
+# ==============================================================================
+# 207. SEARCH MODAL DIRECT VC CHANNEL MUTATION (Wave 18)
+# ==============================================================================
+async def fuzz_search_modal_direct_vc_channel_mutation(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="search_modal_direct_vc_channel_mutation",
+        description="Fuzzing mutasi langsung atribut internal vc.channel = None pada SearchModal.on_submit",
+        iterations=iterations,
+    )
+    mutation_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(SearchModal.on_submit)
+        vulnerable = "vc.channel = None" in src
+        if vulnerable:
+            mutation_events += 1
+
+    if mutation_events > 0:
+        res.anomalies.append(
+            f"SearchModal direct vc.channel mutation terkonfirmasi: {mutation_events}/{iterations} iterasi. "
+            "Mutasi langsung atribut internal vc.channel = None pada SearchModal.on_submit merusak integritas objek VoiceClient discord.py."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"mutation_events": mutation_events}
+    return res
+
+
+# ==============================================================================
+# 208. STATE EXPORTER LOOP STOPPING CHECK OMISSION (Wave 18)
+# ==============================================================================
+async def fuzz_state_exporter_loop_stopping_check_omission(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="state_exporter_loop_stopping_check_omission",
+        description="Fuzzing ketiadaan pengecekan self._stopping pada loop _state_exporter_loop selama proses shutdown",
+        iterations=iterations,
+    )
+    omission_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._state_exporter_loop)
+        vulnerable = "_stopping" not in src
+        if vulnerable:
+            omission_events += 1
+
+    if omission_events > 0:
+        res.anomalies.append(
+            f"_state_exporter_loop missing stopping check terkonfirmasi: {omission_events}/{iterations} iterasi. "
+            "_state_exporter_loop tidak memeriksa self._stopping, memicu I/O disk dump_runtime_state selama shutdown."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"omission_events": omission_events}
+    return res
+
+
+# ==============================================================================
+# 209. ON GUILD REMOVE REDUNDANT EMMC DUMP (Wave 18)
+# ==============================================================================
+async def fuzz_on_guild_remove_redundant_emmc_dump(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="on_guild_remove_redundant_emmc_dump",
+        description="Verifikasi pemanggilan redundan dump_runtime_state pada baris awal on_guild_remove sebelum quit_voice",
+        iterations=iterations,
+    )
+    redundant_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot.on_guild_remove)
+        first_part = src[:120]
+        vulnerable = "dump_runtime_state(self)" in first_part
+        if vulnerable:
+            redundant_events += 1
+
+    if redundant_events > 0:
+        res.anomalies.append(
+            f"on_guild_remove redundant eMMC dump terkonfirmasi: {redundant_events}/{iterations} iterasi. "
+            "Pemanggilan redundan dump_runtime_state pada on_guild_remove sebelum quit_voice memboroskan siklus I/O flash eMMC STB ARM."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"redundant_events": redundant_events}
+    return res
+
+
+# ==============================================================================
+# 210. SOURCE FOR VOLUME NAN INF SANITIZATION (Wave 18)
+# ==============================================================================
+async def fuzz_source_for_volume_nan_inf_sanitization(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="source_for_volume_nan_inf_sanitization",
+        description="Fuzzing ketiadaan sanitasi volume NaN/Inf pada source_for yang menghasilkan stream terdistorsi",
+        iterations=iterations,
+    )
+    sanitization_missing_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(bot_module.source_for)
+        vulnerable = "math.isfinite" not in src
+        if vulnerable:
+            sanitization_missing_events += 1
+
+    if sanitization_missing_events > 0:
+        res.anomalies.append(
+            f"source_for volume NaN/Inf sanitization terkonfirmasi: {sanitization_missing_events}/{iterations} iterasi. "
+            "Ketiadaan sanitasi volume NaN/Inf pada source_for berisiko menghasilkan PCMVolumeTransformer dengan stream terdistorsi."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"sanitization_missing_events": sanitization_missing_events}
+    return res
+
+
+# ==============================================================================
+# 211. RESTORE PERSISTENT QUEUE INFINITE VOLUME (Wave 18)
+# ==============================================================================
+async def fuzz_restore_persistent_queue_infinite_volume(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="restore_persistent_queue_infinite_volume",
+        description="Fuzzing penerimaan volume bernilai infinity pada _restore_persistent_queue akibat pemeriksaan not (vol != vol)",
+        iterations=iterations,
+    )
+    infinite_vol_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._restore_persistent_queue)
+        vulnerable = "not (vol != vol)" in src or "math.isfinite" not in src
+        if vulnerable:
+            infinite_vol_events += 1
+
+    if infinite_vol_events > 0:
+        res.anomalies.append(
+            f"_restore_persistent_queue infinite volume flaw terkonfirmasi: {infinite_vol_events}/{iterations} iterasi. "
+            "Pemeriksaan not (vol != vol) pada _restore_persistent_queue meloloskan float('inf') dan -inf."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"infinite_vol_events": infinite_vol_events}
+    return res
+
+
+# ==============================================================================
+# 212. RESTORE PERSISTENT QUEUE BOOLEAN PANEL MSG ID (Wave 18)
+# ==============================================================================
+async def fuzz_restore_persistent_queue_boolean_panel_msg_id(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="restore_persistent_queue_boolean_panel_msg_id",
+        description="Fuzzing pemuatan boolean True/False ke state.message pada _restore_persistent_queue",
+        iterations=iterations,
+    )
+    boolean_restore_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(MusicBot._restore_persistent_queue)
+        vulnerable = "not isinstance(panel_message_id, bool)" not in src
+        if vulnerable:
+            boolean_restore_events += 1
+
+    if boolean_restore_events > 0:
+        res.anomalies.append(
+            f"_restore_persistent_queue boolean panel_message_id restore flaw terkonfirmasi: {boolean_restore_events}/{iterations} iterasi. "
+            "_restore_persistent_queue tidak memeriksa not isinstance(panel_message_id, bool), memuat boolean True ke state.message."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"boolean_restore_events": boolean_restore_events}
+    return res
+
+
+# ==============================================================================
+# 213. PANEL UPDATE PASSWORD FALLBACK CHMOD OMISSION (Wave 18)
+# ==============================================================================
+async def fuzz_panel_update_password_fallback_chmod_omission(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_update_password_fallback_chmod_omission",
+        description="Fuzzing ketiadaan penegakan os.chmod(target_path, 0o600) pada fallback in-place write di update_panel_password()",
+        iterations=iterations,
+    )
+    chmod_omission_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(panel_module.update_panel_password)
+        part = src.partition("# Fallback jika direktori induk read-only (ProtectSystem=strict): tulis in-place")
+        sub = part[2][:300]
+        vulnerable = "os.chmod(target_path, 0o600)" not in sub
+        if vulnerable:
+            chmod_omission_events += 1
+
+    if chmod_omission_events > 0:
+        res.anomalies.append(
+            f"update_panel_password fallback chmod 0600 omission terkonfirmasi: {chmod_omission_events}/{iterations} iterasi. "
+            "Fallback in-place write pada update_panel_password tidak menegakkan os.chmod(target_path, 0o600)."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"chmod_omission_events": chmod_omission_events}
+    return res
+
+
+# ==============================================================================
+# 214. PANEL UPDATE LOG UNICODE DECODE ERROR (Wave 18)
+# ==============================================================================
+async def fuzz_panel_update_log_unicode_decode_error(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_update_log_unicode_decode_error",
+        description="Fuzzing risiko unhandled UnicodeDecodeError saat membaca UPDATE_LOG_PATH tanpa errors='replace'",
+        iterations=iterations,
+    )
+    decode_risk_events = 0
+    for _ in range(iterations):
+        src_read = inspect.getsource(panel_module.read_last_update_log)
+        src_run = inspect.getsource(panel_module._run_update_inner)
+        vulnerable_read = "open(UPDATE_LOG_PATH, 'r', encoding='utf-8')" in src_read and "errors=" not in src_read.partition("open(UPDATE_LOG_PATH")[2][:50]
+        vulnerable_run = "open(UPDATE_LOG_PATH, 'r', encoding='utf-8')" in src_run and "errors=" not in src_run.partition("open(UPDATE_LOG_PATH")[2][:50]
+        if vulnerable_read or vulnerable_run:
+            decode_risk_events += 1
+
+    if decode_risk_events > 0:
+        res.anomalies.append(
+            f"panel update log UnicodeDecodeError risk terkonfirmasi: {decode_risk_events}/{iterations} iterasi. "
+            "Pembacaan UPDATE_LOG_PATH tanpa errors='replace' rentan unhandled UnicodeDecodeError."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"decode_risk_events": decode_risk_events}
+    return res
+
+
+# ==============================================================================
+# 215. PANEL BOT INVITE REVERSE TABNABBING (Wave 18)
+# ==============================================================================
+async def fuzz_panel_bot_invite_reverse_tabnabbing(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_bot_invite_reverse_tabnabbing",
+        description="Verifikasi kerentanan reverse tabnabbing pada link bot invite di panel akibat target='_blank' tanpa rel='noopener noreferrer'",
+        iterations=iterations,
+    )
+    tabnabbing_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(panel_module.Handler._page)
+        part = src.partition('target="_blank"')
+        vulnerable = 'target="_blank"' in src and 'rel="noopener noreferrer"' not in part[2][:100]
+        if vulnerable:
+            tabnabbing_events += 1
+
+    if tabnabbing_events > 0:
+        res.anomalies.append(
+            f"panel bot invite reverse tabnabbing terkonfirmasi: {tabnabbing_events}/{iterations} iterasi. "
+            "Tautan eksternal bot invite di panel menggunakan target='_blank' tanpa rel='noopener noreferrer' (reverse tabnabbing)."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"tabnabbing_events": tabnabbing_events}
+    return res
+
+
+# ==============================================================================
+# 216. PANEL LOCAL ADDRESSES CACHE MUTATION LEAK (Wave 18)
+# ==============================================================================
+async def fuzz_panel_local_addresses_cache_mutation_leak(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="panel_local_addresses_cache_mutation_leak",
+        description="Fuzzing kebocoran mutasi cache internal _local_addr_cache akibat pengembalian set langsung tanpa set()",
+        iterations=iterations,
+    )
+    cache_leak_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(panel_module._local_addresses)
+        vulnerable = "return set(_local_addr_cache)" not in src and "return _local_addr_cache" in src
+        if vulnerable:
+            cache_leak_events += 1
+
+    if cache_leak_events > 0:
+        res.anomalies.append(
+            f"_local_addresses cache set mutation leak terkonfirmasi: {cache_leak_events}/{iterations} iterasi. "
+            "_local_addresses() mengembalikan cache set internal langsung tanpa penyalinan set()."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"cache_leak_events": cache_leak_events}
+    return res
+
+
+# ==============================================================================
+# 217. CONFIG STORE WRITE NON DICT VALIDATION (Wave 18)
+# ==============================================================================
+async def fuzz_config_store_write_non_dict_validation(iterations: int = 5) -> FuzzScenarioResult:
+    res = FuzzScenarioResult(
+        scenario="config_store_write_non_dict_validation",
+        description="Fuzzing unhandled AttributeError pada ConfigStore.write() ketika parameter values bukan bertipe dict",
+        iterations=iterations,
+    )
+    validation_missing_events = 0
+    for _ in range(iterations):
+        src = inspect.getsource(panel_module.ConfigStore.write)
+        vulnerable = "isinstance(values, dict)" not in src
+        if vulnerable:
+            validation_missing_events += 1
+
+    if validation_missing_events > 0:
+        res.anomalies.append(
+            f"ConfigStore.write non-dict validation terkonfirmasi: {validation_missing_events}/{iterations} iterasi. "
+            "ConfigStore.write melempar AttributeError tanpa handling jika argumen values bukan dict."
+        )
+        res.failed += 1
+    else:
+        res.passed += 1
+
+    res.metrics = {"validation_missing_events": validation_missing_events}
+    return res
+
+
+# ==============================================================================
 # RUNNER
 # ==============================================================================
 ALL_SCENARIOS = {
@@ -9407,6 +10131,30 @@ ALL_SCENARIOS = {
     "voice_state_update_not_in_voice_disk_thrashing": fuzz_voice_state_update_not_in_voice_disk_thrashing,
     "panel_logout_csrf_vulnerability": fuzz_panel_logout_csrf_vulnerability,
     "panel_format_guilds_html_malformed_type_error": fuzz_panel_format_guilds_html_malformed_type_error,
+    # Wave 18 Additions
+    "close_missing_stopping_flag": fuzz_close_missing_stopping_flag,
+    "close_generation_bump_and_background_tasks_leak": fuzz_close_generation_bump_and_background_tasks_leak,
+    "after_dispatch_sleep_shutdown_race": fuzz_after_dispatch_sleep_shutdown_race,
+    "cmd_play_summon_old_panel_channel_mismatch": fuzz_cmd_play_summon_old_panel_channel_mismatch,
+    "safe_delete_msg_param_channel_priority_inversion": fuzz_safe_delete_msg_param_channel_priority_inversion,
+    "quit_voice_cold_cache_channel_resolution": fuzz_quit_voice_cold_cache_channel_resolution,
+    "refresh_unlocked_state_message_mutation": fuzz_refresh_unlocked_state_message_mutation,
+    "delete_all_panels_unlocked_state_mutation": fuzz_delete_all_panels_unlocked_state_mutation,
+    "cmd_shuffle_unlocked_queue_len_check": fuzz_cmd_shuffle_unlocked_queue_len_check,
+    "cmd_skip_missing_idle_schedule": fuzz_cmd_skip_missing_idle_schedule,
+    "cmd_loop_unvalidated_mode_fallback": fuzz_cmd_loop_unvalidated_mode_fallback,
+    "is_connected_fallback_lambda_true_flaw": fuzz_is_connected_fallback_lambda_true_flaw,
+    "search_modal_direct_vc_channel_mutation": fuzz_search_modal_direct_vc_channel_mutation,
+    "state_exporter_loop_stopping_check_omission": fuzz_state_exporter_loop_stopping_check_omission,
+    "on_guild_remove_redundant_emmc_dump": fuzz_on_guild_remove_redundant_emmc_dump,
+    "source_for_volume_nan_inf_sanitization": fuzz_source_for_volume_nan_inf_sanitization,
+    "restore_persistent_queue_infinite_volume": fuzz_restore_persistent_queue_infinite_volume,
+    "restore_persistent_queue_boolean_panel_msg_id": fuzz_restore_persistent_queue_boolean_panel_msg_id,
+    "panel_update_password_fallback_chmod_omission": fuzz_panel_update_password_fallback_chmod_omission,
+    "panel_update_log_unicode_decode_error": fuzz_panel_update_log_unicode_decode_error,
+    "panel_bot_invite_reverse_tabnabbing": fuzz_panel_bot_invite_reverse_tabnabbing,
+    "panel_local_addresses_cache_mutation_leak": fuzz_panel_local_addresses_cache_mutation_leak,
+    "config_store_write_non_dict_validation": fuzz_config_store_write_non_dict_validation,
 }
 
 
@@ -9423,7 +10171,7 @@ async def run_all(scenarios: list[str], iterations: int) -> list[FuzzScenarioRes
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 17)")
+    parser = argparse.ArgumentParser(description="Stress Testing & Concurrency Fuzzing Runner (Wave 18)")
     parser.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
     parser.add_argument("--iterations", type=int, default=10, help="Jumlah iterasi fuzzing per skenario")
     parser.add_argument("--json", action="store_true", help="Format output sebagai JSON")
@@ -9438,7 +10186,7 @@ def main():
         return
 
     print("\n" + "=" * 76)
-    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 17)")
+    print("LAPORAN STRESS TESTING & CONCURRENCY FUZZING BOT.PY (WAVE 18)")
     print("=" * 76)
 
     total_passed = 0

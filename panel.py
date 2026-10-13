@@ -85,6 +85,10 @@ def update_panel_password(new_password: str, env_path: Optional[str] = None) -> 
                 handle.write(body)
                 handle.flush()
                 os.fsync(handle.fileno())
+            try:
+                os.chmod(target_path, 0o600)
+            except OSError:
+                pass
 
         PASSWORD = new_password
         with _lock:
@@ -198,6 +202,8 @@ class ConfigStore:
         return kept
 
     def write(self, values: dict) -> None:
+        if not isinstance(values, dict):
+            raise TypeError('Argumen values harus berupa dict.')
         with self._lock:
             for value in values.values():
                 val_str = str(value) if value is not None else ''
@@ -387,7 +393,7 @@ def read_last_update_log() -> str:
                     _update_log_cache = (mtime, now, _update_log_cache[2])
                     return _update_log_cache[2]
             size = os.path.getsize(UPDATE_LOG_PATH)
-            with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
+            with open(UPDATE_LOG_PATH, 'r', encoding='utf-8', errors='replace') as handle:
                 if size > 65536:
                     handle.seek(max(0, size - 65536))
                     handle.readline()
@@ -524,7 +530,7 @@ def _run_update_inner() -> tuple[bool, str]:
         if ok and cmd == [update_script]:
             if os.path.exists(UPDATE_LOG_PATH):
                 try:
-                    with open(UPDATE_LOG_PATH, 'r', encoding='utf-8') as handle:
+                    with open(UPDATE_LOG_PATH, 'r', encoding='utf-8', errors='replace') as handle:
                         handle.seek(0, 2)
                         size = handle.tell()
                         handle.seek(max(0, size - 65536))
@@ -1262,7 +1268,7 @@ class Handler(BaseHTTPRequestHandler):
         
         bot_id = runtime.get('bot_id')
         if bot_id and str(bot_id).isdigit():
-            invite_html = f'<div style="margin-top:14px"><a href="https://discord.com/oauth2/authorize?client_id={bot_id}&permissions=277028595712&scope=bot%20applications.commands" target="_blank" style="display:inline-block;background:#5865F2;color:#fff;border-radius:6px;padding:8px 12px;font-weight:600;text-decoration:none;font-size:13px">Undang Bot ke Server</a></div>'
+            invite_html = f'<div style="margin-top:14px"><a href="https://discord.com/oauth2/authorize?client_id={bot_id}&permissions=277028595712&scope=bot%20applications.commands" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#5865F2;color:#fff;border-radius:6px;padding:8px 12px;font-weight:600;text-decoration:none;font-size:13px">Undang Bot ke Server</a></div>'
         else:
             invite_html = ''
 
@@ -1496,7 +1502,7 @@ def _local_addresses() -> set[str]:
     with _local_addr_lock:
         now = time.monotonic()
         if _local_addr_cache is not None and (now - _local_addr_cache_ts) < LOCAL_ADDR_TTL:
-            return _local_addr_cache
+            return set(_local_addr_cache)
         import socket
         found: set[str] = set()
 
@@ -1525,7 +1531,7 @@ def _local_addresses() -> set[str]:
 
         _local_addr_cache = {a for a in found if a}
         _local_addr_cache_ts = now
-        return _local_addr_cache
+        return set(_local_addr_cache)
 
 
 def _default_allowed_hosts(host: str, port: int) -> set[str]:
