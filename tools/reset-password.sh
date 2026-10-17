@@ -8,7 +8,9 @@
 set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="${PYTHON:-$DIR/venv/bin/python}"
+# python3 sistem, bukan venv: panel.py hanya butuh stdlib, dan skrip ini
+# biasanya dijalankan sebagai root sedangkan venv bisa ditulis user updater.
+PYTHON="${PYTHON:-/usr/bin/python3}"
 if [ ! -x "$PYTHON" ]; then
     PYTHON="python3"
 fi

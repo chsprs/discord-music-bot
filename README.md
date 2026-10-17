@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.7-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-pinned-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-310%2F310%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-499%2F499%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -54,17 +54,18 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
   - Memulai timer tunggu (default 3 menit via `AFK_TIMEOUT_SECONDS`), otomatis melanjutkan lagu jika ada user yang masuk kembali, atau mematikan proses FFmpeg dan disconnect voice jika room tetap kosong guna menghemat CPU dan RAM STB.
 - **Persistent Queue (Antrean Tahan Restart):**
   - Antrean lagu dan track yang sedang berjalan otomatis dicadangkan ke tmpfs (`/run/discord-music/queue_state.json`).
-  - Saat bot di-restart untuk pembaruan mingguan atau server reboot, antrean dipulihkan seketika tanpa kehilangan daftar putar.
+  - Saat bot di-restart (pembaruan mingguan, tombol **Mulai ulang** di panel, `systemctl restart`, atau crash yang di-restart otomatis), antrean dipulihkan; lagu yang sedang diputar kembali ke urutan pertama antrean. Unit memakai `RuntimeDirectoryPreserve=restart` agar berkas ini tidak dihapus systemd saat restart.
+  - Karena disimpan di tmpfs (hemat tulis eMMC), antrean **tidak** bertahan saat server reboot atau saat service dihentikan penuh (`systemctl stop` / tombol **Matikan**).
 - **Web Control Panel Mandiri & Pemantau Server/Pengguna:**
   - Web dashboard di port `9130` (dibangun murni dengan Python standard library HTTP, aman dengan proteksi CSRF token & nonce).
   - Konfigurasi token bot & ID server Discord langsung dari browser tanpa perlu SSH ke server.
   - Monitor status service & tombol kontrol start / restart / stop service dari web.
   - **Pemantau Server & Pengguna Aktif:** Menampilkan daftar server Discord yang dimasuki bot, channel voice yang sedang tersambung, judul lagu & antrean yang sedang berputar, serta jumlah & nama pengguna yang sedang mendengarkan secara realtime.
-  - **Tombol Pembaruan Manual:** Perbarui `yt-dlp` seketika lewat tombol web lengkap dengan riwayat log keluaran terminal.
+  - **Tombol Pembaruan Manual:** Jalankan `discord-music-update.service` (sebagai user `discord-music-updater`, bukan root) lewat tombol web lengkap dengan riwayat log keluaran terminal. Panel sendiri berjalan dengan `python3` sistem (stdlib saja), tidak memakai interpreter venv.
   - **Pemantau Log Realtime:** Kotak log aktivitas bot (`journalctl`) yang dapat disegarkan langsung dari antarmuka web.
 - **Auto-Update Mingguan yang Aman:**
   - **Systemd Timer Mingguan:** Setiap Minggu pukul 04:00 WIB, `discord-music-update.service` berjalan sebagai user khusus non-root `discord-music-updater` (bukan root).
-  - **Hash-locked install:** Pembaruan memakai `pip install --require-hashes -r requirements.txt`. Setiap paket diverifikasi SHA-256 sebelum dipasang; paket yang hash-nya tidak cocok ditolak. `requirements.txt` di-generate dari `requirements.in` lewat `pip-compile --generate-hashes`.
+  - **Hash-locked install:** Pembaruan memakai `pip install --require-hashes -r requirements.txt`. Setiap paket diverifikasi SHA-256 sebelum dipasang; paket yang hash-nya tidak cocok ditolak. `requirements.txt` di-generate dari `requirements.in` lewat `uv pip compile --universal --generate-hashes` sehingga satu lockfile berlaku untuk Python 3.10–3.13+ (termasuk dependensi bermarker seperti `audioop-lts` di Python 3.13).
   - **Restart hanya bila versi berubah:** Bot di-restart hanya jika versi yt-dlp terpasang benar-benar berubah. Bila tidak ada perubahan, updater keluar tanpa restart.
   - **Restart Aman Saat Ada Pendengar:** Bila masih ada yang mendengarkan musik (dibaca dari `listeners.json` yang world-readable), restart ditunda agar pemutaran tidak terputus; versi yt-dlp baru dipakai pada restart berikutnya.
   - **Integrasi JS Engine:** Terhubung ke Node.js runtime untuk menyelesaikan challenge player API YouTube (EJS) tanpa pesan warning deprecation. Skrip setup NodeSource diverifikasi SHA-256 statis sebelum dieksekusi `install.sh`.
@@ -74,8 +75,10 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
 Timer mingguan tidak menaikkan versi sendiri — ia hanya memasang versi yang ter-pin di `requirements.txt`. Untuk bump yt-dlp ke rilis terbaru:
 
 ```bash
-# Di mesin dev (butuh pip-tools):
-pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+# Di mesin dev (butuh uv). --universal WAJIB: tanpa itu lockfile hanya berlaku
+# untuk versi Python yang menjalankan compile dan install gagal di versi lain.
+uv pip compile requirements.in --universal --generate-hashes --python-version 3.10 \
+    --upgrade-package yt-dlp -o requirements.txt
 git add requirements.txt
 git commit -m "chore: bump yt-dlp"
 git push
@@ -147,12 +150,12 @@ sudo ./install.sh
 
 Skrip installer otomatis:
 1. Memeriksa dan menginstal paket sistem yang dibutuhkan (`python3`, `python3-venv`, `ffmpeg`, `nodejs`; skrip setup NodeSource diverifikasi SHA-256 sebelum dijalankan).
-2. Menyiapkan Python virtual environment dan menginstal dependensi hash-locked dari `requirements.txt`.
+2. Menyiapkan Python virtual environment dan menginstal dependensi hash-locked dari `requirements.txt` (sebagai user `discord-music-updater`, bukan root).
 3. Membuat user sistem non-root `discord-music-updater`, mengatur ownership `venv`/log, dan memasang aturan sudoers terbatas (`systemctl restart/is-active discord-music.service` saja).
 4. Memasang service systemd `discord-music.service`, `discord-music-panel.service`, dan `discord-music-update.service` + timer.
 5. Mengaktifkan auto-start saat boot sistem.
-6. Menjalankan verifikasi unit test mandiri (**321/321 passing**).
-7. Menyalakan Web Control Panel di port `9130`.
+6. Menjalankan verifikasi unit test mandiri (**499/499 passing**) sebagai user non-root dengan path runtime sementara, sehingga tidak menyentuh antrean/state bot yang sedang hidup.
+7. Menyalakan Web Control Panel di port `9130` dengan **password acak** (dicetak di akhir instalasi) kecuali `PANEL_PASSWORD` sudah diberikan, mis. `sudo PANEL_PASSWORD='rahasia' ./install.sh`.
 
 ---
 
@@ -169,8 +172,8 @@ Skrip installer otomatis:
 
 > [!NOTE]
 > **Manajemen Password Panel.**
-> - Panel web berjalan di jaringan rumah (LAN) dan secara default dapat diakses tanpa password.
-> - Password dapat diatur atau dihapus kapan saja melalui form **Konfigurasi** di panel web.
+> - `install.sh` membuat password panel acak dan mencetaknya di akhir instalasi. Tanpa password, siapa pun di LAN bisa mengganti token, mematikan bot, atau memasang password sendiri lalu mengunci Anda.
+> - Password dapat diatur atau dihapus kapan saja melalui form **Konfigurasi** di panel web (mode tanpa password tetap tersedia bila memang diinginkan).
 > - Jika lupa password atau ingin mereset via terminal server:
 >   ```bash
 >   ./tools/reset-password.sh           # Reset/hapus password (akses bebas di LAN)
@@ -248,7 +251,9 @@ Saat membuat aplikasi bot di [Discord Developer Portal](https://discord.com/deve
     ├── test_bot.py               # Unit test core bot, UI View, queue, AFK guard, persistent queue
     ├── test_panel.py             # Unit test web panel, update endpoint, CSRF, validasi DoS & input
     ├── test_update.py            # Unit test skrip update.sh & timer behaviour
-    └── test_systemd_units.py     # Unit test validasi hardening unit systemd
+    ├── test_systemd_units.py     # Unit test validasi hardening unit systemd
+    ├── test_lockfile.py          # Lockfile hash-locked universal (Python 3.10–3.13+)
+    └── test_audit_fixes.py       # Regresi temuan audit (antrean, AutoPlay, ekstraksi, panel)
 ```
 
 ---
@@ -259,12 +264,14 @@ Jalankan rangkaian unit test lengkap:
 
 ```bash
 cd /opt/discord-music-bot
-./venv/bin/python -m pytest tests/ -q
+./venv/bin/python -m unittest discover -s tests
 ```
 
 Hasil uji:
 ```
-310 passed in ~70s
+Ran 499 tests in ~70s
+
+OK
 ```
 
 ---
@@ -283,8 +290,10 @@ sudo systemctl list-timers | grep discord
 # Melihat log bot secara realtime
 sudo journalctl -u discord-music.service -f
 
-# Menjalankan pembaruan yt-dlp manual via terminal
-sudo /opt/discord-music-bot/update.sh
+# Menjalankan pembaruan yt-dlp manual via terminal (sebagai user updater,
+# JANGAN `sudo ./update.sh` langsung: pip sebagai root meninggalkan berkas
+# milik root di venv dan timer mingguan berikutnya gagal)
+sudo systemctl start discord-music-update.service
 ```
 
 ---

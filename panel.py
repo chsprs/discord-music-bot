@@ -5,7 +5,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import signal
 import subprocess
 import sys
@@ -24,11 +23,33 @@ DISCORD_TOKEN_RE = re.compile(r'^[A-Za-z0-9_\-]{24,38}\.[A-Za-z0-9_\-]{6,}\.[A-Z
 
 SERVICE = 'discord-music.service'
 TIMER = 'discord-music-update.timer'
+UPDATE_UNIT = 'discord-music-update.service'
+# venv milik user discord-music-updater. Panel (root) hanya MEMBACA metadata di
+# sini, tidak pernah mengimpor/menjalankan kodenya.
+BOT_VENV = os.environ.get('BOT_VENV', '/opt/discord-music-bot/venv')
 CONFIG_PATH = os.environ.get('BOT_CONFIG', '/opt/discord-music-bot/.env')
 UPDATE_LOG_PATH = os.environ.get('UPDATE_LOG', '/opt/discord-music-bot/last_update.log')
 PANEL_ENV_PATH = os.environ.get('PANEL_ENV', '/opt/discord-music-panel.env')
 PASSWORD = os.environ.get('PANEL_PASSWORD', '')
 _password_lock = threading.Lock()
+
+
+_ENV_SAFE_RE = re.compile(r'^[A-Za-z0-9_@%+=:,./-]*$')
+
+
+def _env_quote(value: str) -> str:
+    """Quote nilai untuk EnvironmentFile systemd agar terbaca persis sama.
+
+    systemd memperlakukan kutip, backslash, dan spasi di ujung secara khusus:
+    password `"abc"` tanpa quoting terbaca sebagai `abc` setelah panel restart
+    dan pemiliknya terkunci. Kutip tunggal = literal; bila nilai memuat kutip
+    tunggal, pakai kutip ganda dengan escape seperti shell.
+    """
+    if _ENV_SAFE_RE.match(value):
+        return value
+    if "'" not in value:
+        return f"'{value}'"
+    return '"' + re.sub(r'(["\\`$])', r'\\\1', value) + '"'
 
 
 def update_panel_password(new_password: str, env_path: Optional[str] = None) -> None:
@@ -46,14 +67,14 @@ def update_panel_password(new_password: str, env_path: Optional[str] = None) -> 
                     for line in handle:
                         stripped = line.rstrip('\r\n')
                         if stripped.strip().startswith('PANEL_PASSWORD='):
-                            lines.append(f'PANEL_PASSWORD={new_password}')
+                            lines.append(f'PANEL_PASSWORD={_env_quote(new_password)}')
                             found = True
                         else:
                             lines.append(stripped)
             except Exception:
                 pass
         if not found:
-            lines.append(f'PANEL_PASSWORD={new_password}')
+            lines.append(f'PANEL_PASSWORD={_env_quote(new_password)}')
         body = '\n'.join(lines).strip() + '\n'
 
         directory = os.path.dirname(target_path) or '.'
@@ -357,6 +378,24 @@ _ytdlp_version_lock = threading.Lock()
 YTDLP_VERSION_CACHE_TTL = 30.0
 
 
+def _venv_ytdlp_version() -> str | None:
+    """Versi yt-dlp di venv bot, dibaca dari berkas dist-info saja.
+
+    Panel berjalan sebagai root dengan python3 sistem (stdlib saja), sedangkan
+    venv bisa ditulis user updater. Mengimpor yt_dlp dari venv berarti root
+    mengeksekusi kode milik user lain; membaca METADATA tidak.
+    """
+    import glob
+    import importlib.metadata
+    paths = sorted(glob.glob(os.path.join(BOT_VENV, 'lib', 'python3*', 'site-packages')))
+    if not paths:
+        return None
+    for dist in importlib.metadata.distributions(name='yt-dlp', path=paths):
+        if dist.version:
+            return dist.version
+    return None
+
+
 def ytdlp_version() -> str:
     global _ytdlp_version_cache
     now = time.monotonic()
@@ -368,7 +407,7 @@ def ytdlp_version() -> str:
         import importlib
         importlib.invalidate_caches()
         import importlib.metadata
-        val = importlib.metadata.version('yt-dlp')
+        val = _venv_ytdlp_version() or importlib.metadata.version('yt-dlp')
     except Exception:
         try:
             import importlib
@@ -532,20 +571,35 @@ def _run_update_inner() -> tuple[bool, str]:
 
     update_script = '/opt/discord-music-bot/update.sh'
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-    if os.path.exists(update_script) and os.access(update_script, os.X_OK):
-        cmd = [update_script]
+    via_unit = os.path.exists(update_script) and os.access(update_script, os.X_OK)
+    if via_unit:
+        # Jalankan update.sh lewat unit-nya (User=discord-music-updater), jangan
+        # langsung: panel berjalan sebagai root, dan pip sebagai root meninggalkan
+        # berkas milik root di venv sehingga timer mingguan gagal permanen.
+        # `systemctl start` pada unit oneshot menunggu sampai update.sh selesai.
+        cmd = ['systemctl', '--no-ask-password', 'start', UPDATE_UNIT]
     else:
-        pip_bin = os.path.join(os.path.dirname(sys.executable), 'pip3')
-        if not os.path.exists(pip_bin):
-            pip_bin = shutil.which('pip3') or '/opt/discord-music-bot/venv/bin/pip'
+        # pip milik venv bot (bukan sys.executable: panel memakai python3 sistem),
+        # dijalankan sebagai user updater lewat sudo -u.
+        pip_bin = os.path.join(BOT_VENV, 'bin', 'pip')
         req_file = '/opt/discord-music-bot/requirements.txt'
         cmd = ['sudo', '-u', 'discord-music-updater', pip_bin, 'install', '--require-hashes', '-r', req_file]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            if not via_unit:
+                raise
+            # Hanya klien systemctl yang berhenti menunggu; unit tetap berjalan.
+            msg = (f'[{timestamp}] Pembaruan masih berjalan di latar belakang '
+                   f'({UPDATE_UNIT}). Muat ulang halaman sebentar lagi untuk melihat log.')
+            with _lock:
+                _last_update_output = msg
+            return False, msg
         out = (proc.stdout + '\n' + proc.stderr).strip()
         ok = (proc.returncode == 0)
-        if ok and cmd != [update_script] and bot_state() == 'active':
+        if ok and not via_unit and bot_state() == 'active':
             # M1: jangan potong musik orang — jalur fallback ini dulu me-restart
             # tanpa cek pendengar, berbeda dari update.sh.
             if listeners_active():
@@ -557,7 +611,7 @@ def _run_update_inner() -> tuple[bool, str]:
                 else:
                     out += f'\nGagal merestart service, return code: {restart_proc.returncode}'
                     ok = False
-        if cmd == [update_script]:
+        if via_unit:
             if os.path.exists(UPDATE_LOG_PATH):
                 try:
                     with open(UPDATE_LOG_PATH, 'r', encoding='utf-8', errors='replace') as handle:

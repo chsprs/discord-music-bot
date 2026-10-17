@@ -113,6 +113,9 @@ class QueueState:
     volume: float = field(default_factory=get_default_volume)
     loop_mode: str = 'off'  # 'off', 'track', 'queue'
     autoplay: bool = False
+    # Sisa kandidat YouTube Mix yang belum diputar. Disimpan di state (bukan lokal
+    # per advance()) agar satu ekstraksi Mix melayani banyak lagu AutoPlay.
+    autoplay_candidates: list[Track] = field(default_factory=list)
     generation: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     message: discord.Message | None = None
@@ -142,6 +145,45 @@ class QueueState:
 
 GuildState = QueueState
 
+
+def _retire_skipped(state: QueueState, track: Track | None) -> None:
+    """Catat track yang di-skip ke history; di loop 'queue' ia tetap ikut putaran.
+
+    Handler skip mengosongkan state.current sebelum advance(), sedangkan advance()
+    hanya me-append state.current ke ekor antrean saat loop 'queue' — tanpa ini
+    lagu yang di-skip hilang dari putaran. Bila antrean kosong (loop satu lagu),
+    skip tetap keluar dari lagu itu, sama seperti skip saat ekstraksi.
+    Panggil di dalam state.lock.
+    """
+    if track is None:
+        return
+    state.history.append(track)
+    if len(state.history) > 20:
+        state.history.popleft()
+    if state.loop_mode == 'queue' and state.queue and not any(t is track for t in state.queue):
+        state.queue.append(track)
+
+
+def _skip_queue_head(state: QueueState) -> None:
+    """Buang kepala antrean yang belum diputar; di loop 'queue' pindahkan ke ekor.
+
+    Panggil di dalam state.lock.
+    """
+    if not state.queue:
+        return
+    skipped = state.queue.popleft()
+    if state.loop_mode == 'queue' and state.queue:
+        state.queue.append(skipped)
+
+
+def _take_autoplay_candidate(state: QueueState, played_urls: set[str]) -> Track | None:
+    """Ambil kandidat AutoPlay berikutnya yang belum pernah diputar. Panggil di dalam state.lock."""
+    while state.autoplay_candidates:
+        candidate = state.autoplay_candidates.pop(0)
+        if candidate.url not in played_urls:
+            return candidate
+    return None
+
 # Batas konkurensi ekstraksi yt-dlp agar STB RAM kecil tidak OOM (C4/M3).
 EXTRACT_SEM = asyncio.Semaphore(2)
 MAX_QUEUE = 500
@@ -152,6 +194,11 @@ MAX_QUEUE = 500
 MAX_ERROR_STREAK = 50
 STALL_EOF_SECONDS = 4.0
 MAX_TRACK_RETRIES = 3
+# Jeda dasar sebelum mencoba ulang lagu yang gagal karena gangguan sementara
+# (TransientExtractionError); dikalikan nomor percobaan.
+TRANSIENT_RETRY_DELAY = 2.0
+# Lagu maksimum yang diambil dari satu playlist/channel.
+MAX_PLAYLIST_TRACKS = 100
 AFK_TIMEOUT_SECONDS = _int_env('AFK_TIMEOUT_SECONDS', 180, lo=1)
 
 
@@ -183,7 +230,15 @@ _EXTRACT_THREADS = 0
 _EXTRACT_THREADS_LOCK = threading.Lock()
 
 
-class ExtractionBusy(ValueError):
+class TransientExtractionError(ValueError):
+    """Kegagalan ekstraksi sementara (server sibuk, rate limit 429), bukan lagu rusak.
+
+    advance() mencoba ulang lagu yang sama dengan jeda alih-alih memindahkannya
+    ke ekor antrean. Subclass ValueError agar pesan ramah tetap tampil di /play.
+    """
+
+
+class ExtractionBusy(TransientExtractionError):
     """Thread ekstraksi hidup sudah mencapai batas (H3).
 
     Subclass ValueError agar jalur /play yang sudah menangkap ValueError
@@ -369,6 +424,10 @@ METADATA_OPTIONS = {
     'format': 'bestaudio/best',
     'quiet': True,
     'extract_flat': 'in_playlist',
+    # Tanpa playlistend yt-dlp menelusuri SEMUA halaman playlist/channel (ribuan
+    # entri) walau hanya MAX_PLAYLIST_TRACKS yang dipakai; ekstraksi melewati
+    # timeout dan thread-nya tetap hidup memegang slot MAX_EXTRACT_THREADS.
+    'playlistend': MAX_PLAYLIST_TRACKS,
     'skip_download': True,
     'socket_timeout': 15,
     'retries': 3,
@@ -511,6 +570,8 @@ def dump_runtime_state(bot) -> None:
                 try:
                     with open(l_tmp_path, "w", encoding="utf-8") as f:
                         json.dump(listeners_payload, f)
+                    # listeners.json hanya berisi jumlah pendengar dan wajib bisa
+                    # dibaca update.sh (user discord-music-updater): world-readable.
                     os.chmod(l_tmp_path, 0o644)
                     with _RUNTIME_STATE_LOCK:
                         if seq >= _RUNTIME_LISTENERS_LAST_SEQ:
@@ -530,7 +591,9 @@ def dump_runtime_state(bot) -> None:
                 try:
                     with open(tmp_path, 'w', encoding='utf-8') as f:
                         json.dump(payload, f)
-                    os.chmod(tmp_path, 0o644)
+                    # state.json memuat nama guild, judul lagu, dan nama pendengar;
+                    # cukup dibaca panel (root), jangan world-readable (L3).
+                    os.chmod(tmp_path, 0o640)
                     with _RUNTIME_STATE_LOCK:
                         if seq >= _RUNTIME_STATE_LAST_SEQ:
                             _RUNTIME_STATE_LAST_SEQ = seq
@@ -674,7 +737,7 @@ def extract_stream(url: str) -> dict:
                     log.warning('Rate limit 429 pada extract_stream, retry setelah jeda 2s: %s', url)
                     time.sleep(2.0)
                     continue
-                raise ValueError('YouTube sedang membatasi permintaan bot (Rate Limit 429). Mohon tunggu beberapa saat.') from exc
+                raise TransientExtractionError('YouTube sedang membatasi permintaan bot (Rate Limit 429). Mohon tunggu beberapa saat.') from exc
             if any(k in msg_lower for k in ('confirm your age', 'age-restricted', 'age restricted')):
                 raise ValueError('Video terkena batasan usia YouTube (age-restricted). Butuh cookies.txt untuk memutar (simpan di direktori bot atau set YTDLP_COOKIES).') from exc
             raise
@@ -713,7 +776,7 @@ async def extract_tracks(query: str, requester: str) -> list[Track]:
                     log.warning('YouTube HTTP 429 rate limit saat ekstraksi metadata, backoff 2s (percobaan %d/%d): %s', attempt + 1, max_attempts, target)
                     await asyncio.sleep(2.0)
                     continue
-                raise ValueError('YouTube sedang membatasi permintaan bot (Rate Limit 429). Mohon tunggu beberapa saat.') from exc
+                raise TransientExtractionError('YouTube sedang membatasi permintaan bot (Rate Limit 429). Mohon tunggu beberapa saat.') from exc
             if any(k in msg_lower for k in ('confirm your age', 'age-restricted', 'age restricted')):
                 raise ValueError('Video terkena batasan usia YouTube (age-restricted). Butuh cookies.txt untuk memutar (simpan di direktori bot atau set YTDLP_COOKIES).') from exc
             if any(k in msg_lower for k in ('private video', 'video unavailable', 'is unavailable', 'not found')):
@@ -772,7 +835,7 @@ def _tracks_from_metadata(data: dict, requester: str, target: str) -> list[Track
                 dur = 0
             author = entry.get('uploader') or entry.get('channel') or entry.get('artist') or 'Unknown'
             tracks.append(Track(title, stable_url, requester, duration=dur, duration_str=format_duration(dur), author=author, stream_url=stream_url, stream_ts=stream_ts))
-            if len(tracks) >= 100:
+            if len(tracks) >= MAX_PLAYLIST_TRACKS:
                 break
         if not tracks and live_skipped > 0:
             raise ValueError('Video siaran langsung (livestream) tidak didukung oleh pemutar audio statis.')
@@ -1283,8 +1346,6 @@ def _check_same_voice(interaction: discord.Interaction) -> tuple[bool, str]:
     if not vc or vc_channel_id is None:
         return False, 'Bot tidak ada di voice channel.'
     user_ch_id = getattr(user_ch, 'id', None)
-    if 'Mock' in type(user_ch_id).__name__ and not isinstance(user_ch_id, (int, str)):
-        return True, ''
     if not user_ch or user_ch_id != vc_channel_id:
         return False, 'Kamu harus di voice channel yang sama dengan bot.'
     return True, ''
@@ -1726,7 +1787,7 @@ class MusicPanel(discord.ui.View):
                     state.consecutive_playback_errors = 0
             if has_queue:
                 await self.bot.advance(interaction.guild)
-                text = 'Melanjutkan pemutaran antrian lagu.'
+                text = self.bot._resume_result_text(vc, state)
             else:
                 text = 'Tidak ada lagu aktif atau antrian kosong.'
                 if not (vc and (vc.is_playing() or vc.is_paused())):
@@ -1761,9 +1822,7 @@ class MusicPanel(discord.ui.View):
             await self.bot._stop_player(interaction.guild)
             async with state.lock:
                 if state.current:
-                    state.history.append(state.current)
-                    if len(state.history) > 20:
-                        state.history.popleft()
+                    _retire_skipped(state, state.current)
                     state.current = None
             await self.bot.advance(interaction.guild)
             if not (vc and (vc.is_playing() or vc.is_paused())):
@@ -1784,12 +1843,10 @@ class MusicPanel(discord.ui.View):
                 elif state.queue:
                     state.consecutive_playback_errors = 0
                     if state.current:
-                        state.history.append(state.current)
-                        if len(state.history) > 20:
-                            state.history.popleft()
+                        _retire_skipped(state, state.current)
                         state.current = None
                     else:
-                        state.queue.popleft()
+                        _skip_queue_head(state)
                     advance_queue = True
                 elif not (vc and (vc.is_playing() or vc.is_paused())):
                     state.current = None
@@ -1905,6 +1962,7 @@ class MusicPanel(discord.ui.View):
                 return await interaction.followup.send('Mohon tunggu sebentar sebelum mengganti AutoPlay lagi.', ephemeral=True)
             state._last_autoplay_time = now
             state.autoplay = not state.autoplay
+            state.autoplay_candidates.clear()
             autoplay_on = state.autoplay
         self.bot._save_persistent_queue()
         status = 'Aktif' if autoplay_on else 'Nonaktif'
@@ -1969,7 +2027,9 @@ class MusicBot(discord.Client):
             raise SystemExit('libopus tidak ditemukan. Install libopus0.') from exc
         intents = discord.Intents.default()
         intents.voice_states = True
-        super().__init__(intents=intents)
+        # Judul lagu (dari YouTube) dan teks lain ikut dikirim ke channel; jangan
+        # biarkan "@everyone"/"@here"/mention di dalamnya mem-ping siapa pun.
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self._background_tasks: set[asyncio.Task] = set()
         self._exporter_task: asyncio.Task | None = None
         self._panel_view: MusicPanel | None = None
@@ -2076,7 +2136,8 @@ class MusicBot(discord.Client):
                     try:
                         with open(tmp_path, 'w', encoding='utf-8') as f:
                             json.dump(payload, f)
-                        os.chmod(tmp_path, 0o644)
+                        # Hanya dibaca bot sendiri saat restore.
+                        os.chmod(tmp_path, 0o600)
                         with lock:
                             if seq >= getattr(self, '_queue_last_seq', 0):
                                 self._queue_last_seq = seq
@@ -2134,12 +2195,6 @@ class MusicBot(discord.Client):
                 continue
             state = self.states.setdefault(gid, QueueState())
             has_restored = False
-            curr_data = g_data.get('current')
-            if curr_data and isinstance(curr_data, dict) and state.current is None:
-                track = _dict_to_track(curr_data)
-                if track:
-                    state.current = track
-                    has_restored = True
             queue_data = g_data.get('queue', [])
             if isinstance(queue_data, list) and not state.queue:
                 for item in queue_data[:MAX_QUEUE]:
@@ -2149,6 +2204,18 @@ class MusicBot(discord.Client):
                         has_restored = True
                         if len(state.queue) >= MAX_QUEUE:
                             break
+            # Lagu yang sedang diputar saat restart masuk ke KEPALA antrean, bukan
+            # state.current: setelah restart tidak ada yang berputar, dan current
+            # basi dibuang ke history oleh /play (_enqueue_tracks) maupun /pause
+            # sehingga lagu itu tidak pernah dilanjutkan.
+            curr_data = g_data.get('current')
+            if curr_data and isinstance(curr_data, dict) and state.current is None:
+                track = _dict_to_track(curr_data)
+                if track:
+                    state.queue.appendleft(track)
+                    while len(state.queue) > MAX_QUEUE:
+                        state.queue.pop()
+                    has_restored = True
             panel_message_id = g_data.get('panel_message_id')
             if panel_message_id is not None and not isinstance(panel_message_id, bool) and state.message is None:
                 try:
@@ -2219,6 +2286,8 @@ class MusicBot(discord.Client):
                 return False
             state.queue.extend(tracks)
             state.consecutive_playback_errors = 0
+            # Lagu pilihan user = seed baru; kandidat Mix lama sudah tidak relevan.
+            state.autoplay_candidates.clear()
             vc = guild.voice_client
             playing = bool(vc and (vc.is_playing() or vc.is_paused()))
             advancing = getattr(state, '_advancing', 0) > 0
@@ -2318,7 +2387,10 @@ class MusicBot(discord.Client):
                 try:
                     if getattr(self, '_stopping', False):
                         break
-                    await asyncio.to_thread(dump_runtime_state, self)
+                    # Di thread loop, bukan to_thread: dump_runtime_state membaca
+                    # struktur internal discord.py (guilds, voice states) yang
+                    # dimutasi loop; penulisan berkas sudah di-offload ke executor.
+                    dump_runtime_state(self)
                 except Exception as exc:
                     log.debug('Gagal menulis state runtime: %s', exc)
                 await asyncio.sleep(30)
@@ -2616,6 +2688,20 @@ class MusicBot(discord.Client):
             self._exporter_task.cancel()
         await super().close()
 
+    async def _play_error(self, interaction: discord.Interaction, msg: str):
+        """Kirim error /play hanya ke pengirimnya.
+
+        /play di-defer publik (pesan "Ditambahkan ke antrian" memang untuk
+        channel), dan followup PERTAMA selalu mengedit respons publik itu —
+        flag ephemeral diabaikan. Hapus dulu respons publiknya agar error tidak
+        tampil ke seluruh channel.
+        """
+        try:
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+        return await interaction.followup.send(msg, ephemeral=True)
+
     async def cmd_play(self, interaction: discord.Interaction, lagu: str):
         voice = getattr(interaction.user, 'voice', None)
         if not interaction.guild or not voice or not voice.channel:
@@ -2629,7 +2715,7 @@ class MusicBot(discord.Client):
             try:
                 perms = voice.channel.permissions_for(interaction.guild.me) if interaction.guild.me else None
                 if perms is not None and (not getattr(perms, 'connect', True) or not getattr(perms, 'speak', True)):
-                    return await interaction.followup.send('Bot butuh izin Connect + Speak di channel ini.', ephemeral=True)
+                    return await self._play_error(interaction, 'Bot butuh izin Connect + Speak di channel ini.')
                 if vc:
                     try:
                         await vc.disconnect(force=True)
@@ -2644,17 +2730,17 @@ class MusicBot(discord.Client):
                         await cur.disconnect(force=True)
                 except Exception:
                     pass
-                return await interaction.followup.send('Timeout masuk voice. Coba lagi.', ephemeral=True)
+                return await self._play_error(interaction, 'Timeout masuk voice. Coba lagi.')
             except discord.ClientException:
-                return await interaction.followup.send('Bot sudah dipakai di voice lain.', ephemeral=True)
+                return await self._play_error(interaction, 'Bot sudah dipakai di voice lain.')
             except Exception:
                 log.exception('Gagal masuk voice')
-                return await interaction.followup.send('Gagal masuk voice. Cek izin Connect/Speak.', ephemeral=True)
+                return await self._play_error(interaction, 'Gagal masuk voice. Cek izin Connect/Speak.')
         elif vc_channel_id != voice.channel.id:
-            return await interaction.followup.send('Bot sedang dipakai di voice channel lain.', ephemeral=True)
+            return await self._play_error(interaction, 'Bot sedang dipakai di voice channel lain.')
         gid = getattr(interaction.guild, 'id', None)
         if not gid:
-            return await interaction.followup.send('Server tidak valid.', ephemeral=True)
+            return await self._play_error(interaction, 'Server tidak valid.')
         try:
             tracks = await extract_tracks(lagu, interaction.user.mention)
             if not await self._enqueue_tracks(interaction.guild, tracks):
@@ -2667,7 +2753,7 @@ class MusicBot(discord.Client):
                         should_idle = False
                 if should_idle:
                     self._schedule_idle(interaction.guild, gen)
-                return await interaction.followup.send(f'Antrian penuh (maks {MAX_QUEUE} lagu).', ephemeral=True)
+                return await self._play_error(interaction, f'Antrian penuh (maks {MAX_QUEUE} lagu).')
             state = self.states.setdefault(gid, QueueState())
             if len(tracks) == 1:
                 msg = f'Ditambahkan ke antrian: **{discord.utils.escape_markdown(tracks[0].title or "Tanpa Judul")}**'
@@ -2709,7 +2795,7 @@ class MusicBot(discord.Client):
                     await self.refresh(state)
         except Exception as exc:
             log.warning('Pencarian gagal: %s', exc)
-            await interaction.followup.send(f'Gagal mencari atau memproses lagu: {exc}', ephemeral=True)
+            await self._play_error(interaction, f'Gagal mencari atau memproses lagu: {exc}')
             state = self.states.setdefault(gid, QueueState())
             async with state.lock:
                 if not state.current and not state.queue:
@@ -2749,12 +2835,10 @@ class MusicBot(discord.Client):
         await self._stop_player(interaction.guild)
         async with state.lock:
             if state.current:
-                state.history.append(state.current)
-                if len(state.history) > 20:
-                    state.history.popleft()
+                _retire_skipped(state, state.current)
                 state.current = None
-            elif state.queue:
-                state.queue.popleft()
+            else:
+                _skip_queue_head(state)
         await self.advance(interaction.guild)
         async with state.lock:
             should_idle = not state.queue and not state.current and not (vc and (vc.is_playing() or vc.is_paused())) and getattr(state, '_advancing', 0) == 0
@@ -2904,6 +2988,7 @@ class MusicBot(discord.Client):
                 return await interaction.followup.send('Mohon tunggu sebentar sebelum mengganti AutoPlay lagi.', ephemeral=True)
             state._last_autoplay_time = now
             state.autoplay = not state.autoplay
+            state.autoplay_candidates.clear()
             autoplay_on = state.autoplay
         self._save_persistent_queue()
         status = 'Aktif' if autoplay_on else 'Nonaktif'
@@ -2926,6 +3011,12 @@ class MusicBot(discord.Client):
                 if clear_queue:
                     state.queue.clear()
                     state.history.clear()
+                    state.autoplay_candidates.clear()
+                elif state.current is not None and not any(t is state.current for t in state.queue):
+                    # Keluar tanpa reset (AFK timeout, dikick, koneksi voice putus):
+                    # lagu yang sedang diputar jangan lenyap — taruh di kepala
+                    # antrean agar lanjut saat bot dipanggil lagi.
+                    state.queue.appendleft(state.current)
                 state.current = None
                 # Jangan cancel task yang sedang menjalankan quit_voice (mis. afk_task atau idle_task).
                 # Bila task meng-cancel dirinya sendiri, await berikutnya langsung melempar CancelledError
@@ -3085,13 +3176,20 @@ class MusicBot(discord.Client):
                     state.consecutive_playback_errors = 0
             if has_queue:
                 await self.advance(interaction.guild)
-                await interaction.followup.send('Melanjutkan pemutaran antrian lagu.', ephemeral=True)
+                await interaction.followup.send(self._resume_result_text(vc, state), ephemeral=True)
             else:
                 async with state.lock:
                     gen = state.generation
                 self._schedule_idle(interaction.guild, gen)
                 await interaction.followup.send('Tidak ada lagu yang aktif atau antrian kosong.', ephemeral=True)
         await self.refresh(state)
+
+    @staticmethod
+    def _resume_result_text(vc, state: QueueState) -> str:
+        """Pesan /pause setelah advance(): jangan klaim melanjutkan bila tidak ada yang diputar."""
+        if vc.is_playing() or vc.is_paused() or getattr(state, '_advancing', 0) > 0:
+            return 'Melanjutkan pemutaran antrian lagu.'
+        return 'Tidak ada lagu yang bisa diputar dari antrian.'
 
     async def cmd_volume(self, interaction: discord.Interaction, tingkat: int):
         if not _check_guild_only(interaction):
@@ -3425,7 +3523,6 @@ class MusicBot(discord.Client):
         gen0 = state.generation  # F2: deteksi /stop atau reconnect di tengah jalan
         loop = asyncio.get_running_loop()
         consecutive_errors = 0
-        autoplay_candidates: list[Track] = []
         autoplay_failed_urls: set[str] = set()
         gid = getattr(guild, 'id', None)
         g_name = getattr(guild, 'name', gid or 'unknown')
@@ -3484,17 +3581,16 @@ class MusicBot(discord.Client):
                             played_urls.add(state.current.url)
                     played_urls.update(autoplay_failed_urls)
 
-                    next_track = next((c for c in autoplay_candidates
-                                       if c.url not in played_urls), None)
+                    async with state.lock:
+                        next_track = _take_autoplay_candidate(state, played_urls)
                     if next_track is None:
                         candidates = await fetch_recommendations(
                             seed_titles, played_urls, seed_urls=seed_urls)
                         async with state.lock:
                             if state.queue:
                                 continue
-                        autoplay_candidates = [c for c in candidates if c.url not in played_urls]
-                        next_track = next((c for c in autoplay_candidates
-                                           if c.url not in played_urls), None)
+                            state.autoplay_candidates = [c for c in candidates if c.url not in played_urls]
+                            next_track = _take_autoplay_candidate(state, played_urls)
 
                     if next_track is None:
                         log.info('AutoPlay: tidak ada rekomendasi baru, pemutaran berhenti.')
@@ -3548,6 +3644,8 @@ class MusicBot(discord.Client):
                                 idx = next((i for i, t in enumerate(state.queue) if t is next_track), None)
                                 if idx is not None:
                                     del state.queue[idx]
+                            if state.loop_mode == 'queue' and state.queue and not any(t is next_track for t in state.queue):
+                                state.queue.append(next_track)
                         elif state.loop_mode in ('track', 'queue') and state.current is next_track:
                             # Loop track / single-track loop queue: skip manual harus keluar
                             # dari track yang sama, bukan mengulangnya lagi.
@@ -3721,6 +3819,10 @@ class MusicBot(discord.Client):
                 return
             except Exception as exc:
                 consecutive_errors += 1
+                # Timeout sengaja TIDAK dianggap sementara: thread yt-dlp yang timeout
+                # tetap hidup (H3), jadi mencoba URL yang sama lagi hanya menumpuk
+                # thread zombie sampai MAX_EXTRACT_THREADS penuh.
+                transient = isinstance(exc, TransientExtractionError)
                 log.warning('Tidak bisa memutar (%d/3): %s (penyebab: %s)', consecutive_errors, next_track.title, exc)
                 try:
                     if next_track:
@@ -3730,6 +3832,15 @@ class MusicBot(discord.Client):
                     pass
                 if is_autoplay and next_track:
                     autoplay_failed_urls.add(next_track.url)
+                if transient and not is_autoplay and consecutive_errors < MAX_TRACK_RETRIES:
+                    async with state.lock:
+                        skip_requested = state._skip_pending
+                    if not skip_requested:
+                        # Gangguan sementara (server sibuk / rate limit 429), bukan
+                        # lagu rusak: jangan ubah urutan antrean. Tunggu sebentar lalu
+                        # coba lagu yang sama; tetap dihitung ke MAX_TRACK_RETRIES.
+                        await asyncio.sleep(TRANSIENT_RETRY_DELAY * consecutive_errors)
+                        continue
                 async with state.lock:
                     # F1: konsumsi _skip_pending apa pun. Bila tidak, skip yang
                     # menargetkan track gagal ini tetap "menggantung" dan ikut
@@ -3737,8 +3848,9 @@ class MusicBot(discord.Client):
                     state._skip_pending = False
                     if consecutive_errors >= MAX_TRACK_RETRIES:
                         break
-                    # Gagal: jangan sentuh history/queue (C3); biarkan track di head untuk retry manual.
-                    # Putar kandidat berikutnya hanya bila masih ada track lain.
+                    # Gagal permanen (C3): jangan buang ke history. Pindahkan track ke
+                    # ekor antrean agar lagu lain tetap jalan dan track ini dicoba lagi
+                    # nanti; bila tidak ada track lain, berhenti.
                     if state.queue and any(t is next_track for t in state.queue) and len(state.queue) > 1:
                         idx = next((i for i, t in enumerate(state.queue) if t is next_track), None)
                         if idx is not None:
@@ -3749,7 +3861,7 @@ class MusicBot(discord.Client):
                         if len(state.history) > 20:
                             state.history.popleft()
                         state.current = None
-                    elif is_autoplay and any(c.url not in autoplay_failed_urls for c in autoplay_candidates):
+                    elif is_autoplay and any(c.url not in autoplay_failed_urls for c in state.autoplay_candidates):
                         pass
                     else:
                         if consecutive_errors > 0:
@@ -4086,14 +4198,11 @@ class MusicBot(discord.Client):
             if vc and getattr(vc, 'channel', None):
                 raw_members = getattr(vc.channel, 'members', [])
                 humans = [m for m in raw_members if not getattr(m, 'bot', False)]
+                # Penentu satu-satunya adalah room yang MASIH kosong saat timer
+                # habis. generation tidak dipakai: skip/back membump generation
+                # tanpa ada yang masuk room, dan task ini sudah dibatalkan oleh
+                # on_voice_state_update (user masuk) maupun quit_voice.
                 if not humans:
-                    state = self.states.get(gid)
-                    if state and generation != state.generation:
-                        qv = getattr(self, 'quit_voice', None)
-                        if getattr(qv, '_is_fuzz_mock', False) or (isinstance(getattr(qv, '__class__', None), type) and qv.__class__.__name__ == 'AsyncMock'):
-                            pass
-                        elif generation == 0 or len(humans) > 0:
-                            return
                     dur_str = "3 menit" if timeout == 180 else (f"{int(timeout // 60)} menit" if timeout >= 60 else f"{int(timeout)} detik")
                     log.info("AFK timeout: room kosong selama %s, bot keluar dari voice channel", dur_str)
                     await self.quit_voice(guild, clear_queue=False)

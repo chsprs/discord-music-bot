@@ -1,12 +1,18 @@
 # Dependensi langsung discord-music-bot.
 #
 # File ini adalah SUMBER untuk requirements.txt yang hash-locked.
-# Jangan edit requirements.txt manual — regenerate lewat:
+# Jangan edit requirements.txt manual — regenerate lewat (butuh uv):
 #
-#   pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+#   uv pip compile requirements.in --universal --generate-hashes --python-version 3.10 -o requirements.txt
 #
-# yt-dlp sengaja tidak di-pin di sini supaya tiap pip-compile mengambil
-# rilis terbaru (itulah cara me-bump yt-dlp). discord.py di-pin karena
-# API-nya sensitif terhadap perubahan mayor.
+# --universal WAJIB: lockfile harus memuat dependensi bermarker untuk SEMUA
+# versi Python yang didukung (>=3.10), mis. audioop-lts (Python >=3.13) dan
+# async-timeout (Python <3.11). pip-compile biasa hanya mengunci dependensi
+# untuk interpreter yang menjalankannya, sehingga `pip install --require-hashes`
+# gagal di versi Python lain.
+#
+# yt-dlp sengaja tidak di-pin di sini supaya tiap compile dengan
+# --upgrade-package yt-dlp mengambil rilis terbaru (itulah cara me-bump yt-dlp).
+# discord.py di-pin karena API-nya sensitif terhadap perubahan mayor.
 discord.py[voice]==2.7.1
 yt-dlp[default]

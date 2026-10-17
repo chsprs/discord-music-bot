@@ -1,13 +1,26 @@
 import asyncio
+import atexit
 from collections import deque
 import json
 import os
+import shutil
 import signal
 import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock, PropertyMock
+
+# Isolasi path runtime SEBELUM bot/panel diimpor. Tanpa ini suite menulis dan
+# menghapus /run/discord-music/{queue_state,state,listeners}.json serta
+# panel.env/.env milik bot yang sedang hidup (install.sh menjalankan suite di
+# mesin produksi). setdefault: nilai dari install.sh tetap dihormati.
+_ISOLATED_RUNTIME = tempfile.mkdtemp(prefix='discord-music-tests-')
+atexit.register(shutil.rmtree, _ISOLATED_RUNTIME, True)
+for _key, _name in (('QUEUE_STATE_FILE', 'queue_state.json'), ('BOT_STATE_FILE', 'state.json'),
+                    ('PANEL_ENV', 'panel.env'), ('BOT_CONFIG', 'bot.env'),
+                    ('UPDATE_LOG', 'last_update.log'), ('BOT_VENV', 'venv')):
+    os.environ.setdefault(_key, os.path.join(_ISOLATED_RUNTIME, _name))
 
 import discord
 
@@ -350,7 +363,8 @@ class MusicTests(unittest.TestCase):
 
         with patch.object(bot, 'refresh', new=AsyncMock()):
             asyncio.run(bot.quit_voice(guild, clear_queue=False))
-            self.assertEqual(len(state.queue), 1)
+            # Lagu yang sedang diputar tidak lenyap: kembali ke kepala antrean.
+            self.assertEqual([t.title for t in state.queue], ['track0', 'track1'])
             self.assertIsNone(state.current)
 
     def test_quit_voice_clears_cache_when_clear_queue_true(self):
@@ -2333,14 +2347,17 @@ class PersistentQueueTests(unittest.TestCase):
             self.assertIn(guild_id, bot2.states)
             restored_state = bot2.states[guild_id]
             self.assertIsInstance(restored_state, GuildState)
-            self.assertIsNotNone(restored_state.current)
-            self.assertEqual(restored_state.current.title, 'Lagu Aktif')
-            self.assertEqual(restored_state.current.url, 'https://youtube.com/watch?v=active')
-            self.assertEqual(restored_state.current.requester, 'User1')
-            self.assertEqual(restored_state.current.duration, 180)
-            self.assertEqual(len(restored_state.queue), 2)
-            self.assertEqual(restored_state.queue[0].title, 'Lagu Antri 1')
-            self.assertEqual(restored_state.queue[1].title, 'Lagu Antri 2')
+            # Lagu aktif saat restart dipulihkan ke KEPALA antrean (tidak ada
+            # yang berputar setelah restart), bukan sebagai current basi.
+            self.assertIsNone(restored_state.current)
+            restored_active = restored_state.queue[0]
+            self.assertEqual(restored_active.title, 'Lagu Aktif')
+            self.assertEqual(restored_active.url, 'https://youtube.com/watch?v=active')
+            self.assertEqual(restored_active.requester, 'User1')
+            self.assertEqual(restored_active.duration, 180)
+            self.assertEqual(len(restored_state.queue), 3)
+            self.assertEqual(restored_state.queue[1].title, 'Lagu Antri 1')
+            self.assertEqual(restored_state.queue[2].title, 'Lagu Antri 2')
 
             # Berkas di-repersist setelah restore agar tahan restart/crash berikutnya
             self.assertTrue(os.path.exists(queue_file))
@@ -2472,7 +2489,7 @@ class PersistentQueueTests(unittest.TestCase):
 
             self.assertIn(101, bot2.states)
             self.assertIn(102, bot2.states)
-            self.assertEqual(bot2.states[101].current.title, 'G1 Track')
+            self.assertEqual(bot2.states[101].queue[0].title, 'G1 Track')
             self.assertEqual(len(bot2.states[102].queue), 1)
             self.assertEqual(bot2.states[102].queue[0].title, 'G2 Queue')
 
@@ -2551,7 +2568,8 @@ class PersistentQueueTests(unittest.TestCase):
         interaction.guild.id = 2222
         interaction.response.defer = AsyncMock()
         interaction.followup.send = AsyncMock()
-        with patch.object(bot, '_save_persistent_queue') as mock_save:
+        with patch.object(bot, '_save_persistent_queue') as mock_save, \
+             patch('bot._check_same_voice', return_value=(True, '')):
             asyncio.run(bot.cmd_loop(interaction, 'track'))
             mock_save.assert_called_once()
             self.assertEqual(bot.states[2222].loop_mode, 'track')
@@ -2604,7 +2622,8 @@ class PersistentQueueTests(unittest.TestCase):
         interaction.guild.id = 4444
         interaction.response.defer = AsyncMock()
         interaction.followup.send = AsyncMock()
-        with patch.object(bot, '_save_persistent_queue') as mock_save:
+        with patch.object(bot, '_save_persistent_queue') as mock_save, \
+             patch('bot._check_same_voice', return_value=(True, '')):
             asyncio.run(bot.cmd_autoplay(interaction))
             mock_save.assert_called_once()
             self.assertTrue(bot.states[4444].autoplay)
@@ -3826,30 +3845,32 @@ class AuditOptimizationRegressionTests(unittest.TestCase):
              patch.object(bot, '_announce'):
             asyncio.run(worker())
 
-    def test_afk_disconnect_honors_generation_zero_change(self):
-        """Wave 3: _afk_disconnect dengan generation=0 tidak memutus voice jika state.generation dinaikkan."""
+    def test_afk_disconnect_decided_by_room_not_generation(self):
+        """_afk_disconnect: generation berubah (0 -> 1) tidak relevan; yang menentukan
+        adalah ada/tidaknya manusia di room saat timer habis (dulu dibedakan lewat
+        deteksi AsyncMock di kode produksi)."""
         bot = MusicBot()
         guild = MagicMock(id=99102)
         vc = MagicMock()
-        vc.channel.members = []
         guild.voice_client = vc
-
         state = QueueState()
-        state.generation = 1  # Berubah dari 0 ke 1
+        state.generation = 1
         bot.states[guild.id] = state
 
-        quit_called = False
+        quits = []
+
         async def mock_quit(*args, **kwargs):
-            nonlocal quit_called
-            quit_called = True
+            quits.append(args)
 
         bot.quit_voice = mock_quit
 
-        async def worker():
-            await bot._afk_disconnect(guild, generation=0, timeout=0.001)
+        vc.channel.members = [MagicMock(bot=False)]
+        asyncio.run(bot._afk_disconnect(guild, generation=0, timeout=0.001))
+        self.assertEqual(quits, [], 'ada pendengar manusia: bot tidak boleh keluar')
 
-        asyncio.run(worker())
-        self.assertFalse(quit_called)
+        vc.channel.members = []
+        asyncio.run(bot._afk_disconnect(guild, generation=0, timeout=0.001))
+        self.assertEqual(len(quits), 1, 'room kosong saat timer habis: bot harus keluar')
 
     def test_run_extract_cancellation_releases_slot(self):
         """Wave 3: Pembatalan run_extract coroutine sebelum thread jalan tidak membocorkan slot."""
@@ -5116,7 +5137,7 @@ class Wave10RemediationTests(unittest.TestCase):
             self.assertGreater(bot_mod._RUNTIME_STATE_LAST_SEQ, 80)
 
     def test_wave10_dump_runtime_state_tmp_chmod(self):
-        """Wave 10: dump_runtime_state menyetel izin 0644 pada state.json."""
+        """state.json 0640 (tidak world-readable), listeners.json 0644 (dibaca update.sh)."""
         import bot as bot_mod
         with tempfile.TemporaryDirectory() as td:
             s_file = os.path.join(td, "state.json")
@@ -5126,7 +5147,10 @@ class Wave10RemediationTests(unittest.TestCase):
                 time.sleep(0.05)
             if os.path.exists(s_file):
                 mode = os.stat(s_file).st_mode & 0o777
-                self.assertEqual(mode, 0o644)
+                self.assertEqual(mode, 0o640)
+            l_file = os.path.join(td, "listeners.json")
+            if os.path.exists(l_file):
+                self.assertEqual(os.stat(l_file).st_mode & 0o777, 0o644)
 
     def test_wave10_buffered_audio_source_cleanup_nonblocking(self):
         """Wave 10: BufferedAudioSource.cleanup tidak memanggil join dengan timeout > 0."""
@@ -5291,7 +5315,7 @@ class Wave10RemediationTests(unittest.TestCase):
         self.assertIsNone(state.empty_task)
 
     def test_wave11_save_persistent_queue_chmod_0644(self):
-        """Wave 11: _save_persistent_queue menerapkan os.chmod 0644 pada berkas queue_state.json."""
+        """queue_state.json hanya dibaca bot sendiri: 0600."""
         with tempfile.TemporaryDirectory() as tmpdir:
             q_path = os.path.join(tmpdir, "queue_state.json")
             orig_umask = os.umask(0o077)
@@ -5309,7 +5333,7 @@ class Wave10RemediationTests(unittest.TestCase):
 
                 self.assertTrue(os.path.exists(q_path))
                 mode = os.stat(q_path).st_mode & 0o777
-                self.assertEqual(mode, 0o644)
+                self.assertEqual(mode, 0o600)
             finally:
                 os.umask(orig_umask)
 
@@ -5363,7 +5387,8 @@ class Wave10RemediationTests(unittest.TestCase):
         bot.advance = AsyncMock()
         bot.refresh = AsyncMock()
 
-        asyncio.run(bot.cmd_autoplay(interaction))
+        with patch('bot._check_same_voice', return_value=(True, '')):
+            asyncio.run(bot.cmd_autoplay(interaction))
         self.assertTrue(state.autoplay)
         bot.advance.assert_called_once_with(guild)
 
@@ -6241,8 +6266,8 @@ class Wave20RemediationTests(unittest.TestCase):
         self.assertIsNone(_clean_channel_id(-5))
         self.assertIsNone(_clean_channel_id("abc"))
 
-    def test_wave23_check_same_voice_mock_overhead(self):
-        """Wave 23: _check_same_voice mendeteksi Mock tanpa impor unittest.mock."""
+    def test_check_same_voice_has_no_mock_bypass(self):
+        """_check_same_voice tidak lagi meloloskan channel id bertipe Mock (hack test di produksi)."""
         from bot import _check_same_voice
         interaction = MagicMock()
         interaction.guild = MagicMock()
@@ -6251,8 +6276,10 @@ class Wave20RemediationTests(unittest.TestCase):
         interaction.guild.voice_client = vc
         interaction.user.voice.channel.id = MagicMock()
         ok, msg = _check_same_voice(interaction)
-        self.assertTrue(ok)
-        self.assertEqual(msg, "")
+        self.assertFalse(ok)
+        self.assertIn('voice channel yang sama', msg)
+        interaction.user.voice.channel.id = 1122
+        self.assertEqual(_check_same_voice(interaction), (True, ''))
 
     def test_wave23_embed_avatar_url_getattr_safety(self):
         """Wave 23: MusicBot.embed aman dari AttributeError bila display_avatar tidak memiliki url."""

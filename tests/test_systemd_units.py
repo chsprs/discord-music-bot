@@ -69,6 +69,13 @@ class PanelUnitHardeningTests(unittest.TestCase):
                 return value.strip()
         return None
 
+    def test_panel_does_not_run_updater_owned_venv(self):
+        """Panel root tidak boleh mengeksekusi interpreter venv milik user updater."""
+        exec_start = self._directive('ExecStart')
+        self.assertIsNotNone(exec_start)
+        self.assertNotIn('/venv/', exec_start)
+        self.assertTrue(exec_start.startswith('/usr/bin/python3 '), exec_start)
+
     def test_umask_is_restrictive(self):
         self.assertIn('UMask=0077', self.unit,
                       'UMask harus 0077 agar berkas panel tidak world-readable')
@@ -111,6 +118,12 @@ class BotUnitHardeningTests(unittest.TestCase):
     def test_bot_writes_only_runtime_dir(self):
         """Bot hanya perlu tulis ke RuntimeDirectory (state exporter)."""
         self.assertIn('RuntimeDirectory=discord-music', self.unit)
+
+    def test_runtime_dir_survives_restart(self):
+        """queue_state.json ada di RuntimeDirectory; default systemd menghapusnya saat stop."""
+        directive = self._directive('RuntimeDirectoryPreserve')
+        self.assertIn(directive, ('restart', 'yes'),
+                      'RuntimeDirectoryPreserve harus restart/yes agar persistent queue selamat dari restart')
 
     def test_bot_umask_is_restrictive(self):
         """L3: state.json memuat nama guild/lagu/pendengar — jangan world-readable."""

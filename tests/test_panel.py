@@ -1,7 +1,9 @@
+import atexit
 import http.client
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -12,6 +14,17 @@ import threading
 import time
 import unittest
 import unittest.mock
+
+# Isolasi path runtime SEBELUM bot/panel diimpor. Tanpa ini suite menulis dan
+# menghapus /run/discord-music/{queue_state,state,listeners}.json serta
+# panel.env/.env milik bot yang sedang hidup (install.sh menjalankan suite di
+# mesin produksi). setdefault: nilai dari install.sh tetap dihormati.
+_ISOLATED_RUNTIME = tempfile.mkdtemp(prefix='discord-music-tests-')
+atexit.register(shutil.rmtree, _ISOLATED_RUNTIME, True)
+for _key, _name in (('QUEUE_STATE_FILE', 'queue_state.json'), ('BOT_STATE_FILE', 'state.json'),
+                    ('PANEL_ENV', 'panel.env'), ('BOT_CONFIG', 'bot.env'),
+                    ('UPDATE_LOG', 'last_update.log'), ('BOT_VENV', 'venv')):
+    os.environ.setdefault(_key, os.path.join(_ISOLATED_RUNTIME, _name))
 
 import panel
 
@@ -1345,8 +1358,11 @@ class PanelListenerAwareUpdateTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state_file = os.path.join(self.tmp.name, 'state.json')
-        os.environ['BOT_STATE_FILE'] = self.state_file
-        self.addCleanup(os.environ.pop, 'BOT_STATE_FILE', None)
+        # patch.dict memulihkan nilai sebelumnya (path terisolasi), bukan pop:
+        # tanpa BOT_STATE_FILE test berikutnya jatuh ke /run/discord-music.
+        env_patcher = unittest.mock.patch.dict(os.environ, {'BOT_STATE_FILE': self.state_file})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
         # M7: read_bot_runtime_info() short-circuit ke "offline" bila
         # bot_state() != 'active'. Tanpa mock ini, hasil test bergantung pada
         # status service di mesin yang menjalankannya (di STB bot aktif -> lulus,
@@ -1448,3 +1464,81 @@ class PanelPortAndNonceRegressionTests(unittest.TestCase):
                 self.assertTrue(mock_close.called)
             with open(target) as f:
                 self.assertIn('PANEL_PASSWORD=newpass', f.read())
+
+
+class PanelUpdatePrivilegeTests(unittest.TestCase):
+    """Panel (root) tidak boleh menjalankan update.sh/pip sebagai root."""
+
+    def _run_inner(self, fake_run):
+        with unittest.mock.patch.object(panel, 'UPDATE_RUNNER', None), \
+             unittest.mock.patch('panel.os.path.exists',
+                                 side_effect=lambda p: p == '/opt/discord-music-bot/update.sh'), \
+             unittest.mock.patch('panel.os.access', return_value=True), \
+             unittest.mock.patch('panel.subprocess.run', side_effect=fake_run):
+            return panel._run_update_inner()
+
+    def test_update_goes_through_updater_unit(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return unittest.mock.MagicMock(returncode=0, stdout='', stderr='')
+
+        ok, _ = self._run_inner(fake_run)
+        self.assertTrue(ok)
+        self.assertEqual(calls, [['systemctl', '--no-ask-password', 'start', panel.UPDATE_UNIT]])
+        self.assertEqual(panel.UPDATE_UNIT, 'discord-music-update.service')
+        self.assertFalse(any('/opt/discord-music-bot/update.sh' in c for c in calls),
+                         'update.sh dijalankan langsung sebagai root')
+
+    def test_update_unit_failure_reported(self):
+        def fake_run(cmd, **kwargs):
+            return unittest.mock.MagicMock(returncode=1, stdout='', stderr='Job failed')
+
+        ok, out = self._run_inner(fake_run)
+        self.assertFalse(ok)
+        self.assertIn('Job failed', out)
+
+    def test_update_unit_timeout_keeps_running_in_background(self):
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 90)
+
+        ok, out = self._run_inner(fake_run)
+        self.assertFalse(ok)
+        self.assertIn('latar belakang', out)
+
+    def test_fallback_pip_comes_from_bot_venv_as_updater(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return unittest.mock.MagicMock(returncode=0, stdout='', stderr='')
+
+        with unittest.mock.patch.object(panel, 'UPDATE_RUNNER', None), \
+             unittest.mock.patch.object(panel, 'bot_state', return_value='inactive'), \
+             unittest.mock.patch('panel.os.path.exists', return_value=False), \
+             unittest.mock.patch('panel.os.access', return_value=False), \
+             unittest.mock.patch('panel.subprocess.run', side_effect=fake_run):
+            panel._run_update_inner()
+        self.assertEqual(calls[0][:3], ['sudo', '-u', 'discord-music-updater'])
+        self.assertEqual(calls[0][3], os.path.join(panel.BOT_VENV, 'bin', 'pip'))
+
+    def test_venv_version_read_from_metadata_without_import(self):
+        with tempfile.TemporaryDirectory() as venv:
+            dist = os.path.join(venv, 'lib', 'python3.11', 'site-packages', 'yt_dlp-2031.1.2.dist-info')
+            os.makedirs(dist)
+            with open(os.path.join(dist, 'METADATA'), 'w', encoding='utf-8') as fh:
+                fh.write('Metadata-Version: 2.1\nName: yt-dlp\nVersion: 2031.1.2\n')
+            # Modul yt_dlp palsu di venv: tidak boleh pernah diimpor oleh panel.
+            pkg = os.path.join(venv, 'lib', 'python3.11', 'site-packages', 'yt_dlp')
+            os.makedirs(pkg)
+            with open(os.path.join(pkg, '__init__.py'), 'w', encoding='utf-8') as fh:
+                fh.write('raise RuntimeError("kode venv dieksekusi")\n')
+            with unittest.mock.patch.object(panel, 'BOT_VENV', venv), \
+                 unittest.mock.patch.object(panel, '_ytdlp_version_cache', None):
+                self.assertEqual(panel._venv_ytdlp_version(), '2031.1.2')
+                self.assertEqual(panel.ytdlp_version(), '2031.1.2')
+
+    def test_venv_version_missing_venv_falls_back(self):
+        with unittest.mock.patch.object(panel, 'BOT_VENV', '/nonexistent/venv'):
+            self.assertIsNone(panel._venv_ytdlp_version())
