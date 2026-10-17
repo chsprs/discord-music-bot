@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.7-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-pinned-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-499%2F499%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-514%2F514%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -30,7 +30,7 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
 
 ## ✨ Fitur Utama
 
-- **Hemat Memori & CPU:** Konsumsi RAM stabil ~46 MB pada arsitektur STB ARM64 (Amlogic S905X / H96 Max / HG680P) tanpa beban video rendering.
+- **Hemat Memori & CPU:** Konsumsi RAM stabil ~46 MB pada arsitektur STB ARM64 (Amlogic S905X / H96 Max / HG680P) tanpa beban video rendering. Bot hanya berlangganan event gateway yang dipakai (`guilds`, `voice_states`, `dm_messages`) dan tidak menyimpan cache pesan, jadi obrolan ramai di server tidak membebani CPU/RAM STB.
 - **Bebas Iklan (Ad-Free):** Memutar direct stream audio dari CDN Google (`googlevideo.com`), bebas dari gangguan pre-roll dan mid-roll iklan.
 - **Kualitas Audio Studio (Studio Quality):**
   - Profil enkoder Opus full-band (`-application audio`) dengan kualitas kompresi algoritma maksimal (`-compression_level 10`).
@@ -43,7 +43,7 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
   - Mendukung tautan video tunggal maupun playlist YouTube / YouTube Music (`list=...`).
   - Ekstraksi metadata instan (<2 detik) hingga 100 lagu per playlist.
   - Video private / dihapus otomatis dilewati tanpa menghentikan pemutaran (`ignoreerrors`).
-  - Ekstraksi stream secara *lazy* (hanya saat giliran lagu dimulai) agar URL CDN tidak kedaluwarsa dan menghemat bandwidth.
+  - **Tanpa jeda antar lagu:** stream lagu berikutnya (antrean, loop, atau kandidat AutoPlay) disiapkan di latar belakang ±60 detik sebelum lagu yang sedang diputar habis, sehingga lagu berikutnya langsung mulai tanpa menunggu ekstraksi (±2–4 detik di server x86, lebih lama di STB). Kesegaran URL CDN dicek dari parameter `expire` milik YouTube, jadi URL yang masih berlaku tidak diekstraksi ulang.
 - **Fitur Cerdas (AutoPlay, Loop, Shuffle & History):**
   - **AutoPlay (YouTube Mix):** Saat antrian/playlist habis, bot mengambil rekomendasi langsung dari **YouTube Mix** — algoritma radio resmi YouTube (`watch?v=<id>&list=RD<id>&start_radio=1`) yang di-seed dari lagu yang baru diputar, sehingga hasilnya mengikuti "radio" asli YouTube, bukan sekadar pencarian kata kunci. Bila ekstraksi Mix gagal (video tak tersedia / radio tidak dapat dibuka), bot otomatis **fallback ke pencarian teks** berbasis riwayat lagu sebelumnya. Semua kandidat disaring terhadap lagu yang pernah diputar (**anti-ulang**) agar tidak mengulang lagu yang sama; bila tidak ada kandidat baru, pemutaran berhenti dengan rapi. Jumlah lagu yang ditarik per rekomendasi diatur lewat `MIX_RESULT_LIMIT` (default `15`).
   - **Loop Mode:** Siklus pengulangan 3-arah: *Track* (ulang 1 lagu), *Queue* (ulang seluruh antrian), atau *Off*.
@@ -154,7 +154,7 @@ Skrip installer otomatis:
 3. Membuat user sistem non-root `discord-music-updater`, mengatur ownership `venv`/log, dan memasang aturan sudoers terbatas (`systemctl restart/is-active discord-music.service` saja).
 4. Memasang service systemd `discord-music.service`, `discord-music-panel.service`, dan `discord-music-update.service` + timer.
 5. Mengaktifkan auto-start saat boot sistem.
-6. Menjalankan verifikasi unit test mandiri (**499/499 passing**) sebagai user non-root dengan path runtime sementara, sehingga tidak menyentuh antrean/state bot yang sedang hidup.
+6. Menjalankan verifikasi unit test mandiri (**514/514 passing**) sebagai user non-root dengan path runtime sementara, sehingga tidak menyentuh antrean/state bot yang sedang hidup.
 7. Menyalakan Web Control Panel di port `9130` dengan **password acak** (dicetak di akhir instalasi) kecuali `PANEL_PASSWORD` sudah diberikan, mis. `sudo PANEL_PASSWORD='rahasia' ./install.sh`.
 
 ---
@@ -253,7 +253,8 @@ Saat membuat aplikasi bot di [Discord Developer Portal](https://discord.com/deve
     ├── test_update.py            # Unit test skrip update.sh & timer behaviour
     ├── test_systemd_units.py     # Unit test validasi hardening unit systemd
     ├── test_lockfile.py          # Lockfile hash-locked universal (Python 3.10–3.13+)
-    └── test_audit_fixes.py       # Regresi temuan audit (antrean, AutoPlay, ekstraksi, panel)
+    ├── test_audit_fixes.py       # Regresi temuan audit (antrean, AutoPlay, ekstraksi, panel)
+    └── test_prefetch.py          # Prefetch stream lagu berikutnya & intent gateway minimal
 ```
 
 ---
@@ -269,7 +270,7 @@ cd /opt/discord-music-bot
 
 Hasil uji:
 ```
-Ran 499 tests in ~70s
+Ran 514 tests in ~70s
 
 OK
 ```

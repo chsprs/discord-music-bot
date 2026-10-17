@@ -132,6 +132,11 @@ class QueueState:
     refresh_task: asyncio.Task | None = None
     _refresh_pending: bool = False
     announce_task: asyncio.Task | None = None
+    # Prefetch stream lagu berikutnya (lihat MusicBot._prefetch_next).
+    prefetch_task: asyncio.Task | None = None
+    prefetch_job: asyncio.Future | None = None  # ekstraksi prefetch yang sedang jalan
+    prefetch_track: Track | None = None  # track yang sedang diekstraksi prefetch_job
+    track_started_at: float | None = None  # time.monotonic() saat current mulai diputar
     _advance_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _advance_pending: bool = False
     _last_skip_time: float = 0.0
@@ -184,6 +189,57 @@ def _take_autoplay_candidate(state: QueueState, played_urls: set[str]) -> Track 
             return candidate
     return None
 
+
+def _autoplay_seeds(state: QueueState) -> tuple[list[str], list[str], set[str]]:
+    """(judul seed, URL seed, URL yang sudah diputar) untuk AutoPlay. Panggil di dalam state.lock."""
+    recent = list(state.history)[-5:]
+    seed_titles = [t.title for t in recent]
+    seed_urls = [t.url for t in recent]
+    played_urls = {t.url for t in list(state.history)[-20:]}
+    if state.current:
+        seed_titles.append(state.current.title)
+        seed_urls.append(state.current.url)
+        played_urls.add(state.current.url)
+    return seed_titles, seed_urls, played_urls
+
+
+def _stream_expiry(url: str | None) -> float | None:
+    """Waktu kedaluwarsa URL googlevideo (parameter expire=, detik epoch)."""
+    if not url:
+        return None
+    match = _STREAM_EXPIRE_RE.search(url)
+    return float(match.group(1)) if match else None
+
+
+def _stream_fresh(track: Track, now: float | None = None) -> bool:
+    """Apakah URL stream ter-cache masih berlaku sampai track ini selesai diputar?
+
+    Memakai expire= milik YouTube (umumnya ±6 jam): batas tetap 30 menit dulu
+    memicu ekstraksi ulang untuk URL yang masih berlaku berjam-jam. URL harus
+    bertahan sepanjang lagu karena ffmpeg -reconnect memakai URL yang sama.
+    """
+    if not track.stream_url or not track.stream_ts:
+        return False
+    now = time.time() if now is None else now
+    expire = _stream_expiry(track.stream_url)
+    if expire is None:
+        return now - track.stream_ts < STREAM_URL_TTL
+    return now + (track.duration or 0) + STREAM_EXPIRY_MARGIN < expire
+
+
+def _prefetch_delay(state: QueueState) -> float:
+    """Detik sampai prefetch dimulai: PREFETCH_LEAD_SECONDS sebelum current habis.
+
+    Jeda (pause) tidak dihitung, jadi perkiraan bisa terlalu awal — aman, karena
+    URL berlaku berjam-jam dan dicek ulang oleh _stream_fresh saat diputar.
+    """
+    current = state.current
+    started = state.track_started_at
+    if current is None or started is None or not current.duration:
+        return 0.0
+    remaining = current.duration - (time.monotonic() - started)
+    return max(0.0, remaining - PREFETCH_LEAD_SECONDS)
+
 # Batas konkurensi ekstraksi yt-dlp agar STB RAM kecil tidak OOM (C4/M3).
 EXTRACT_SEM = asyncio.Semaphore(2)
 MAX_QUEUE = 500
@@ -199,6 +255,15 @@ MAX_TRACK_RETRIES = 3
 TRANSIENT_RETRY_DELAY = 2.0
 # Lagu maksimum yang diambil dari satu playlist/channel.
 MAX_PLAYLIST_TRACKS = 100
+# Stream lagu berikutnya diekstraksi selagi lagu sekarang masih diputar, mulai
+# sekian detik sebelum lagu habis. Tanpa ini ada jeda hening antar lagu sepanjang
+# waktu ekstraksi (1,5–5 dtk di x86, lebih lama di STB ARM).
+PREFETCH_LEAD_SECONDS = 60.0
+# Umur maksimum URL stream bila URL tidak memuat parameter expire=.
+STREAM_URL_TTL = 1800
+# URL stream harus masih berlaku sepanjang durasi lagu + margin ini.
+STREAM_EXPIRY_MARGIN = 300
+_STREAM_EXPIRE_RE = re.compile(r'[?&/]expire[=/](\d{9,11})(?!\d)')
 AFK_TIMEOUT_SECONDS = _int_env('AFK_TIMEOUT_SECONDS', 180, lo=1)
 
 
@@ -1909,6 +1974,7 @@ class MusicPanel(discord.ui.View):
             shuffled_len = len(state.queue)
         if not too_few:
             self.bot._save_persistent_queue()
+            self.bot._schedule_prefetch(interaction.guild, state)
         if too_few:
             # await di luar lock (lihat catatan di back()).
             return await interaction.followup.send('Antrian kurang dari 2 lagu untuk diacak.', ephemeral=True)
@@ -1968,6 +2034,7 @@ class MusicPanel(discord.ui.View):
         status = 'Aktif' if autoplay_on else 'Nonaktif'
         await interaction.followup.send(f'AutoPlay sekarang: **{status}**', ephemeral=True)
         if autoplay_on:
+            self.bot._schedule_prefetch(interaction.guild, state)
             vc = interaction.guild.voice_client if interaction.guild else None
             if vc and getattr(vc, 'is_connected', lambda: False)() and not (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)()):
                 await self.bot.advance(interaction.guild)
@@ -2025,11 +2092,20 @@ class MusicBot(discord.Client):
         except Exception as exc:
             log.critical('libopus tidak tersedia, voice tidak bisa jalan: %s', exc)
             raise SystemExit('libopus tidak ditemukan. Install libopus0.') from exc
-        intents = discord.Intents.default()
+        # Hanya event yang benar-benar dipakai. Intents.default() ikut mengirim
+        # SEMUA pesan, typing, reaksi, invite, dst. dari tiap channel: CPU parse
+        # + bandwidth gateway terbuang di STB. Slash command & tombol datang
+        # sebagai interaction (tidak butuh intent); dm_messages untuk balasan DM.
+        intents = discord.Intents.none()
+        intents.guilds = True
         intents.voice_states = True
+        intents.dm_messages = True
         # Judul lagu (dari YouTube) dan teks lain ikut dikirim ke channel; jangan
         # biarkan "@everyone"/"@here"/mention di dalamnya mem-ping siapa pun.
-        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+        # max_messages=None: bot tidak pernah membaca cache pesan (panel disimpan
+        # sebagai objek/ID sendiri), jadi cache 1000 pesan hanya memakan RAM.
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none(),
+                         max_messages=None)
         self._background_tasks: set[asyncio.Task] = set()
         self._exporter_task: asyncio.Task | None = None
         self._panel_view: MusicPanel | None = None
@@ -2309,6 +2385,8 @@ class MusicBot(discord.Client):
                     state.current = None
             need_advance = not playing and not advancing
         self._save_persistent_queue()
+        if playing:
+            self._schedule_prefetch(guild, state)
         if need_advance and vc and not vc.is_playing() and not vc.is_paused():
             await self.advance(guild)
         return True
@@ -2431,10 +2509,12 @@ class MusicBot(discord.Client):
             pass
         state = self.states.pop(gid, None) if gid is not None else None
         if state:
-            for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task, state.announce_task):
+            for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task, state.announce_task,
+                         state.prefetch_task):
                 if task and not task.done():
                     task.cancel()
             state.idle_task = state.empty_task = state.afk_task = state.refresh_task = state.announce_task = None
+            state.prefetch_task = state.prefetch_job = state.prefetch_track = None
             state.afk_paused = False
         self._save_persistent_queue()
         dump_runtime_state(self)
@@ -2633,10 +2713,12 @@ class MusicBot(discord.Client):
         for state in list(self.states.values()):
             async with state.lock:
                 state.generation += 1
-                for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task, state.announce_task):
+                for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task, state.announce_task,
+                             state.prefetch_task):
                     if task and not task.done():
                         task.cancel()
                 state.idle_task = state.empty_task = state.afk_task = state.refresh_task = state.announce_task = None
+                state.prefetch_task = state.prefetch_job = state.prefetch_track = None
                 state.afk_paused = False
         for task in list(self._background_tasks):
             if not task.done():
@@ -2932,6 +3014,7 @@ class MusicBot(discord.Client):
         if too_few:
             return await interaction.followup.send('Antrian kurang dari 2 lagu untuk diacak.', ephemeral=True)
         self._save_persistent_queue()
+        self._schedule_prefetch(interaction.guild, state)
         await interaction.followup.send(f'Antrian berhasil diacak ({shuffled_len} lagu).', ephemeral=True)
         await self.refresh(state)
 
@@ -2994,6 +3077,7 @@ class MusicBot(discord.Client):
         status = 'Aktif' if autoplay_on else 'Nonaktif'
         await interaction.followup.send(f'AutoPlay sekarang: **{status}**', ephemeral=True)
         if autoplay_on:
+            self._schedule_prefetch(interaction.guild, state)
             vc = interaction.guild.voice_client if interaction.guild else None
             if vc and getattr(vc, 'is_connected', lambda: False)() and not (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)()):
                 await self.advance(interaction.guild)
@@ -3021,10 +3105,12 @@ class MusicBot(discord.Client):
                 # Jangan cancel task yang sedang menjalankan quit_voice (mis. afk_task atau idle_task).
                 # Bila task meng-cancel dirinya sendiri, await berikutnya langsung melempar CancelledError
                 # sehingga vc.disconnect() tidak pernah terpanggil dan bot tersangkut di voice.
-                for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task):
+                for task in (state.idle_task, state.empty_task, state.afk_task, state.refresh_task, state.prefetch_task):
                     if task and not task.done() and task is not current:
                         task.cancel()
                 state.idle_task = state.empty_task = state.afk_task = state.refresh_task = None
+                state.prefetch_task = state.prefetch_job = state.prefetch_track = None
+                state.track_started_at = None
                 state.afk_paused = False
                 announce_task = state.announce_task
                 state.announce_task = None
@@ -3571,14 +3657,7 @@ class MusicBot(discord.Client):
                     async with state.lock:
                         if state.queue:
                             continue
-                        seed_titles = [t.title for t in list(state.history)[-5:]]
-                        seed_urls = [t.url for t in list(state.history)[-5:]]
-                        if state.current:
-                            seed_titles.append(state.current.title)
-                            seed_urls.append(state.current.url)
-                        played_urls = {t.url for t in list(state.history)[-20:]}
-                        if state.current:
-                            played_urls.add(state.current.url)
+                        seed_titles, seed_urls, played_urls = _autoplay_seeds(state)
                     played_urls.update(autoplay_failed_urls)
 
                     async with state.lock:
@@ -3612,7 +3691,12 @@ class MusicBot(discord.Client):
 
             # --- fase 3: extract stream di luar lock (C4) + batas thread (H3) ---
             try:
-                if next_track.stream_url and next_track.stream_ts and (time.time() - next_track.stream_ts) < 1800:
+                job = state.prefetch_job
+                if job is not None and not job.done() and state.prefetch_track is next_track:
+                    # Prefetch sedang mengekstraksi track yang sama: tunggu hasilnya
+                    # alih-alih mengekstraksi dua kali.
+                    await asyncio.wait({job}, timeout=65)
+                if _stream_fresh(next_track):
                     data = {'url': next_track.stream_url, 'title': next_track.title}
                 else:
                     data = await run_extract(extract, next_track.url, timeout=60)
@@ -3813,7 +3897,9 @@ class MusicBot(discord.Client):
                                 if len(state.history) > 20:
                                     state.history.popleft()
                         state.current = next_track
+                    state.track_started_at = time.monotonic()
                 self._save_persistent_queue()
+                self._schedule_prefetch(guild, state, restart=True)
                 await self.refresh(state)
                 self._announce(guild, played)
                 return
@@ -3992,6 +4078,94 @@ class MusicBot(discord.Client):
                 log.error('Gagal mengumumkan now-playing: %s', exc)
 
         task.add_done_callback(_done)
+
+    def _schedule_prefetch(self, guild: discord.Guild, state: QueueState, restart: bool = False) -> None:
+        """Pastikan ada satu prefetch hidup untuk lagu berikutnya.
+
+        restart=True dipakai saat lagu baru mulai (sisa waktu berubah): prefetch
+        yang masih menunggu diganti. Pemanggil lain (antrean/AutoPlay berubah)
+        cukup memastikan ada satu — prefetch memilih target terbaru saat bangun.
+        Prefetch yang sedang mengekstraksi tidak dibatalkan; ia menghitung ulang
+        target dan jadwalnya setelah selesai.
+        """
+        task = state.prefetch_task
+        if task is not None and not task.done():
+            if not restart or state.prefetch_job is not None:
+                return
+            task.cancel()
+        vc = getattr(guild, 'voice_client', None)
+        playing = bool(vc and (vc.is_playing() or vc.is_paused()))
+        if state.current is None or not playing or getattr(self, '_stopping', False):
+            state.prefetch_task = None
+            return
+        try:
+            state.prefetch_task = asyncio.get_running_loop().create_task(self._prefetch_next(guild, state))
+        except RuntimeError:
+            state.prefetch_task = None
+
+    async def _prefetch_target(self, state: QueueState) -> Track | None:
+        """Track yang akan diputar advance() berikutnya (cermin fase 1-2 _advance_loop)."""
+        async with state.lock:
+            if state.loop_mode == 'track' and state.current:
+                return state.current
+            if state.queue:
+                return state.queue[0]
+            if state.loop_mode == 'queue' and state.current:
+                return state.current
+            if not (state.autoplay and (state.current or state.history)):
+                return None
+            seed_titles, seed_urls, played_urls = _autoplay_seeds(state)
+            candidate = next((c for c in state.autoplay_candidates if c.url not in played_urls), None)
+        if candidate is not None:
+            return candidate
+        # Antrean habis + AutoPlay: ambil daftar Mix lebih awal juga, supaya
+        # transisi tidak menunggu ekstraksi Mix maupun stream-nya.
+        candidates = await fetch_recommendations(seed_titles, played_urls, seed_urls=seed_urls)
+        async with state.lock:
+            if state.queue or state.autoplay_candidates or not state.autoplay:
+                return None  # state berubah selama fetch; biarkan advance() yang memilih
+            state.autoplay_candidates = [c for c in candidates if c.url not in played_urls]
+            return next(iter(state.autoplay_candidates), None)
+
+    async def _prefetch_next(self, guild: discord.Guild, state: QueueState) -> None:
+        """Ekstraksi stream lagu berikutnya selagi lagu sekarang masih diputar.
+
+        Tanpa ini advance() baru mengekstraksi saat lagu selesai, sehingga ada jeda
+        hening sepanjang waktu ekstraksi. Jumlah ekstraksi tetap sama, hanya lebih
+        awal. Kegagalan diabaikan: advance() mengekstraksi seperti biasa.
+        """
+        last_target = None
+        try:
+            while True:
+                delay = _prefetch_delay(state)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if getattr(self, '_stopping', False) or self.is_closed():
+                    return
+                vc = getattr(guild, 'voice_client', None)
+                if not vc or not getattr(vc, 'is_connected', lambda: False)() or state.current is None:
+                    return
+                target = await self._prefetch_target(state)
+                if target is None or target is last_target or _stream_fresh(target):
+                    return
+                last_target = target
+                job = asyncio.ensure_future(run_extract(extract, target.url, timeout=60))
+                state.prefetch_track = target
+                state.prefetch_job = job
+                try:
+                    data = await job
+                finally:
+                    if state.prefetch_job is job:
+                        state.prefetch_job = None
+                        state.prefetch_track = None
+                if isinstance(data, dict) and data.get('url'):
+                    target.stream_url = data['url']
+                    target.stream_ts = time.time()
+                    log.info('Prefetch stream siap: %s', target.title)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.info('Prefetch dilewati (diekstraksi ulang saat giliran): %s', exc)
 
     def _schedule_idle(self, guild: discord.Guild, generation: int) -> None:
         gid = getattr(guild, 'id', None)
