@@ -14,7 +14,8 @@ RestartSec=10
 MemoryMax=400M
 TasksMax=64
 # Berkas runtime (state.json/queue_state.json) memuat nama guild, judul lagu,
-# dan nama pendengar — jangan world-readable (L3).
+# dan nama pendengar — jangan world-readable (L3). Pengecualian: listeners.json
+# (hanya jumlah pendengar) 0644 karena dibaca update.sh sebagai user updater.
 UMask=0027
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -23,6 +24,11 @@ PrivateTmp=true
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=XDG_CACHE_HOME=/run/discord-music
 RuntimeDirectory=discord-music
+# Tanpa ini systemd menghapus /run/discord-music (termasuk queue_state.json)
+# setiap kali service berhenti, sehingga persistent queue tidak pernah selamat
+# dari restart (update yt-dlp, Restart=on-failure, tombol "Mulai ulang" panel).
+# 'restart' = dipertahankan saat restart, tetap dibersihkan saat stop penuh.
+RuntimeDirectoryPreserve=restart
 
 [Install]
 WantedBy=multi-user.target

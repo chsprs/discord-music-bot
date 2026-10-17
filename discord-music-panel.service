@@ -7,7 +7,10 @@ After=network-online.target
 Type=simple
 WorkingDirectory=/opt/discord-music-bot
 EnvironmentFile=/opt/discord-music-panel.env
-ExecStart=/opt/discord-music-bot/venv/bin/python /opt/discord-music-bot/panel.py
+# python3 sistem, BUKAN venv: panel berjalan sebagai root dan hanya butuh
+# stdlib, sedangkan venv bisa ditulis user discord-music-updater. Menjalankan
+# interpreter venv di sini = updater bisa mengeksekusi kode sebagai root.
+ExecStart=/usr/bin/python3 /opt/discord-music-bot/panel.py
 Restart=on-failure
 RestartSec=5
 MemoryMax=120M

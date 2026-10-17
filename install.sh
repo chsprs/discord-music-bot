@@ -21,7 +21,10 @@ apt-get update -y
 apt-get install -y --no-install-recommends python3 python3-venv python3-pip ffmpeg curl git openssl
 
 # Bot memakai asyncio.Semaphore/Lock tingkat modul sehingga butuh Python >= 3.10.
-PY_VER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo '0.0')"
+# Interpreter yang sama dipakai untuk venv bot dan untuk menjalankan panel
+# (ExecStart=/usr/bin/python3 di discord-music-panel.service).
+PYTHON3=/usr/bin/python3
+PY_VER="$("$PYTHON3" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo '0.0')"
 PY_MAJOR="${PY_VER%%.*}"
 PY_MINOR="${PY_VER##*.}"
 if (( PY_MAJOR < 3 || (PY_MAJOR == 3 && PY_MINOR < 10) )); then
@@ -99,13 +102,21 @@ if ! id "discord-music-updater" &>/dev/null; then
 fi
 
 if [[ ! -d "venv" ]]; then
-    python3 -m venv venv
+    "$PYTHON3" -m venv venv
 fi
-venv/bin/pip install --upgrade pip
-venv/bin/pip install -r requirements.txt
 
 touch last_update.log .update.lock
 chown -R discord-music-updater:discord-music-updater venv last_update.log .update.lock
+
+# Pasang dependensi SEBAGAI user updater, bukan root: venv milik updater (timer
+# mingguan memakai pip yang sama), jadi berkas milik root di venv membuat update
+# berikutnya gagal, dan root tidak boleh mengeksekusi kode yang bisa ditulis
+# user lain.
+as_updater() {
+    runuser -u discord-music-updater -- env HOME=/nonexistent PIP_NO_CACHE_DIR=1 "$@"
+}
+as_updater venv/bin/pip install --upgrade pip
+as_updater venv/bin/pip install --require-hashes -r requirements.txt
 
 # Sudoers untuk updater agar bisa restart bot
 echo "discord-music-updater ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart discord-music.service, /usr/bin/systemctl is-active --quiet discord-music.service" > /etc/sudoers.d/discord-music-updater
@@ -119,20 +130,37 @@ if [[ ! -f ".env" ]]; then
 fi
 
 PANEL_ENV="/opt/discord-music-panel.env"
+PANEL_PASS_GENERATED=""
 if [[ ! -f "$PANEL_ENV" ]]; then
+    # Default AMAN: panel tanpa password di 0.0.0.0 membuat siapa pun di LAN bisa
+    # mengganti token, mematikan bot, menjalankan update, bahkan memasang
+    # password sendiri lalu mengunci pemiliknya. Buat password acak bila
+    # PANEL_PASSWORD tidak diberikan; mode tanpa password tetap bisa dipilih
+    # lewat panel / tools/reset-password.sh.
     PANEL_PASS="${PANEL_PASSWORD:-}"
+    if [[ -z "$PANEL_PASS" ]]; then
+        PANEL_PASS="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 20)"
+        PANEL_PASS_GENERATED="$PANEL_PASS"
+    fi
     LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     cat <<EOF > "$PANEL_ENV"
 PANEL_HOST=$PANEL_HOST
 PANEL_PORT=$PANEL_PORT
-PANEL_PASSWORD=$PANEL_PASS
 # Batasi Host header yang diterima (proteksi DNS-rebinding). Pisahkan dengan koma.
 # Kosongkan untuk deteksi otomatis dari alamat lokal mesin.
 PANEL_ALLOWED_HOSTS=${LAN_IP:+$LAN_IP:$PANEL_PORT}
 EOF
     chmod 600 "$PANEL_ENV"
+    # Ditulis lewat panel.py agar nilai di-quote benar untuk EnvironmentFile
+    # systemd (password berisi kutip/backslash/spasi tidak berubah saat dibaca).
+    PANEL_ENV="$PANEL_ENV" "$PYTHON3" "$INSTALL_DIR/panel.py" --set-password "$PANEL_PASS" >/dev/null
     echo ""
-    echo ">>> PANEL_PASSWORD default: ${PANEL_PASS:-kosong (akses bebas di LAN)}. Dapat diatur via web panel atau ./tools/reset-password.sh."
+    if [[ -n "$PANEL_PASS_GENERATED" ]]; then
+        echo ">>> PANEL_PASSWORD dibuat acak: $PANEL_PASS_GENERATED"
+        echo "    Simpan password ini. Ubah via web panel atau ./tools/reset-password.sh <sandi>."
+    else
+        echo ">>> PANEL_PASSWORD diambil dari variabel lingkungan PANEL_PASSWORD."
+    fi
     echo ">>> Panel bind ke $PANEL_HOST. Untuk LAN tak-terpercaya, set PANEL_HOST=127.0.0.1"
     echo "    dan akses lewat SSH tunnel: ssh -L 9130:127.0.0.1:9130 user@host"
     if [[ -n "$LAN_IP" ]]; then
@@ -154,8 +182,28 @@ systemctl start discord-music-update.timer
 systemctl restart discord-music-panel.service
 
 # 6. Jalankan unit test
+# Sebagai user updater (bukan root) dan dengan semua path runtime diarahkan ke
+# direktori sementara: installer sering dijalankan ulang di mesin yang botnya
+# sedang hidup, dan suite tidak boleh menyentuh /run/discord-music (antrean,
+# listeners.json) atau panel.env/.env produksi.
 echo "[6/6] Menjalankan verifikasi tes..."
-PYTHONPATH="$INSTALL_DIR" "$INSTALL_DIR/venv/bin/python" -m unittest discover -s "$INSTALL_DIR/tests" -v
+TEST_TMP="$(mktemp -d /tmp/discord-music-tests.XXXXXX)"
+chown discord-music-updater "$TEST_TMP"
+TEST_RC=0
+runuser -u discord-music-updater -- env \
+    HOME="$TEST_TMP" TMPDIR="$TEST_TMP" PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$INSTALL_DIR" \
+    QUEUE_STATE_FILE="$TEST_TMP/queue_state.json" \
+    BOT_STATE_FILE="$TEST_TMP/state.json" \
+    PANEL_ENV="$TEST_TMP/panel.env" \
+    BOT_CONFIG="$TEST_TMP/bot.env" \
+    UPDATE_LOG="$TEST_TMP/last_update.log" \
+    "$INSTALL_DIR/venv/bin/python" -m unittest discover -s "$INSTALL_DIR/tests" -v || TEST_RC=$?
+rm -rf "$TEST_TMP"
+if [[ $TEST_RC -ne 0 ]]; then
+    echo "Error: verifikasi tes gagal (exit $TEST_RC). Periksa output di atas." >&2
+    exit "$TEST_RC"
+fi
 
 LAN_IP=$(hostname -I | awk '{print $1}')
 echo ""
@@ -168,4 +216,8 @@ echo "1. Buka browser: http://${LAN_IP}:${PANEL_PORT}"
 echo "2. Masukkan Bot Token & Guild ID (Server ID Discord)"
 echo "3. Klik 'Simpan konfigurasi' lalu 'Nyalakan bot'"
 echo "4. Di Discord ketik /musik untuk membuka panel"
+if [[ -n "$PANEL_PASS_GENERATED" ]]; then
+    echo ""
+    echo "Password panel: $PANEL_PASS_GENERATED"
+fi
 echo "=========================================="
