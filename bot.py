@@ -11,10 +11,8 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
-import types
 from collections import deque
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
@@ -567,7 +565,7 @@ def dump_runtime_state(bot) -> None:
         else:
             path = '/tmp/discord-music-state.json'
     try:
-        global _RUNTIME_STATE_SEQ, _RUNTIME_STATE_LAST_SEQ
+        global _RUNTIME_STATE_SEQ
         with _RUNTIME_STATE_LOCK:
             _RUNTIME_STATE_SEQ += 1
             seq = _RUNTIME_STATE_SEQ
@@ -1966,7 +1964,6 @@ class MusicPanel(discord.ui.View):
                 too_few = True
             else:
                 too_few = False
-                import random
                 items = list(state.queue)
                 random.shuffle(items)
                 for idx, itm in enumerate(items):
@@ -3003,7 +3000,6 @@ class MusicBot(discord.Client):
                     too_few = True
                 else:
                     too_few = False
-                    import random
                     items = list(state.queue)
                     random.shuffle(items)
                     for idx, itm in enumerate(items):

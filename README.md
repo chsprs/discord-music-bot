@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.7-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-pinned-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-514%2F514%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-517%2F517%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -154,7 +154,7 @@ Skrip installer otomatis:
 3. Membuat user sistem non-root `discord-music-updater`, mengatur ownership `venv`/log, dan memasang aturan sudoers terbatas (`systemctl restart/is-active discord-music.service` saja).
 4. Memasang service systemd `discord-music.service`, `discord-music-panel.service`, dan `discord-music-update.service` + timer.
 5. Mengaktifkan auto-start saat boot sistem.
-6. Menjalankan verifikasi unit test mandiri (**514/514 passing**) sebagai user non-root dengan path runtime sementara, sehingga tidak menyentuh antrean/state bot yang sedang hidup.
+6. Menjalankan verifikasi unit test mandiri (**517/517 passing**) sebagai user non-root dengan path runtime sementara, sehingga tidak menyentuh antrean/state bot yang sedang hidup.
 7. Menyalakan Web Control Panel di port `9130` dengan **password acak** (dicetak di akhir instalasi) kecuali `PANEL_PASSWORD` sudah diberikan, mis. `sudo PANEL_PASSWORD='rahasia' ./install.sh`.
 
 ---
@@ -270,7 +270,7 @@ cd /opt/discord-music-bot
 
 Hasil uji:
 ```
-Ran 514 tests in ~70s
+Ran 517 tests in ~70s
 
 OK
 ```
