@@ -427,7 +427,7 @@ UPDATE_LOG_CACHE_TTL = 2.0
 
 
 def read_last_update_log() -> str:
-    global _last_update_output, _update_log_cache
+    global _update_log_cache
     now = time.monotonic()
     with _update_log_lock:
         if _update_log_cache is not None and now - _update_log_cache[1] < UPDATE_LOG_CACHE_TTL:
@@ -550,7 +550,7 @@ def listeners_active() -> bool:
 
 
 def run_update() -> tuple[bool, str]:
-    global _last_update_output, _update_running
+    global _update_running
     with _update_lock:
         if _update_running:
             return False, 'Pembaruan sedang berjalan. Tunggu selesai dulu.'
@@ -563,6 +563,10 @@ def run_update() -> tuple[bool, str]:
 
 
 def _run_update_inner() -> tuple[bool, str]:
+    # Tanpa global, semua penulisan _last_update_output di sini hanya mengisi
+    # variabel lokal: fallback "Log Pembaruan Terakhir" (saat last_update.log
+    # tidak ada) selalu kosong.
+    global _last_update_output
     if UPDATE_RUNNER is not None:
         ok, out = UPDATE_RUNNER()
         with _lock:
@@ -1524,7 +1528,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._redirect('/', extra_headers)
 
     def _update(self):
-        global _ytdlp_version_cache, _update_log_cache
+        global _ytdlp_version_cache, _update_log_cache, _runtime_info_cache
         ok, out = run_update()
         with _state_cache_lock:
             _state_cache.pop('bot', None)
@@ -1549,6 +1553,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._redirect('/')
 
     def _service(self, action):
+        global _runtime_info_cache
         data = store().read()
         # 'stop' harus selalu boleh: operator perlu bisa mematikan bot walau
         # konfigurasi hilang/kosong (S12).

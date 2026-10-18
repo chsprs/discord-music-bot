@@ -1542,3 +1542,48 @@ class PanelUpdatePrivilegeTests(unittest.TestCase):
     def test_venv_version_missing_venv_falls_back(self):
         with unittest.mock.patch.object(panel, 'BOT_VENV', '/nonexistent/venv'):
             self.assertIsNone(panel._venv_ytdlp_version())
+
+
+class PanelModuleStateTests(unittest.TestCase):
+    """Penulisan state modul dari fungsi/handler harus memakai `global`."""
+
+    class _FakeHandler:
+        def __init__(self):
+            self.flash = None
+
+        def _set_flash(self, message):
+            self.flash = message
+
+        def _redirect(self, location, extra=None):
+            return location
+
+        def _page(self, message='', status=None):
+            return message
+
+        def log_message(self, *args):
+            pass
+
+        def log_exception(self, *args):
+            pass
+
+    def setUp(self):
+        orig = panel._last_update_output
+        self.addCleanup(setattr, panel, '_last_update_output', orig)
+
+    def test_run_update_output_feeds_log_fallback(self):
+        with unittest.mock.patch.object(panel, 'UPDATE_RUNNER', lambda: (True, 'OUTPUT UPDATE TERBARU')), \
+             unittest.mock.patch.object(panel, 'UPDATE_LOG_PATH', os.path.join(tempfile.gettempdir(), 'tidak-ada-xyz.log')), \
+             unittest.mock.patch.object(panel, '_update_log_cache', None):
+            self.assertEqual(panel.run_update(), (True, 'OUTPUT UPDATE TERBARU'))
+            self.assertEqual(panel._last_update_output, 'OUTPUT UPDATE TERBARU')
+            self.assertEqual(panel.read_last_update_log(), 'OUTPUT UPDATE TERBARU')
+
+    def test_update_invalidates_runtime_cache(self):
+        with unittest.mock.patch.object(panel, '_runtime_info_cache', ('x', None, 0.0, {})):
+            panel.Handler._update(self._FakeHandler())
+            self.assertIsNone(panel._runtime_info_cache)
+
+    def test_service_invalidates_runtime_cache(self):
+        with unittest.mock.patch.object(panel, '_runtime_info_cache', ('x', None, 0.0, {})):
+            panel.Handler._service(self._FakeHandler(), 'stop')
+            self.assertIsNone(panel._runtime_info_cache)
