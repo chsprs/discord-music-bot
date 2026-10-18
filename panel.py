@@ -129,6 +129,13 @@ UPDATE_RUNNER: Optional[Callable[[], tuple[bool, str]]] = None
 # WAJIB dipasang oleh unit test: menjalankan suite di server produksi tidak
 # boleh mematikan bot yang sedang berjalan.
 SERVICE_RUNNER: Optional[Callable[[str], tuple[bool, str]]] = None
+# Hook untuk menguji /deploy-check dan /deploy-apply tanpa git/systemd
+# sungguhan. Menerima 'check' atau 'apply'. WAJIB dipasang oleh unit test.
+DEPLOY_RUNNER: Optional[Callable[[str], tuple[bool, str]]] = None
+APP_DIR = os.environ.get('BOT_DIR', '/opt/discord-music-bot')
+DEPLOY_SCRIPT = os.path.join(APP_DIR, 'deploy.sh')
+DEPLOY_UNIT = 'discord-music-deploy.service'
+DEPLOY_LOG_PATH = os.environ.get('DEPLOY_LOG', os.path.join(APP_DIR, 'last_deploy.log'))
 
 # Nama host/IP yang diizinkan muncul di header Host. Tanpa allowlist, pemeriksaan
 # Origin bisa dilewati dengan DNS rebinding (Host dari klien selalu dipercaya).
@@ -147,6 +154,8 @@ _sessions: dict[str, float] = {}
 SESSION_TTL = 43200
 MAX_SESSIONS = 512
 _last_update_output: str = ''
+# Hasil "Cek pembaruan" terakhir (pratinjau commit sebelum diterapkan).
+_last_deploy_check: str = ''
 _update_lock = threading.Lock()
 _update_running = False
 # PRG flash: POST handler set pesan lalu redirect 303 ke GET, refresh aman.
@@ -365,6 +374,85 @@ def _cached_systemctl(kind: str, unit: str, timeout: int, fallback: str) -> str:
 def bot_state() -> str:
     state = _cached_systemctl('bot', SERVICE, 3, 'unknown')
     return state if state in {'active', 'inactive', 'failed'} else 'unknown'
+
+
+def deploy_state() -> str:
+    """Status unit pembaruan kode: 'activating' selama deploy.sh apply berjalan."""
+    return _cached_systemctl('deploy', DEPLOY_UNIT, 2, 'inactive')
+
+
+_version_cache: tuple[float, str] | None = None
+VERSION_CACHE_TTL = 30.0
+
+
+def installed_version() -> str:
+    """Commit kode bot yang terpasang (hash pendek, judul, umur)."""
+    global _version_cache
+    now = time.monotonic()
+    if _version_cache is not None and now - _version_cache[0] < VERSION_CACHE_TTL:
+        return _version_cache[1]
+    try:
+        proc = subprocess.run(['git', '-c', f'safe.directory={APP_DIR}', '-C', APP_DIR, 'log', '-1',
+                               '--format=%h %s (%cr)'], capture_output=True, text=True, timeout=5)
+        value = proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else 'tidak diketahui'
+    except Exception:
+        value = 'tidak diketahui'
+    _version_cache = (now, value)
+    return value
+
+
+def run_deploy_check() -> tuple[bool, str]:
+    """Jalankan `deploy.sh check` (fetch + pratinjau, tidak mengubah apa pun)."""
+    global _last_deploy_check
+    if DEPLOY_RUNNER is not None:
+        ok, out = DEPLOY_RUNNER('check')
+    elif not os.access(DEPLOY_SCRIPT, os.X_OK):
+        ok, out = False, f'{DEPLOY_SCRIPT} tidak ditemukan. Perbarui manual sekali (git pull + sudo ./install.sh).'
+    else:
+        try:
+            proc = subprocess.run([DEPLOY_SCRIPT, 'check'], capture_output=True, text=True, timeout=90)
+            ok = proc.returncode == 0
+            out = (proc.stdout + ('\n' + proc.stderr if proc.stderr.strip() else '')).strip()
+        except Exception as exc:
+            ok, out = False, f'Gagal memeriksa pembaruan: {exc}'
+    with _lock:
+        _last_deploy_check = out[-16384:]
+    return ok, out
+
+
+def start_deploy() -> tuple[bool, str]:
+    """Mulai `deploy.sh apply` di latar belakang lewat unit systemd-nya."""
+    global _last_deploy_check
+    if DEPLOY_RUNNER is not None:
+        ok, out = DEPLOY_RUNNER('apply')
+    elif not os.access(DEPLOY_SCRIPT, os.X_OK):
+        ok, out = False, f'{DEPLOY_SCRIPT} tidak ditemukan. Perbarui manual sekali (git pull + sudo ./install.sh).'
+    else:
+        try:
+            # --no-block: deploy bisa makan beberapa menit (tes) dan me-restart
+            # panel ini sendiri; jangan tahan request HTTP.
+            proc = subprocess.run(['systemctl', '--no-ask-password', '--no-block', 'start', DEPLOY_UNIT],
+                                  capture_output=True, text=True, timeout=15)
+            ok = proc.returncode == 0
+            out = (proc.stderr or proc.stdout or '').strip()[:300]
+        except Exception as exc:
+            ok, out = False, str(exc)
+    if ok:
+        with _lock:
+            _last_deploy_check = ''
+    return ok, out
+
+
+def read_last_deploy_log() -> str:
+    try:
+        size = os.path.getsize(DEPLOY_LOG_PATH)
+        with open(DEPLOY_LOG_PATH, 'r', encoding='utf-8', errors='replace') as handle:
+            if size > 65536:
+                handle.seek(size - 65536)
+                handle.readline()
+            return handle.read().strip()
+    except OSError:
+        return ''
 
 
 def timer_state() -> str:
@@ -914,6 +1002,20 @@ pernah ditampilkan kembali. Menyimpan tidak menyalakan bot.</p>
 {update_log_section}
 </section>
 <section>
+<h2>Pembaruan Bot dari GitHub</h2>
+<div class="kv"><span>Versi terpasang</span><span><code>{deploy_version}</code></span></div>
+<div class="kv"><span>Status pembaruan</span><span>{deploy_status}</span></div>
+<div class="row">
+<form method="post" action="/deploy-check"><input type="hidden" name="form_token" value="{form_token}"><button type="submit" class="ghost">Cek pembaruan</button></form>
+<form method="post" action="/deploy-apply"><input type="hidden" name="form_token" value="{form_token}"><button type="submit">Terapkan pembaruan</button></form>
+</div>
+<p class="note">Menarik branch <code>main</code> dari GitHub (fast-forward saja). Tes dijalankan
+dulu; bila gagal, kode dikembalikan otomatis. Restart bot ditunda bila ada pendengar.
+Periksa daftar commit lewat <b>Cek pembaruan</b> sebelum menerapkan.</p>
+{deploy_check_section}
+{deploy_log_section}
+</section>
+<section>
 <div style="display:flex;justify-content:space-between;align-items:center">
 <h2 style="margin:0">Log Aktivitas Bot (Journalctl)</h2>
 <form method="get" action="/"><button type="submit" class="ghost" style="margin:0;padding:4px 10px;font-size:12px">Segarkan</button></form>
@@ -1287,7 +1389,7 @@ class Handler(BaseHTTPRequestHandler):
                 cookie = f'{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
                 return self._redirect('/login', {'Set-Cookie': cookie})
             return self._redirect('/')
-        if path not in ('/save', '/start', '/restart', '/stop', '/update'):
+        if path not in ('/save', '/start', '/restart', '/stop', '/update', '/deploy-check', '/deploy-apply'):
             return self._send(HTTPStatus.NOT_FOUND, 'Tidak ditemukan')
         fields = self._body()
         if fields is None:
@@ -1300,6 +1402,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._save(fields)
         if path == '/update':
             return self._update()
+        if path == '/deploy-check':
+            return self._deploy_check()
+        if path == '/deploy-apply':
+            return self._deploy_apply()
         return self._service(path.lstrip('/'))
 
     def do_PUT(self):
@@ -1375,6 +1481,32 @@ class Handler(BaseHTTPRequestHandler):
             runtime_badge_text = 'offline'
 
         guilds_html = format_guilds_html(runtime)
+
+        if deploy_state() in ('activating', 'active', 'reloading'):
+            deploy_status_html = '<span class="badge on">Sedang berjalan</span>'
+        else:
+            deploy_status_html = '<span class="badge">Siap</span>'
+        with _lock:
+            last_check = _last_deploy_check
+        if last_check:
+            deploy_check_section = (
+                '<div style="margin-top:14px">'
+                '<label style="font-size:12px;color:var(--muted)">Hasil cek pembaruan:</label>'
+                f'<pre class="log-box" style="max-height:220px">{html.escape(last_check)}</pre>'
+                '</div>'
+            )
+        else:
+            deploy_check_section = ''
+        last_deploy = read_last_deploy_log()
+        if last_deploy:
+            deploy_log_section = (
+                '<div style="margin-top:14px">'
+                '<label style="font-size:12px;color:var(--muted)">Log pembaruan kode terakhir:</label>'
+                f'<pre class="log-box" style="max-height:220px">{html.escape(last_deploy)}</pre>'
+                '</div>'
+            )
+        else:
+            deploy_log_section = ''
         
         bot_id = runtime.get('bot_id')
         if bot_id and str(bot_id).isdigit():
@@ -1426,6 +1558,10 @@ class Handler(BaseHTTPRequestHandler):
                 .replace('{ytdlp_version}', html.escape(ytdlp_version()))
                 .replace('{timer_state}', html.escape(timer_state()))
                 .replace('{update_log_section}', update_log_section)
+                .replace('{deploy_version}', html.escape(installed_version()))
+                .replace('{deploy_status}', deploy_status_html)
+                .replace('{deploy_check_section}', deploy_check_section)
+                .replace('{deploy_log_section}', deploy_log_section)
                 .replace('{bot_logs}', html.escape(read_bot_logs_cached(35))))
         self._send(status, page)
 
@@ -1550,6 +1686,26 @@ class Handler(BaseHTTPRequestHandler):
             self._set_flash(f'Pembaruan yt-dlp berhasil dijalankan.\n{out}')
         else:
             self._set_flash(f'Pembaruan yt-dlp gagal: {out}')
+        return self._redirect('/')
+
+    def _deploy_check(self):
+        ok, _ = run_deploy_check()
+        self._set_flash('Pengecekan pembaruan selesai. Periksa daftar commit di bagian '
+                        '"Pembaruan Bot dari GitHub" sebelum menerapkan.' if ok
+                        else 'Pengecekan pembaruan gagal. Lihat detail di bagian "Pembaruan Bot dari GitHub".')
+        return self._redirect('/')
+
+    def _deploy_apply(self):
+        global _version_cache
+        ok, out = start_deploy()
+        with _state_cache_lock:
+            _state_cache.pop('deploy', None)
+        _version_cache = None
+        if ok:
+            self._set_flash('Pembaruan kode berjalan di latar belakang (tes dulu, bisa beberapa menit). '
+                            'Muat ulang halaman untuk melihat log.')
+        else:
+            self._set_flash(f'Gagal memulai pembaruan kode: {out}')
         return self._redirect('/')
 
     def _service(self, action):

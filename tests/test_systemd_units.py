@@ -96,6 +96,32 @@ class PanelUnitHardeningTests(unittest.TestCase):
         self.assertNotIn('Unknown key', output)
 
 
+class DeployUnitTests(unittest.TestCase):
+    """Unit pembaruan kode dari GitHub: manual saja, tidak pernah otomatis."""
+
+    def setUp(self):
+        self.unit = read_unit('discord-music-deploy.service')
+
+    def test_manual_oneshot_unit(self):
+        lines = [line.strip() for line in self.unit.splitlines()]
+        self.assertIn('Type=oneshot', lines)
+        self.assertIn('ExecStart=/opt/discord-music-bot/deploy.sh apply', lines)
+        self.assertNotIn('[Install]', lines, 'deploy tidak boleh di-enable / jalan saat boot')
+
+    def test_unit_is_valid(self):
+        path = os.path.join(ROOT, 'discord-music-deploy.service')
+        proc = subprocess.run(['systemd-analyze', 'verify', path], capture_output=True, text=True, timeout=60)
+        output = proc.stdout + proc.stderr
+        self.assertNotIn('Failed to parse', output)
+        self.assertNotIn('Unknown key', output)
+
+    def test_installer_installs_deploy_unit(self):
+        with open(os.path.join(ROOT, 'install.sh'), encoding='utf-8') as handle:
+            src = handle.read()
+        self.assertRegex(src, r'cp "\$INSTALL_DIR/discord-music-deploy\.service" /etc/systemd/system/')
+        self.assertNotRegex(src, r'systemctl enable[^\n]*discord-music-deploy')
+
+
 class BotUnitHardeningTests(unittest.TestCase):
     def setUp(self):
         self.unit = read_unit('discord-music.service')

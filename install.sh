@@ -72,9 +72,10 @@ if [[ "$SCRIPT_DIR" != "$INSTALL_DIR" ]]; then
     mkdir -p "$INSTALL_DIR"
     # Salin hanya artefak yang memang bagian aplikasi. Jangan salin .git atau
     # .env (berisi token) dari direktori sumber ke /opt.
-    for f in bot.py panel.py update.sh install.sh requirements.txt README.md \
+    for f in bot.py panel.py update.sh deploy.sh install.sh requirements.txt README.md \
              discord-music.service discord-music-panel.service \
              discord-music-update.service discord-music-update.timer \
+             discord-music-deploy.service \
              .env.example .gitignore; do
         if [[ -e "$SCRIPT_DIR/$f" ]]; then
             cp -r "$SCRIPT_DIR/$f" "$INSTALL_DIR"/
@@ -174,7 +175,9 @@ cp "$INSTALL_DIR/discord-music.service" /etc/systemd/system/discord-music.servic
 cp "$INSTALL_DIR/discord-music-panel.service" /etc/systemd/system/discord-music-panel.service
 cp "$INSTALL_DIR/discord-music-update.service" /etc/systemd/system/discord-music-update.service
 cp "$INSTALL_DIR/discord-music-update.timer" /etc/systemd/system/discord-music-update.timer
-chmod +x "$INSTALL_DIR/update.sh"
+# Tanpa enable: hanya dijalankan lewat tombol "Terapkan pembaruan" di panel.
+cp "$INSTALL_DIR/discord-music-deploy.service" /etc/systemd/system/discord-music-deploy.service
+chmod +x "$INSTALL_DIR/update.sh" "$INSTALL_DIR/deploy.sh"
 
 systemctl daemon-reload
 systemctl enable discord-music.service discord-music-panel.service discord-music-update.timer
