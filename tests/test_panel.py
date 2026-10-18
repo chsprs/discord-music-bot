@@ -50,8 +50,18 @@ def _no_update():
 # Pasang sekali di tingkat modul, sebelum test apa pun berjalan. Kedua hook ini
 # adalah jaring pengaman: suite harus bisa dijalankan di server produksi tanpa
 # menyentuh systemd atau memasang paket.
+def _no_deploy(action):
+    """Pengganti deploy.sh untuk unit test.
+
+    Tanpa ini, /deploy-check menjalankan git fetch sungguhan dan /deploy-apply
+    memulai discord-music-deploy.service (git pull + restart bot).
+    """
+    return True, f'[uji] deploy {action} dilewati'
+
+
 panel.SERVICE_RUNNER = _no_systemd
 panel.UPDATE_RUNNER = _no_update
+panel.DEPLOY_RUNNER = _no_deploy
 
 
 class PanelTests(unittest.TestCase):
@@ -248,6 +258,64 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('Pembaruan yt-dlp berhasil dijalankan', body)
         self.assertIn('yt-dlp updated successfully', body)
+
+    def test_deploy_requires_authentication(self):
+        calls = []
+        panel.DEPLOY_RUNNER = lambda action: (calls.append(action), (True, ''))[1]
+        self.addCleanup(setattr, panel, 'DEPLOY_RUNNER', _no_deploy)
+        for path in ('/deploy-check', '/deploy-apply'):
+            status, _, _ = self.req('POST', path, '')
+            self.assertIn(status, (401, 403))
+        self.assertEqual(calls, [])
+
+    def test_deploy_cross_site_post_rejected(self):
+        cookie = self.login()
+        calls = []
+        panel.DEPLOY_RUNNER = lambda action: (calls.append(action), (True, ''))[1]
+        self.addCleanup(setattr, panel, 'DEPLOY_RUNNER', _no_deploy)
+        status, _, _ = self.req('POST', '/deploy-apply', '', headers={'Origin': 'http://evil.example'}, cookie=cookie)
+        self.assertEqual(status, 403)
+        self.assertEqual(calls, [])
+
+    def test_deploy_check_shows_escaped_preview(self):
+        cookie = self.login()
+        panel.DEPLOY_RUNNER = lambda action: (True, 'Status    : 1 commit baru siap diterapkan.\n  abc1234 <b>judul</b>')
+        self.addCleanup(setattr, panel, 'DEPLOY_RUNNER', _no_deploy)
+        self.addCleanup(setattr, panel, '_last_deploy_check', '')
+        status, _, _ = self.req('POST', '/deploy-check', '', cookie=cookie)
+        self.assertEqual(status, 303)
+        status, body, _ = self.req('GET', '/', cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertIn('Pembaruan Bot dari GitHub', body)
+        self.assertIn('Hasil cek pembaruan', body)
+        self.assertIn('1 commit baru siap diterapkan', body)
+        self.assertIn('&lt;b&gt;judul&lt;/b&gt;', body)
+        self.assertNotIn('<b>judul</b>', body)
+        self.assertIn('Pengecekan pembaruan selesai', body)
+
+    def test_deploy_apply_starts_background_job(self):
+        cookie = self.login()
+        calls = []
+        panel.DEPLOY_RUNNER = lambda action: (calls.append(action), (True, ''))[1]
+        self.addCleanup(setattr, panel, 'DEPLOY_RUNNER', _no_deploy)
+        panel._last_deploy_check = 'pratinjau lama'
+        self.addCleanup(setattr, panel, '_last_deploy_check', '')
+        status, _, _ = self.req('POST', '/deploy-apply', '', cookie=cookie)
+        self.assertEqual(status, 303)
+        self.assertEqual(calls, ['apply'])
+        status, body, _ = self.req('GET', '/', cookie=cookie)
+        self.assertIn('berjalan di latar belakang', body)
+        self.assertNotIn('pratinjau lama', body, 'pratinjau basi harus dibuang setelah diterapkan')
+
+    def test_deploy_log_is_rendered(self):
+        cookie = self.login()
+        log_file = os.path.join(self.tmp.name, 'last_deploy.log')
+        with open(log_file, 'w', encoding='utf-8') as fh:
+            fh.write('[2026-10-18 10:00:00] Status: Sukses. Versi sekarang: abc1234 <x>\n')
+        with unittest.mock.patch.object(panel, 'DEPLOY_LOG_PATH', log_file):
+            status, body, _ = self.req('GET', '/', cookie=cookie)
+        self.assertIn('Log pembaruan kode terakhir', body)
+        self.assertIn('Status: Sukses. Versi sekarang: abc1234 &lt;x&gt;', body)
 
     def test_api_logs_requires_authentication(self):
         status, _, _ = self.req('GET', '/api/logs')
@@ -1041,6 +1109,12 @@ class NoRealSystemdTests(unittest.TestCase):
             'systemctl sungguhan dan mematikan bot produksi')
         self.assertTrue(callable(panel.SERVICE_RUNNER))
 
+    def test_suite_installs_deploy_runner_hook(self):
+        """DEPLOY_RUNNER wajib ada: tanpa itu /deploy-apply menjalankan git pull
+        sungguhan dan me-restart bot produksi."""
+        self.assertIsNotNone(panel.DEPLOY_RUNNER, 'panel.DEPLOY_RUNNER belum dipasang')
+        self.assertTrue(callable(panel.DEPLOY_RUNNER))
+
     def test_suite_installs_update_runner_hook(self):
         """UPDATE_RUNNER juga wajib ada: tanpa itu /update memasang paket
         sungguhan lewat update.sh dan me-restart bot."""
@@ -1587,3 +1661,42 @@ class PanelModuleStateTests(unittest.TestCase):
         with unittest.mock.patch.object(panel, '_runtime_info_cache', ('x', None, 0.0, {})):
             panel.Handler._service(self._FakeHandler(), 'stop')
             self.assertIsNone(panel._runtime_info_cache)
+
+
+class PanelDeployRunnerTests(unittest.TestCase):
+    """Jalur produksi start_deploy()/run_deploy_check() tanpa hook uji."""
+
+    def test_apply_uses_deploy_unit_without_blocking(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return unittest.mock.MagicMock(returncode=0, stdout='', stderr='')
+
+        with unittest.mock.patch.object(panel, 'DEPLOY_RUNNER', None), \
+             unittest.mock.patch('panel.os.access', return_value=True), \
+             unittest.mock.patch('panel.subprocess.run', side_effect=fake_run):
+            ok, _ = panel.start_deploy()
+        self.assertTrue(ok)
+        self.assertEqual(calls, [['systemctl', '--no-ask-password', '--no-block', 'start',
+                                  'discord-music-deploy.service']])
+
+    def test_check_runs_script_and_keeps_output(self):
+        def fake_run(cmd, **kwargs):
+            self.assertEqual(cmd, [panel.DEPLOY_SCRIPT, 'check'])
+            return unittest.mock.MagicMock(returncode=0, stdout='Status    : sudah versi terbaru.\n', stderr='')
+
+        with unittest.mock.patch.object(panel, 'DEPLOY_RUNNER', None), \
+             unittest.mock.patch('panel.os.access', return_value=True), \
+             unittest.mock.patch('panel.subprocess.run', side_effect=fake_run):
+            ok, out = panel.run_deploy_check()
+        self.addCleanup(setattr, panel, '_last_deploy_check', '')
+        self.assertTrue(ok)
+        self.assertIn('sudah versi terbaru', panel._last_deploy_check)
+
+    def test_missing_script_reports_manual_bootstrap(self):
+        with unittest.mock.patch.object(panel, 'DEPLOY_RUNNER', None), \
+             unittest.mock.patch.object(panel, 'DEPLOY_SCRIPT', '/nonexistent/deploy.sh'):
+            ok, out = panel.start_deploy()
+        self.assertFalse(ok)
+        self.assertIn('install.sh', out)

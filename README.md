@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.7-5865F2?logo=discord&logoColor=white)](https://discordpy.readthedocs.io/)
 [![yt-dlp](https://img.shields.io/badge/yt--dlp-pinned-red)](https://github.com/yt-dlp/yt-dlp)
-[![Tests](https://img.shields.io/badge/Tests-517%2F517%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
+[![Tests](https://img.shields.io/badge/Tests-544%2F544%20Passing-brightgreen)](https://github.com/chsprs/discord-music-bot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20ARM64%20%7C%20x86__64-orange)](https://armbian.com)
 [![RAM Usage](https://img.shields.io/badge/RAM-%3C50MB-success)](#performa--arsitektur)
@@ -62,6 +62,7 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
   - Monitor status service & tombol kontrol start / restart / stop service dari web.
   - **Pemantau Server & Pengguna Aktif:** Menampilkan daftar server Discord yang dimasuki bot, channel voice yang sedang tersambung, judul lagu & antrean yang sedang berputar, serta jumlah & nama pengguna yang sedang mendengarkan secara realtime.
   - **Tombol Pembaruan Manual:** Jalankan `discord-music-update.service` (sebagai user `discord-music-updater`, bukan root) lewat tombol web lengkap dengan riwayat log keluaran terminal. Panel sendiri berjalan dengan `python3` sistem (stdlib saja), tidak memakai interpreter venv.
+  - **Pembaruan Bot dari GitHub (manual):** Tombol **Cek pembaruan** menampilkan commit baru di branch `main` beserta file yang berubah; tombol **Terapkan pembaruan** menjalankan `discord-music-deploy.service` (lihat [Memperbarui Bot dari Web Panel](#-memperbarui-bot-dari-web-panel)).
   - **Pemantau Log Realtime:** Kotak log aktivitas bot (`journalctl`) yang dapat disegarkan langsung dari antarmuka web.
 - **Auto-Update Mingguan yang Aman:**
   - **Systemd Timer Mingguan:** Setiap Minggu pukul 04:00 WIB, `discord-music-update.service` berjalan sebagai user khusus non-root `discord-music-updater` (bukan root).
@@ -69,6 +70,25 @@ Dashboard web lokal ringan untuk pemantauan runtime, kontrol service, konfiguras
   - **Restart hanya bila versi berubah:** Bot di-restart hanya jika versi yt-dlp terpasang benar-benar berubah. Bila tidak ada perubahan, updater keluar tanpa restart.
   - **Restart Aman Saat Ada Pendengar:** Bila masih ada yang mendengarkan musik (dibaca dari `listeners.json` yang world-readable), restart ditunda agar pemutaran tidak terputus; versi yt-dlp baru dipakai pada restart berikutnya.
   - **Integrasi JS Engine:** Terhubung ke Node.js runtime untuk menyelesaikan challenge player API YouTube (EJS) tanpa pesan warning deprecation. Skrip setup NodeSource diverifikasi SHA-256 statis sebelum dieksekusi `install.sh`.
+
+## 🌐 Memperbarui Bot dari Web Panel
+
+Bagian **Pembaruan Bot dari GitHub** di panel memperbarui kode bot ke versi terbaru branch `main`, tanpa SSH:
+
+1. **Cek pembaruan** menjalankan `deploy.sh check`: `git fetch` lalu menampilkan commit baru, file yang berubah, dan tindakan yang akan dilakukan. Belum ada yang diubah.
+2. **Terapkan pembaruan** menjalankan `discord-music-deploy.service` (`deploy.sh apply`, sebagai root) di latar belakang, lalu mencatat prosesnya ke `last_deploy.log` yang tampil di panel:
+   - hanya *fast-forward* dari `origin/main`; ditolak bila ada perubahan lokal pada file yang dilacak git atau riwayat lokal berbeda;
+   - `requirements.txt` berubah → `pip install --require-hashes` sebagai `discord-music-updater`;
+   - menjalankan seluruh unit test sebagai `discord-music-updater`; **tes atau pip gagal → kode otomatis dikembalikan** ke commit sebelumnya dan bot tetap memakai versi lama;
+   - unit systemd berubah → disalin ke `/etc/systemd/system` + `daemon-reload`;
+   - `bot.py`/`requirements.txt` berubah → bot di-restart, **ditunda bila ada pendengar** (tekan *Mulai ulang* saat room kosong); `panel.py` berubah → panel di-restart.
+
+Pembaruan tidak pernah berjalan otomatis; unit ini sengaja tanpa `[Install]` dan tanpa timer.
+
+> [!IMPORTANT]
+> Siapa pun yang bisa merge/push ke `main` di GitHub bisa menjalankan kode sebagai root di server lewat tombol ini. Aktifkan **2FA** di akun GitHub, jangan menambah collaborator sembarangan, dan lindungi `main` dengan ruleset (Settings → Rules → Rulesets: *Restrict deletions*, *Block force pushes*, *Require a pull request before merging*). Selalu periksa daftar commit di **Cek pembaruan** sebelum menerapkan.
+
+Instalasi lama yang belum punya fitur ini perlu diperbarui manual sekali (`git pull` + `sudo ./install.sh`) agar `discord-music-deploy.service` terpasang. Fitur ini butuh `/opt/discord-music-bot` berupa checkout git (instalasi dengan `git clone` seperti di bawah).
 
 ## 🔄 Memperbarui yt-dlp (Untuk Maintainer)
 
@@ -154,7 +174,7 @@ Skrip installer otomatis:
 3. Membuat user sistem non-root `discord-music-updater`, mengatur ownership `venv`/log, dan memasang aturan sudoers terbatas (`systemctl restart/is-active discord-music.service` saja).
 4. Memasang service systemd `discord-music.service`, `discord-music-panel.service`, dan `discord-music-update.service` + timer.
 5. Mengaktifkan auto-start saat boot sistem.
-6. Menjalankan verifikasi unit test mandiri (**517/517 passing**) sebagai user non-root dengan path runtime sementara, sehingga tidak menyentuh antrean/state bot yang sedang hidup.
+6. Menjalankan verifikasi unit test mandiri (**544/544 passing**) sebagai user non-root dengan path runtime sementara, sehingga tidak menyentuh antrean/state bot yang sedang hidup.
 7. Menyalakan Web Control Panel di port `9130` dengan **password acak** (dicetak di akhir instalasi) kecuali `PANEL_PASSWORD` sudah diberikan, mis. `sudo PANEL_PASSWORD='rahasia' ./install.sh`.
 
 ---
@@ -234,6 +254,7 @@ Saat membuat aplikasi bot di [Discord Developer Portal](https://discord.com/deve
 ├── bot.py                        # Core bot Discord (audio pipeline, queue, commands, UI View)
 ├── panel.py                      # Web Control Panel LAN mandiri (stdlib HTTP, CSRF-safe, log viewer)
 ├── update.sh                     # Skrip pembaruan yt-dlp hash-locked & restart bot (jalan sbg discord-music-updater)
+├── deploy.sh                     # Pembaruan kode dari GitHub main (cek / terapkan) yang dipicu dari web panel
 ├── requirements.txt              # Dependensi Python hash-locked (jangan edit manual; regenerate dari .in)
 ├── requirements.in               # Dependensi langsung; sumber untuk regenerate requirements.txt
 ├── install.sh                    # Skrip instalasi otomatis satu baris
@@ -242,6 +263,7 @@ Saat membuat aplikasi bot di [Discord Developer Portal](https://discord.com/deve
 ├── discord-music-panel.service   # Service systemd web dashboard
 ├── discord-music-update.service  # Service oneshot pembaruan yt-dlp (User=discord-music-updater)
 ├── discord-music-update.timer    # Timer mingguan auto-update
+├── discord-music-deploy.service  # Service oneshot "Terapkan pembaruan" dari panel (manual, tanpa timer)
 ├── .env.example                  # Templat variabel lingkungan
 ├── .gitignore
 ├── README.md                     # Dokumentasi proyek
@@ -254,6 +276,7 @@ Saat membuat aplikasi bot di [Discord Developer Portal](https://discord.com/deve
     ├── test_systemd_units.py     # Unit test validasi hardening unit systemd
     ├── test_lockfile.py          # Lockfile hash-locked universal (Python 3.10–3.13+)
     ├── test_audit_fixes.py       # Regresi temuan audit (antrean, AutoPlay, ekstraksi, panel)
+    ├── test_deploy.py            # deploy.sh: pembaruan kode dari GitHub (repo git sungguhan, systemd tiruan)
     └── test_prefetch.py          # Prefetch stream lagu berikutnya & intent gateway minimal
 ```
 
@@ -270,7 +293,7 @@ cd /opt/discord-music-bot
 
 Hasil uji:
 ```
-Ran 517 tests in ~70s
+Ran 544 tests in ~75s
 
 OK
 ```

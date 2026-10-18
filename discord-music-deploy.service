@@ -1,0 +1,14 @@
+[Unit]
+Description=Discord Music Bot: terapkan pembaruan kode dari GitHub (dipicu manual dari web panel)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Berjalan sebagai root: memperbarui checkout milik root, memasang unit systemd,
+# dan me-restart service. pip dan tes dijalankan sebagai discord-music-updater.
+# Sengaja tanpa [Install]: tidak pernah jalan otomatis, hanya lewat tombol panel
+# (`systemctl start discord-music-deploy.service`).
+Type=oneshot
+WorkingDirectory=/opt/discord-music-bot
+ExecStart=/opt/discord-music-bot/deploy.sh apply
+TimeoutStartSec=45min
