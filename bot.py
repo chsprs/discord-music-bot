@@ -1,6 +1,7 @@
 """Minimal Discord music player: slash summon, buttons, modal, streaming voice."""
 import asyncio
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -397,7 +398,7 @@ async def run_extract(func, *args, timeout: float = 60, **kwargs):
         try:
             task = asyncio.to_thread(_tracked_extract, slot, func, *args, **kwargs)
             return await asyncio.wait_for(task, timeout=timeout)
-        except (BaseException, asyncio.CancelledError):
+        except BaseException:
             slot.release_if_unstarted()
             raise
 
@@ -553,6 +554,22 @@ _RUNTIME_STATE_LOCK = threading.Lock()
 _RUNTIME_STATE_SEQ = 0
 _RUNTIME_STATE_LAST_SEQ = 0
 _RUNTIME_LISTENERS_LAST_SEQ = 0
+# O1: skip-cache penulisan state.json. Payload di-hash TANPA field updated_at;
+# bila hash sama dengan tulisan terakhir dan tulisan itu masih lebih baru dari
+# STATE_REFRESH_SECONDS, penulisan besar state.json dilewati (listeners.json
+# yang kecil tetap ditulis tiap siklus agar cek kesegaran 60 dtk di update.sh
+# tidak berubah). Tulisan eMMC saat bot idle turun dari tiap 30 dtk menjadi
+# sekali per ~3 menit; perubahan state apa pun tetap langsung ditulis.
+STATE_REFRESH_SECONDS = 180.0
+_RUNTIME_STATE_PATH_KEY: str | None = None
+_RUNTIME_STATE_STRUCT_HASH: str | None = None
+_RUNTIME_STATE_LAST_WRITE_MONO: float = 0.0
+
+
+def _state_struct_hash(payload: dict) -> str:
+    """Hash payload state tanpa updated_at (satu-satunya field yang berubah tiap siklus)."""
+    structural = {k: v for k, v in payload.items() if k != 'updated_at'}
+    return hashlib.sha256(json.dumps(structural, sort_keys=True).encode('utf-8')).hexdigest()
 
 
 def dump_runtime_state(bot) -> None:
@@ -622,13 +639,28 @@ def dump_runtime_state(bot) -> None:
         }
         listeners_path = os.path.join(os.path.dirname(path), "listeners.json")
         listeners_payload = {"total_listeners": total_listeners, "updated_at": time.time()}
+        struct_hash = _state_struct_hash(payload)
+        # O1: state.json besar dan isinya identik saat bot idle — lewati bila
+        # tulisan terakhir untuk path ini ber-hash sama dan masih segar.
+        write_state = True
+        with _RUNTIME_STATE_LOCK:
+            if (_RUNTIME_STATE_PATH_KEY == path
+                    and _RUNTIME_STATE_STRUCT_HASH == struct_hash
+                    and (time.monotonic() - _RUNTIME_STATE_LAST_WRITE_MONO) < STATE_REFRESH_SECONDS
+                    and os.path.exists(path)):
+                write_state = False
 
         def _do_write():
             global _RUNTIME_STATE_LAST_SEQ, _RUNTIME_LISTENERS_LAST_SEQ
+            global _RUNTIME_STATE_PATH_KEY, _RUNTIME_STATE_STRUCT_HASH, _RUNTIME_STATE_LAST_WRITE_MONO
             try:
                 with _RUNTIME_STATE_LOCK:
                     if seq < _RUNTIME_STATE_LAST_SEQ: return
-                os.makedirs(os.path.dirname(path), exist_ok=True)
+                # BOT_STATE_FILE bisa berupa nama file polos: dirname '' membuat
+                # makedirs melempar FileNotFoundError.
+                _dir = os.path.dirname(path)
+                if _dir:
+                    os.makedirs(_dir, exist_ok=True)
                 l_tmp_path = f"{listeners_path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
                 try:
                     with open(l_tmp_path, "w", encoding="utf-8") as f:
@@ -647,26 +679,30 @@ def dump_runtime_state(bot) -> None:
                         except Exception:
                             pass
 
-                with _RUNTIME_STATE_LOCK:
-                    if seq < _RUNTIME_STATE_LAST_SEQ:
-                        return
-                tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
-                try:
-                    with open(tmp_path, 'w', encoding='utf-8') as f:
-                        json.dump(payload, f)
-                    # state.json memuat nama guild, judul lagu, dan nama pendengar;
-                    # cukup dibaca panel (root), jangan world-readable (L3).
-                    os.chmod(tmp_path, 0o640)
+                if write_state:
                     with _RUNTIME_STATE_LOCK:
-                        if seq >= _RUNTIME_STATE_LAST_SEQ:
-                            _RUNTIME_STATE_LAST_SEQ = seq
-                            os.replace(tmp_path, path)
-                finally:
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
+                        if seq < _RUNTIME_STATE_LAST_SEQ:
+                            return
+                    tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+                    try:
+                        with open(tmp_path, 'w', encoding='utf-8') as f:
+                            json.dump(payload, f)
+                        # state.json memuat nama guild, judul lagu, dan nama pendengar;
+                        # cukup dibaca panel (root), jangan world-readable (L3).
+                        os.chmod(tmp_path, 0o640)
+                        with _RUNTIME_STATE_LOCK:
+                            if seq >= _RUNTIME_STATE_LAST_SEQ:
+                                _RUNTIME_STATE_LAST_SEQ = seq
+                                os.replace(tmp_path, path)
+                                _RUNTIME_STATE_PATH_KEY = path
+                                _RUNTIME_STATE_STRUCT_HASH = struct_hash
+                                _RUNTIME_STATE_LAST_WRITE_MONO = time.monotonic()
+                    finally:
+                        if os.path.exists(tmp_path):
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
             except Exception as exc:
                 log.debug('Gagal menulis state runtime bot: %s', exc)
 
@@ -687,9 +723,15 @@ def dump_runtime_state_offline() -> None:
         else:
             path = '/tmp/discord-music-state.json'
     global _RUNTIME_STATE_LAST_SEQ, _RUNTIME_LISTENERS_LAST_SEQ
+    global _RUNTIME_STATE_PATH_KEY, _RUNTIME_STATE_STRUCT_HASH, _RUNTIME_STATE_LAST_WRITE_MONO
     with _RUNTIME_STATE_LOCK:
         _RUNTIME_STATE_LAST_SEQ = max(_RUNTIME_STATE_SEQ, _RUNTIME_STATE_LAST_SEQ) + 1
         _RUNTIME_LISTENERS_LAST_SEQ = max(_RUNTIME_STATE_SEQ, _RUNTIME_LISTENERS_LAST_SEQ) + 1
+        # state.json/listeners.json dihapus -> cache skip harus invalidated agar
+        # dump berikutnya (bot start ulang) menulis ulang walau hash sama.
+        _RUNTIME_STATE_PATH_KEY = None
+        _RUNTIME_STATE_STRUCT_HASH = None
+        _RUNTIME_STATE_LAST_WRITE_MONO = 0.0
         try:
             if os.path.exists(path):
                 os.remove(path)
@@ -1780,6 +1822,7 @@ class MusicPanel(discord.ui.View):
         # yang lambat tidak memblokir advance()/enqueue.
         schedule_idle = False
         gen = 0
+        replayed_current = False
         async with state.lock:
             now = time.monotonic()
             if now - getattr(state, '_last_back_time', 0.0) < 0.5:
@@ -1800,16 +1843,21 @@ class MusicPanel(discord.ui.View):
                     state.queue.appendleft(prev)
                     state.current = None
                 elif state.current:
+                    # Riwayat kosong: yang bisa "diputar sebelumnya" hanya track
+                    # saat ini, diputar ulang dari awal.
                     state.queue.appendleft(state.current)
                     state.current = None
+                    replayed_current = True
         if not had_prev:
             if schedule_idle:
                 self.bot._schedule_idle(interaction.guild, gen)
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self.bot._stop_player(interaction.guild)
         await self.bot.advance(interaction.guild)
-        # removed # removed self.bot._save_persistent_queue()
-        await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
+        if replayed_current:
+            await interaction.followup.send('Riwayat kosong; lagu saat ini diputar ulang dari awal.', ephemeral=True)
+        else:
+            await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
 
     @discord.ui.button(label='Pause', emoji='⏸️', style=discord.ButtonStyle.secondary, custom_id='music:pause', row=0)
     async def pause(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2129,6 +2177,12 @@ class MusicBot(discord.Client):
         self._queue_seq: int = 0
         self._queue_last_seq: int = 0
         self._queue_restored: bool = False
+        # O2: hash payload terakhir yang BENAR-BENAR tertulis ke disk + flag
+        # suksesnya. _save_persistent_queue dipanggil dari banyak call site yang
+        # sering beruntun dengan isi identik (stop_player -> advance commit);
+        # payload sama = disk sudah benar, jangan tulis ulang (hemat eMMC).
+        self._queue_last_hash: str | None = None
+        self._queue_write_ok: bool = False
 
     def _track_background_task(self, task: asyncio.Task) -> asyncio.Task:
         self._background_tasks.add(task)
@@ -2183,6 +2237,13 @@ class MusicBot(discord.Client):
                     payload[str(gid)] = g_entry
             self._queue_seq = getattr(self, '_queue_seq', 0) + 1
             seq = self._queue_seq
+            body = json.dumps(payload)
+            pending_hash = hashlib.sha256(body.encode('utf-8')).hexdigest()
+            # O2: isi identik dengan tulisan sukses terakhir -> disk sudah benar.
+            if pending_hash == getattr(self, '_queue_last_hash', None) and getattr(self, '_queue_write_ok', False):
+                return None
+            self._queue_write_ok = False
+
             def _write_file():
                 lock = getattr(self, '_queue_write_lock', None)
                 if lock is None:
@@ -2193,28 +2254,36 @@ class MusicBot(discord.Client):
                         if seq < getattr(self, '_queue_last_seq', 0):
                             return
                         self._queue_last_seq = seq
+                        removed = True
                         if os.path.exists(path):
                             try:
                                 os.remove(path)
                             except Exception:
-                                pass
+                                removed = False
+                    if removed:
+                        self._queue_last_hash = pending_hash
+                        self._queue_write_ok = True
                     return
 
                 try:
                     with lock:
                         if seq < getattr(self, '_queue_last_seq', 0):
                             return
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    _dir = os.path.dirname(path)
+                    if _dir:
+                        os.makedirs(_dir, exist_ok=True)
                     tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
                     try:
                         with open(tmp_path, 'w', encoding='utf-8') as f:
-                            json.dump(payload, f)
+                            f.write(body)
                         # Hanya dibaca bot sendiri saat restore.
                         os.chmod(tmp_path, 0o600)
                         with lock:
                             if seq >= getattr(self, '_queue_last_seq', 0):
                                 self._queue_last_seq = seq
                                 os.replace(tmp_path, path)
+                                self._queue_last_hash = pending_hash
+                                self._queue_write_ok = True
                     finally:
                         if os.path.exists(tmp_path):
                             try:
@@ -2253,6 +2322,10 @@ class MusicBot(discord.Client):
             os.remove(path)
         except Exception:
             pass
+        # File dihapus di luar jalur penulis -> invalidasi cache hash (O2) agar
+        # save berikutnya tidak salah menganggap disk sudah sinkron.
+        self._queue_last_hash = None
+        self._queue_write_ok = False
 
         if not isinstance(data, dict):
             log.warning('Data persistent queue bukan format dict, dilewati.')
@@ -2863,11 +2936,23 @@ class MusicBot(discord.Client):
                         async with state.lock:
                             emb = self.embed(state)
                         new_msg = await channel.send(embed=emb, view=MusicPanel(self))
+                        dup = False
                         async with state.lock:
-                            state.message = new_msg
-                            clean_cid = _clean_channel_id(channel_id)
-                            if clean_cid:
-                                state.text_channel_id = clean_cid
+                            if state.message is None:
+                                state.message = new_msg
+                                clean_cid = _clean_channel_id(channel_id)
+                                if clean_cid:
+                                    state.text_channel_id = clean_cid
+                            else:
+                                # /play paralel memasang panel lebih dulu: milik
+                                # kita jadi duplikat — hapus agar tidak menggantung
+                                # sebagai panel basi (B7).
+                                dup = True
+                        if dup and new_msg is not None:
+                            try:
+                                await self._safe_delete_msg(new_msg, guild=interaction.guild)
+                            except Exception:
+                                pass
                     except Exception:
                         log.exception('Gagal memunculkan panel otomatis saat play')
                 else:
@@ -2942,6 +3027,7 @@ class MusicBot(discord.Client):
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         had_prev = False
         schedule_idle = False
+        replayed_current = False
         gen = 0
         async with state.lock:
             now = time.monotonic()
@@ -2956,9 +3042,11 @@ class MusicBot(discord.Client):
                 state.current = None
                 had_prev = True
             elif state.current:
+                # Riwayat kosong: hanya track saat ini yang bisa diputar ulang.
                 state.queue.appendleft(state.current)
                 state.current = None
                 had_prev = True
+                replayed_current = True
             else:
                 had_prev = False
                 vc = interaction.guild.voice_client if interaction.guild else None
@@ -2972,8 +3060,10 @@ class MusicBot(discord.Client):
             return await interaction.followup.send('Tidak ada riwayat lagu sebelumnya.', ephemeral=True)
         await self._stop_player(interaction.guild)
         await self.advance(interaction.guild)
-        # removed # removed self._save_persistent_queue()
-        await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
+        if replayed_current:
+            await interaction.followup.send('Riwayat kosong; lagu saat ini diputar ulang dari awal.', ephemeral=True)
+        else:
+            await interaction.followup.send('Memutar lagu sebelumnya.', ephemeral=True)
 
     async def cmd_shuffle(self, interaction: discord.Interaction):
         if not _check_guild_only(interaction):
@@ -3443,11 +3533,21 @@ class MusicBot(discord.Client):
                 async with state.lock:
                     emb = self.embed(state)
                 new_msg = await channel.send(embed=emb, view=MusicPanel(self))
+                dup = False
                 async with state.lock:
-                    state.message = new_msg
-                    clean_cid = _clean_channel_id(getattr(channel, 'id', None))
-                    if clean_cid:
-                        state.text_channel_id = clean_cid
+                    if state.message is None:
+                        state.message = new_msg
+                        clean_cid = _clean_channel_id(getattr(channel, 'id', None))
+                        if clean_cid:
+                            state.text_channel_id = clean_cid
+                    else:
+                        # /musik paralel memasang panel lebih dulu (B7).
+                        dup = True
+                if dup and new_msg is not None:
+                    try:
+                        await self._safe_delete_msg(new_msg, guild=interaction.guild)
+                    except Exception:
+                        pass
                 await interaction.followup.send('Panel musik aktif di channel ini.', ephemeral=True)
             except discord.Forbidden:
                 await interaction.followup.send('Bot butuh izin Send Messages + Embed Links di channel ini.', ephemeral=True)
@@ -4191,8 +4291,14 @@ class MusicBot(discord.Client):
         gid = getattr(guild, 'id', None)
         if not gid:
             return
+        # Timer antrean-habis mengikuti AFK_TIMEOUT_SECONDS seperti timer
+        # room-kosong (_afk_disconnect) — sebelumnya hard-coded 180 sehingga
+        # env var hanya mengubah salah satu dari dua timer keluar otomatis.
+        timeout = get_afk_timeout()
+        if not (isinstance(timeout, (int, float)) and math.isfinite(timeout) and timeout > 0):
+            timeout = 180.0
         try:
-            await asyncio.sleep(180)
+            await asyncio.sleep(timeout)
             state = self.states.get(gid)
             if not state:
                 return
@@ -4210,7 +4316,8 @@ class MusicBot(discord.Client):
                 if state.generation == generation and state.current is None and (not state.queue or cb_tripped) and not_playing and vc:
                     should_quit = True
             if should_quit:
-                log.info('Idle 3 menit tanpa antrian aktif di guild %s, bot keluar.', getattr(guild, 'name', gid))
+                dur_str = "3 menit" if timeout == 180 else (f"{int(timeout // 60)} menit" if timeout >= 60 else f"{int(timeout)} detik")
+                log.info('Idle %s tanpa antrian aktif di guild %s, bot keluar.', dur_str, getattr(guild, 'name', gid))
                 await self.quit_voice(guild, clear_queue=False)
         except asyncio.CancelledError:
             pass

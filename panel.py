@@ -678,6 +678,13 @@ def _run_update_inner() -> tuple[bool, str]:
         cmd = ['sudo', '-u', 'discord-music-updater', pip_bin, 'install', '--require-hashes', '-r', req_file]
 
     try:
+        # Catat mtime log SEBELUM menjalankan unit: bila unit gagal dinyalakan
+        # (mis. tidak ada) dan berkas log lama masih ada, isinya berasal dari
+        # eksekusi sebelumnya dan tidak boleh menutupi pesan error aktual.
+        try:
+            pre_log_mtime = os.path.getmtime(UPDATE_LOG_PATH) if os.path.exists(UPDATE_LOG_PATH) else None
+        except OSError:
+            pre_log_mtime = None
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         except subprocess.TimeoutExpired:
@@ -704,7 +711,12 @@ def _run_update_inner() -> tuple[bool, str]:
                     out += f'\nGagal merestart service, return code: {restart_proc.returncode}'
                     ok = False
         if via_unit:
-            if os.path.exists(UPDATE_LOG_PATH):
+            try:
+                log_mtime = os.path.getmtime(UPDATE_LOG_PATH) if os.path.exists(UPDATE_LOG_PATH) else None
+            except OSError:
+                log_mtime = None
+            log_is_fresh = log_mtime is not None and log_mtime != pre_log_mtime
+            if log_is_fresh:
                 try:
                     with open(UPDATE_LOG_PATH, 'r', encoding='utf-8', errors='replace') as handle:
                         handle.seek(0, 2)
@@ -733,6 +745,12 @@ def _run_update_inner() -> tuple[bool, str]:
 _runtime_info_cache: tuple[str, float | None, float, dict] | None = None
 _runtime_info_lock = threading.Lock()
 RUNTIME_INFO_CACHE_TTL = 1.0
+# Batas state.json dianggap segar. Bot kini melewati penulisan state.json yang
+# tidak berubah dan hanya menulis ulang paling lama ~3 menit (STATE_REFRESH_SECONDS
+# di bot.py); ambang 60 dtk lama salah menampilkan bot online-idle sebagai offline.
+# listeners.json (dipakai update.sh/deploy.sh) tetap ditulis tiap 30 dtk dengan
+# ambang 60 dtk sendiri dan tidak terpengaruh nilai ini.
+RUNTIME_STATE_FRESHNESS = 300.0
 
 
 def read_bot_runtime_info() -> dict:
@@ -775,7 +793,7 @@ def read_bot_runtime_info() -> dict:
                 return default_info
             with open(path, 'r', encoding='utf-8') as handle:
                 data = json.load(handle)
-            if time.time() - data.get('updated_at', 0) < 60:
+            if time.time() - data.get('updated_at', 0) < RUNTIME_STATE_FRESHNESS:
                 data['status'] = 'online'
                 with _runtime_info_lock:
                     _runtime_info_cache = (path, mtime, now, data)
@@ -1839,7 +1857,8 @@ def main():
         if idx + 1 < len(sys.argv):
             new_p = sys.argv[idx + 1]
             update_panel_password(new_p)
-            print(f'Password panel berhasil diatur ke: {new_p}')
+            # Jangan echo password ke stdout: tercatat di journal/log shell.
+            print('Password panel berhasil diatur.')
             return
         else:
             print('Error: Nilai password harus disertakan setelah --set-password', file=sys.stderr)

@@ -6339,3 +6339,340 @@ class Wave20RemediationTests(unittest.TestCase):
 
 
 
+
+
+class Wave24IdleAndWriteOptimizationTests(unittest.TestCase):
+    """Wave 24: timer idle mengikuti AFK_TIMEOUT_SECONDS (B1) + skip penulisan
+    disk yang tidak berubah untuk state.json (O1) dan queue_state.json (O2)."""
+
+    def test_idle_disconnect_uses_afk_timeout_env(self):
+        """idle_disconnect tidur selama AFK_TIMEOUT_SECONDS, bukan hard-coded 180."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 242401
+        guild.name = 'IdleGuild'
+        guild.voice_client = None
+        slept = []
+
+        async def fake_sleep(seconds, *args, **kwargs):
+            slept.append(seconds)
+
+        with patch.dict(os.environ, {'AFK_TIMEOUT_SECONDS': '7'}), \
+             patch('asyncio.sleep', new=fake_sleep), \
+             patch('bot.dump_runtime_state'):
+            asyncio.run(bot.idle_disconnect(guild, generation=1))
+        self.assertEqual(slept, [7.0])
+
+    def test_idle_disconnect_falls_back_to_180_on_invalid_env(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 242402
+        guild.name = 'IdleGuild2'
+        guild.voice_client = None
+        slept = []
+
+        async def fake_sleep(seconds, *args, **kwargs):
+            slept.append(seconds)
+
+        with patch.dict(os.environ, {'AFK_TIMEOUT_SECONDS': 'bogus'}), \
+             patch('asyncio.sleep', new=fake_sleep), \
+             patch('bot.dump_runtime_state'):
+            asyncio.run(bot.idle_disconnect(guild, generation=1))
+        self.assertEqual(slept, [180.0])
+
+    def test_dump_runtime_state_skips_identical_state_json(self):
+        """Dump kedua dengan struktur identik tidak menulis ulang state.json;
+        listeners.json (kecil) tetap ditulis tiap siklus."""
+        import bot as bot_mod
+        with tempfile.TemporaryDirectory() as td:
+            s_file = os.path.join(td, 'state.json')
+            bot = MusicBot()
+            replaces = []
+            real_replace = os.replace
+
+            def counting_replace(src, dst):
+                replaces.append(os.path.basename(dst))
+                return real_replace(src, dst)
+
+            with patch.dict(os.environ, {'BOT_STATE_FILE': s_file}), \
+                 patch('bot.os.replace', side_effect=counting_replace):
+                bot_mod.dump_runtime_state(bot)  # tanpa running loop -> tulis inline
+                bot_mod.dump_runtime_state(bot)
+            self.assertEqual(replaces.count('state.json'), 1)
+            self.assertEqual(replaces.count('listeners.json'), 2)
+            # Bersihkan cache modul agar test lain tidak terpengaruh.
+            bot_mod.dump_runtime_state_offline()
+
+    def test_dump_runtime_state_writes_again_when_struct_changed(self):
+        import bot as bot_mod
+        with tempfile.TemporaryDirectory() as td:
+            s_file = os.path.join(td, 'state.json')
+            bot = MusicBot()
+            guild = MagicMock()
+            guild.id = 242410
+            guild.name = 'G'
+            guild.member_count = 5
+            guild.voice_client = None
+            # Client.guilds & ConnectionState.guilds keduanya property; injeksi
+            # langsung ke dict internal.
+            bot._connection._guilds = {guild.id: guild}
+            replaces = []
+            real_replace = os.replace
+
+            def counting_replace(src, dst):
+                replaces.append(os.path.basename(dst))
+                return real_replace(src, dst)
+
+            with patch.dict(os.environ, {'BOT_STATE_FILE': s_file}), \
+                 patch('bot.os.replace', side_effect=counting_replace):
+                bot_mod.dump_runtime_state(bot)
+                # Struktur berubah (guild baru terhubung voice) -> harus menulis.
+                # NB: name harus lewat assignment; kwargs name= di MagicMock hanya
+                # mengatur repr, bukan atribut.
+                vc = MagicMock()
+                ch = MagicMock(members=[], bitrate=96000)
+                ch.name = 'Ch'
+                vc.channel = ch
+                vc.is_playing.return_value = False
+                vc.is_paused.return_value = False
+                guild.voice_client = vc
+                bot_mod.dump_runtime_state(bot)
+            self.assertEqual(replaces.count('state.json'), 2)
+            bot_mod.dump_runtime_state_offline()
+
+    def test_dump_runtime_state_writes_again_after_offline_reset(self):
+        """dump_runtime_state_offline menghapus berkas + cache: dump berikutnya
+        menulis ulang walau strukturnya identik."""
+        import bot as bot_mod
+        with tempfile.TemporaryDirectory() as td:
+            s_file = os.path.join(td, 'state.json')
+            bot = MusicBot()
+            replaces = []
+            real_replace = os.replace
+
+            def counting_replace(src, dst):
+                replaces.append(os.path.basename(dst))
+                return real_replace(src, dst)
+
+            with patch.dict(os.environ, {'BOT_STATE_FILE': s_file}), \
+                 patch('bot.os.replace', side_effect=counting_replace):
+                bot_mod.dump_runtime_state(bot)
+                bot_mod.dump_runtime_state_offline()
+                bot_mod.dump_runtime_state(bot)
+            self.assertEqual(replaces.count('state.json'), 2)
+            bot_mod.dump_runtime_state_offline()
+
+    def test_save_persistent_queue_skips_identical_payload(self):
+        bot = MusicBot()
+        guild = MagicMock(id=242420, voice_client=None)
+        state = QueueState()
+        state.queue.append(Track('T', 'http://t', 'u'))
+        bot.states[guild.id] = state
+        with tempfile.TemporaryDirectory() as td:
+            q_path = os.path.join(td, 'queue_state.json')
+            replaces = []
+            real_replace = os.replace
+
+            def counting_replace(src, dst):
+                replaces.append(os.path.basename(dst))
+                return real_replace(src, dst)
+
+            # Tanpa running loop, save menulis inline (return None): ukur lewat
+            # jumlah os.replace nyata ke queue_state.json.
+            with patch('bot._persistent_queue_file', return_value=q_path), \
+                 patch('bot.os.replace', side_effect=counting_replace):
+                bot._save_persistent_queue()
+                self.assertTrue(os.path.exists(q_path))
+                bot._save_persistent_queue()  # payload identik -> tidak menulis
+            self.assertEqual(replaces.count('queue_state.json'), 1)
+            self.assertTrue(bot._queue_write_ok)
+
+    def test_save_persistent_queue_writes_when_payload_changes(self):
+        bot = MusicBot()
+        guild = MagicMock(id=242421, voice_client=None)
+        state = QueueState()
+        state.queue.append(Track('T', 'http://t', 'u'))
+        bot.states[guild.id] = state
+        with tempfile.TemporaryDirectory() as td:
+            q_path = os.path.join(td, 'queue_state.json')
+            replaces = []
+            real_replace = os.replace
+
+            def counting_replace(src, dst):
+                replaces.append(os.path.basename(dst))
+                return real_replace(src, dst)
+
+            with patch('bot._persistent_queue_file', return_value=q_path), \
+                 patch('bot.os.replace', side_effect=counting_replace):
+                bot._save_persistent_queue()
+                state.queue.append(Track('T2', 'http://t2', 'u'))
+                bot._save_persistent_queue()
+            self.assertEqual(replaces.count('queue_state.json'), 2)
+            with open(q_path, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+            titles = [t['title'] for t in data[str(guild.id)]['queue']]
+            self.assertEqual(titles, ['T', 'T2'])
+
+    def test_save_persistent_queue_writes_after_failed_flag_reset(self):
+        """Flag sukses hanya boleh terisi setelah tulisan benar-benar berhasil;
+        tulisan yang gagal tidak boleh membuat save berikutnya ter-skip."""
+        bot = MusicBot()
+        guild = MagicMock(id=242422, voice_client=None)
+        state = QueueState()
+        state.queue.append(Track('T', 'http://t', 'u'))
+        bot.states[guild.id] = state
+        with tempfile.TemporaryDirectory() as td:
+            q_path = os.path.join(td, 'queue_state.json')
+            with patch('bot._persistent_queue_file', return_value=q_path), \
+                 patch('bot.os.replace', side_effect=OSError('disk full')):
+                bot._save_persistent_queue()  # gagal (ditelan log.debug)
+                self.assertFalse(os.path.exists(q_path))
+            self.assertFalse(bot._queue_write_ok)
+            # Tulisan ulang harus tetap dijalankan, tidak di-skip.
+            with patch('bot._persistent_queue_file', return_value=q_path):
+                bot._save_persistent_queue()
+            self.assertTrue(os.path.exists(q_path))
+            self.assertTrue(bot._queue_write_ok)
+
+
+class Wave25BackMessageAndDuplicatePanelTests(unittest.TestCase):
+    """Wave 25: pesan /back jujur saat riwayat kosong (B5) dan panel duplikat
+    dari /play konkuren dihapus, bukan menggantung sebagai panel basi (B7)."""
+
+    def _mk_interaction(self, guild):
+        interaction = MagicMock()
+        interaction.guild = guild
+        interaction.response.send_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    def test_cmd_back_history_empty_replays_current_with_clear_message(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 252501
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+        state = QueueState()
+        state.current = Track('now', 'https://example.com/now', 'u')
+        bot.states[guild.id] = state
+        interaction = self._mk_interaction(guild)
+        with patch.object(bot, 'advance', new=AsyncMock()), \
+             patch.object(bot, '_stop_player', new=AsyncMock()), \
+             patch('bot._check_guild_only', return_value=True), \
+             patch('bot._check_same_voice', return_value=(True, '')):
+            asyncio.run(bot.cmd_back(interaction))
+        msg = interaction.followup.send.call_args.args[0]
+        self.assertIn('diputar ulang', msg)
+        self.assertEqual(state.queue[0].title, 'now')
+        self.assertIsNone(state.current)
+
+    def test_cmd_back_with_history_keeps_previous_message(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 252502
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+        state = QueueState()
+        state.history.append(Track('prev', 'https://example.com/prev', 'u'))
+        state.current = Track('now', 'https://example.com/now', 'u')
+        bot.states[guild.id] = state
+        interaction = self._mk_interaction(guild)
+        with patch.object(bot, 'advance', new=AsyncMock()), \
+             patch.object(bot, '_stop_player', new=AsyncMock()), \
+             patch('bot._check_guild_only', return_value=True), \
+             patch('bot._check_same_voice', return_value=(True, '')):
+            asyncio.run(bot.cmd_back(interaction))
+        msg = interaction.followup.send.call_args.args[0]
+        self.assertEqual(msg, 'Memutar lagu sebelumnya.')
+
+    def test_cmd_play_concurrent_panel_duplicate_deleted(self):
+        """/play paralel memasang panel lebih dulu -> panel kita dihapus dan
+        state.message tetap milik pemasang pertama (B7)."""
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 252510
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        channel = MagicMock()
+        channel.id = 555001
+        voice_channel = MagicMock(id=777001)
+        vc.channel = voice_channel
+        other_msg = MagicMock()
+        dup_msg = MagicMock()
+
+        async def racing_send(*a, **kw):
+            # Simulasi /play lain memenangkan pemasangan panel di sela send().
+            async with state.lock:
+                if state.message is None:
+                    state.message = other_msg
+            return dup_msg
+
+        channel.send = racing_send
+
+        interaction = self._mk_interaction(guild)
+        interaction.channel = channel
+        interaction.channel_id = 555001
+        interaction.user.voice.channel = voice_channel
+        tracks = [Track('T', 'https://example.com/t', 'u')]
+
+        with patch('bot.extract_tracks', new=AsyncMock(return_value=tracks)), \
+             patch.object(bot, '_enqueue_tracks', new=AsyncMock(return_value=True)), \
+             patch.object(bot, 'refresh', new=AsyncMock()), \
+             patch.object(bot, '_schedule_idle') as mock_idle, \
+             patch.object(bot, '_safe_delete_msg', new=AsyncMock()) as mock_del:
+            asyncio.run(bot.cmd_play(interaction, 'T'))
+
+        self.assertIs(state.message, other_msg)
+        deleted = [c.args[0] for c in mock_del.await_args_list]
+        self.assertIn(dup_msg, deleted)
+
+    def test_summon_concurrent_panel_duplicate_deleted(self):
+        bot = MusicBot()
+        guild = MagicMock()
+        guild.id = 252520
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+        state = QueueState()
+        bot.states[guild.id] = state
+
+        channel = MagicMock()
+        channel.id = 555002
+        voice_channel = MagicMock(id=777002)
+        vc.channel = voice_channel
+        other_msg = MagicMock()
+        dup_msg = MagicMock()
+
+        async def racing_send(*a, **kw):
+            async with state.lock:
+                if state.message is None:
+                    state.message = other_msg
+            return dup_msg
+
+        channel.send = racing_send
+
+        interaction = self._mk_interaction(guild)
+        interaction.channel = channel
+        interaction.channel_id = 555002
+        interaction.user.voice.channel = voice_channel
+
+        with patch.object(bot, '_schedule_idle'), \
+             patch.object(bot, '_safe_delete_msg', new=AsyncMock()) as mock_del:
+            asyncio.run(bot.summon(interaction))
+
+        self.assertIs(state.message, other_msg)
+        deleted = [c.args[0] for c in mock_del.await_args_list]
+        self.assertIn(dup_msg, deleted)
