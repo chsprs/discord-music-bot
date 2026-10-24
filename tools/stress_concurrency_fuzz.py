@@ -589,7 +589,7 @@ async def fuzz_circuit_breaker(iterations: int = 10) -> FuzzScenarioResult:
 async def fuzz_afk_guard(iterations: int = 10) -> FuzzScenarioResult:
     res = FuzzScenarioResult(
         scenario="afk_guard_lifecycle",
-        description="Fuzzing timer AFK Guard, auto-pause/resume, dan bypass pengecekan generation != 0",
+        description="Fuzzing timer AFK Guard: room kosong tetap disconnect walau generation berubah (Wave 7), ada manusia = batal",
         iterations=iterations,
     )
     bypassed_disconnects = 0
@@ -610,15 +610,26 @@ async def fuzz_afk_guard(iterations: int = 10) -> FuzzScenarioResult:
         bot.quit_voice = mock_quit
         state.generation = 1
 
+        # Kontrak Wave 7 (#27/#35): perubahan generation SENDIRI (skip/back)
+        # tidak boleh membatalkan disconnect saat room tetap kosong.
         await bot._afk_disconnect(guild, generation=0, timeout=0.001)
+        if not quit_called:
+            bypassed_disconnects += 1
 
+        # Kontrol positif: ada pendengar manusia saat timer habis -> tidak
+        # boleh disconnect.
+        human = MagicMock()
+        human.bot = False
+        vc.channel.members = [human]
+        quit_called = False
+        await bot._afk_disconnect(guild, generation=state.generation, timeout=0.001)
         if quit_called:
             bypassed_disconnects += 1
 
     if bypassed_disconnects > 0:
         res.anomalies.append(
-            f"Bypass generasi AFK Guard terverifikasi: {bypassed_disconnects}/{iterations} kasus mematikan voice "
-            "meskipun generation telah berubah (terpicu oleh logic cacat 'and generation != 0' di bot.py:2979)."
+            f"Kontrak AFK Guard Wave 7 dilanggar: {bypassed_disconnects}/{iterations * 2} kasus — room kosong "
+            "tidak didisconnect saat generation berubah, atau didisconnect padahal ada pendengar manusia."
         )
         res.failed += 1
     else:
@@ -4263,7 +4274,7 @@ async def fuzz_buffered_audio_source_cleanup_event_loop_freeze(iterations: int =
 async def fuzz_dump_runtime_state_tmp_chmod_permission(iterations: int = 5) -> FuzzScenarioResult:
     res = FuzzScenarioResult(
         scenario="dump_runtime_state_tmp_chmod_permission",
-        description="Verifikasi missing os.chmod 0644 pada file sementara state.json di dump_runtime_state",
+        description="Verifikasi os.chmod 0640 pada file sementara state.json di dump_runtime_state (Wave 10/L3)",
         iterations=iterations,
     )
     permission_missing_events = 0
@@ -4280,15 +4291,16 @@ async def fuzz_dump_runtime_state_tmp_chmod_permission(iterations: int = 5) -> F
 
                 if os.path.exists(s_path):
                     mode = os.stat(s_path).st_mode & 0o777
-                    if mode != 0o644:
+                    if mode != 0o640:
                         permission_missing_events += 1
             finally:
                 os.umask(orig_umask)
 
     if permission_missing_events > 0:
         res.anomalies.append(
-            f"Missing chmod 0644 terkonfirmasi: {permission_missing_events}/{iterations} iterasi menghasilkan "
-            "state.json tanpa izin 0644 (mengikuti umask proses sehingga file hanya 0600), memicu PermissionError saat dibaca panel."
+            f"chmod 0644/0600 terdeteksi: {permission_missing_events}/{iterations} iterasi menghasilkan "
+            "state.json tanpa izin 0640. Catatan: 0640 adalah hardening Wave 10 (L3) — state.json berisi nama "
+            "guild/pendengar dan cukup dibaca panel (root), jangan world-readable."
         )
         res.failed += 1
     else:
@@ -4479,7 +4491,7 @@ async def fuzz_autoplay_idle_connected_advance_trigger(iterations: int = 5) -> F
         interaction.response.is_done = MagicMock(return_value=True)
         interaction.followup.send = AsyncMock()
 
-        with patch.object(bot_module, "_check_guild_only", return_value=True):
+        with patch.object(bot_module, "_check_guild_only", return_value=True),              patch.object(bot_module, "_check_same_voice", return_value=(True, "")):
             await bot.cmd_autoplay(interaction)
 
         if not bot.advance.called:
@@ -5095,7 +5107,7 @@ async def fuzz_dump_runtime_state_current_title_race(iterations: int = 5) -> Fuz
 async def fuzz_save_persistent_queue_tmp_chmod_permission(iterations: int = 5) -> FuzzScenarioResult:
     res = FuzzScenarioResult(
         scenario="save_persistent_queue_tmp_chmod_permission",
-        description="Verifikasi missing os.chmod 0644 pada berkas .tmp di _save_persistent_queue",
+        description="Verifikasi os.chmod 0600 pada berkas .tmp di _save_persistent_queue (Wave 11)",
         iterations=iterations,
     )
     permission_missing_events = 0
@@ -5118,16 +5130,16 @@ async def fuzz_save_persistent_queue_tmp_chmod_permission(iterations: int = 5) -
 
                 if os.path.exists(q_path):
                     mode = os.stat(q_path).st_mode & 0o777
-                    if mode != 0o644:
+                    if mode != 0o600:
                         permission_missing_events += 1
             finally:
                 os.umask(orig_umask)
 
     if permission_missing_events > 0:
         res.anomalies.append(
-            f"_save_persistent_queue missing chmod 0644 terkonfirmasi: {permission_missing_events}/{iterations} iterasi "
-            "menulis queue_state.json tanpa os.chmod 0644 sehingga file hanya berizin 0600 di bawah umask ketat, "
-            "berisiko PermissionError untuk tool monitoring/updater."
+            f"_save_persistent_queue chmod salah terdeteksi: {permission_missing_events}/{iterations} iterasi "
+            "menulis queue_state.json tanpa izin 0600. Catatan: 0600 adalah hardening Wave 11 — berkas hanya "
+            "dibaca bot sendiri saat restore, tidak ada tool lain yang membutuhkan akses baca."
         )
         res.failed += 1
     else:
@@ -5279,7 +5291,8 @@ async def fuzz_cmd_autoplay_stale_current_lockout(iterations: int = 5) -> FuzzSc
         bot.advance = AsyncMock()
         bot.refresh = AsyncMock()
 
-        await bot.cmd_autoplay(interaction)
+        with patch.object(bot_module, "_check_guild_only", return_value=True),              patch.object(bot_module, "_check_same_voice", return_value=(True, "")):
+            await bot.cmd_autoplay(interaction)
 
         if not bot.advance.called:
             lockout_events += 1
@@ -7067,8 +7080,14 @@ async def fuzz_skip_stopped_playback_failing_queue_head_drop_omission(iterations
         src_panel_skip = inspect.getsource(MusicPanel.skip)
         src_cmd_skip = inspect.getsource(MusicBot.cmd_skip)
 
-        panel_drops_queue_head = "state.queue.popleft()" in src_panel_skip or "del state.queue[0]" in src_panel_skip
-        cmd_drops_queue_head = "state.queue.popleft()" in src_cmd_skip or "del state.queue[0]" in src_cmd_skip
+        # _skip_queue_head(state) adalah helper yang membuang kepala antrean
+        # (refactor lanjutan memindahkan popleft inline ke helper bersama).
+        panel_drops_queue_head = ("state.queue.popleft()" in src_panel_skip
+                                  or "del state.queue[0]" in src_panel_skip
+                                  or "_skip_queue_head(" in src_panel_skip)
+        cmd_drops_queue_head = ("state.queue.popleft()" in src_cmd_skip
+                                or "del state.queue[0]" in src_cmd_skip
+                                or "_skip_queue_head(" in src_cmd_skip)
 
         if not panel_drops_queue_head or not cmd_drops_queue_head:
             stuck_head_events += 1
@@ -12247,7 +12266,9 @@ async def fuzz_detect_js_runtime_synchronous_import_subprocess(iterations: int =
     )
     sync_import_events = 0
     for _ in range(iterations):
-        with open("/opt/discord-music-bot/bot.py", "r", encoding="utf-8") as f:
+        # Baca bot.py relatif terhadap lokasi skrip ini (bukan /opt) agar
+        # fuzzer bisa dijalankan dari checkout mana pun.
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot.py"), "r", encoding="utf-8") as f:
             bot_src = f.read()
         vulnerable = "\n_JS_RUNTIME = _detect_js_runtime()\n" in bot_src
         if vulnerable:
@@ -12410,7 +12431,9 @@ async def fuzz_clean_channel_id_sanitization_helper(iterations: int = 5) -> Fuzz
     )
     helper_events = 0
     for _ in range(iterations):
-        with open("/opt/discord-music-bot/bot.py", "r", encoding="utf-8") as f:
+        # Baca bot.py relatif terhadap lokasi skrip ini (bukan /opt) agar
+        # fuzzer bisa dijalankan dari checkout mana pun.
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot.py"), "r", encoding="utf-8") as f:
             bot_src = f.read()
         vulnerable = "def _clean_channel_id" not in bot_src
         if vulnerable:
